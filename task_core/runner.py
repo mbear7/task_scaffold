@@ -44,7 +44,6 @@ def _underlying_pipeline_class(entry):
     # or a PipelineBinding (task_core/binding.py) wrapping one with its
     # resource bindings. Everywhere this module needs .spec, .__name__, or
     # .run itself, it needs the underlying class, not the wrapper.
-    from task_core.binding import PipelineBinding
     if isinstance(entry, PipelineBinding):
         return entry.pipeline
     return entry
@@ -105,7 +104,15 @@ def run_pipelines(
     pg_schema='bsr',
     source_change_check=None,
     force_run=False,
+    publisher_factory=DbPublisher,
 ):
+    """publisher_factory: the DbPublisher constructor to use, real by
+    default. Pass a fake here for tests -- e.g. tc.run_pipelines(...,
+    publisher_factory=FakeDbPublisher) -- rather than monkeypatching
+    tc.runner.DbPublisher, which this default parameter value no longer
+    responds to: like any default argument, it's bound once, to whatever
+    DbPublisher was at the time this function was defined (module import
+    time), not re-read from the module namespace on every call."""
     log = logging.getLogger(task_name)
     specs = validate_pipeline_classes(pipelines, run_sequence)
     ctx = build_context()
@@ -137,7 +144,7 @@ def run_pipelines(
         # read/write the technical source-state table -- source-change
         # checking must not open a second, independent DB connection.
         if has_db_outputs or source_check_enabled:
-            publisher = DbPublisher(creds=creds, schema=pg_schema, logger=log)
+            publisher = publisher_factory(creds=creds, schema=pg_schema, logger=log)
 
         current_fingerprints = []
         source_changed = None
@@ -204,16 +211,26 @@ def run_pipelines(
 
             try:
                 if isinstance(entry, PipelineBinding):
-                    kwargs = {
-                        alias: ctx.get_resource(ctx.resource_keys_by_spec_id[id(resource_spec)])
-                        for alias, resource_spec in entry.resources.items()
-                    }
+                    kwargs = {}
+                    for alias, resource_spec in entry.resources.items():
+                        spec_id = id(resource_spec)
+                        if spec_id not in ctx.resource_keys_by_spec_id:
+                            raise PipelineContractError(
+                                f"{ctx.task_name}: pipeline '{pipeline_name}' binding '{alias}' -- "
+                                f"ctx.resource_keys_by_spec_id has no entry for this resource. "
+                                f"task_context was built without the binding key map: pass "
+                                f"compute_resource_wiring()'s key_by_spec_id through as "
+                                f"resource_keys_by_spec_id=... when hand-building task_context() "
+                                f"for an incremental migration, or use build_resource_context() "
+                                f"instead once every pipeline is migrated."
+                            )
+                        kwargs[alias] = ctx.get_resource(ctx.resource_keys_by_spec_id[spec_id])
                     out_tbl = pipeline_cls.run(ctx, **kwargs)
                 elif callable(getattr(pipeline_cls, 'run', None)):
                     out_tbl = pipeline_cls.run(ctx)
                 else:
                     raise PipelineError(ctx.task_name, pipeline_name, 'run', 'pipeline has no run(ctx) method')
-            except PipelineError:
+            except (PipelineError, PipelineContractError):
                 raise
             except Exception as e:
                 raise PipelineError(ctx.task_name, pipeline_name, 'run', 'failed during pipeline execution') from e

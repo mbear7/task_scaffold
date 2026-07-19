@@ -25,7 +25,7 @@ from lxml import etree
 
 
 def strip_ns(root):
-    for elem in root.getiterator():
+    for elem in root.iter():
         if not isinstance(elem.tag, str):
             continue
         elem.tag = etree.QName(elem).localname

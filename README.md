@@ -157,6 +157,49 @@ future task file. Tasks utilize `task_core`; they are never part of it,
 at any point, and this is checked automatically now rather than relying
 on nothing having been added by mistake.
 
+Three more, following an external review that identified real,
+verified gaps `test_binding.py` alone didn't cover:
+
+`tests/test_context_lifecycle.py` -- the resource lifecycle guarantees
+`task_context` itself makes: a resource fingerprinted during source-change
+checking is the exact same object later injected into the pipeline that
+processes it (the most architecturally central test in this project's
+suite -- it's what a lazy, cached resource model is actually for),
+close-exactly-once, an inactive resource is never constructed at all, all
+resources close even when a pipeline raises, and clear diagnostics for
+missing results/shared values/resources rather than raw, unexplained
+`KeyError`s.
+
+`tests/test_source_change_runner.py` -- source-change execution paths
+(unchanged sources skip execution, `force_run=True` overrides that,
+changed sources execute, enabling the check with no tracked sources fails
+clearly) and runner transaction atomicity (two DB-output pipelines commit
+together; a later pipeline failing rolls back an earlier one's already-
+published output too; a publisher and its resources close in every path,
+success or failure). These turned out to be the same underlying
+mechanism, not two separate ones: source-state update and DB payload
+publishing both happen inside the same, single `publisher.commit()` at
+the very end of `run_pipelines()`, so one rollback protects both
+together -- kept in one file for that reason, not split by which module
+happens to implement which half. Exercises `source_state.py`'s real code
+(not a parallel reimplementation of its logic) against an in-memory fake
+`conn` -- see the file's own docstring for why this needed a small,
+sandbox-only extension to the local `sqlalchemy` stub.
+
+`tests/test_excel_metadata.py` -- real, generated `.xlsx` fixtures (mocks
+alone can't validate genuinely XML-specific behavior: sparse rows,
+outline levels, sheet-name resolution). Includes a permanent regression
+test for the exact `first_row` misalignment bug found twice, independently,
+through manual verification earlier in this project's history (once in
+`hr_task.py`, again in `hr_petl_task.py`) -- captured here so a future
+regression is caught automatically instead of needing to be rediscovered
+by hand a third time.
+
+Every test added this round was verified to have genuine teeth, not just
+asserted to pass: each one was checked against a deliberately broken
+version of the real code it protects, confirmed to fail with a clear,
+relevant message, then confirmed the code was cleanly restored afterward.
+
 Tests are task_core-only: every pipeline and resource in `tests/` is a
 minimal stub built inline. No file under `tasks/` is ever imported by the
 test suite -- that's real usage, not test fixtures, and it's intentional

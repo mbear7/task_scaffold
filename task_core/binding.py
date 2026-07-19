@@ -55,7 +55,7 @@ from task_core.source_tracking import TrackedResourceSource
 from task_core.types import PipelineContractError
 
 
-# === Section 4: resource environment ===
+# === Resource environment ===
 
 @dataclass
 class ResourceEnvironment:
@@ -69,15 +69,28 @@ class ResourceEnvironment:
         base_path = None if self.base_path is None else os.fspath(self.base_path)
 
         if path.startswith('\\\\') or path.startswith('/') or (len(path) > 1 and path[1] == ':'):
-            return path
-        if base_path is None:
-            raise ValueError(
-                f"Resource uses relative path {path!r}, but this task has no base_path. "
-                f"Use an absolute path or provide base_path."
-            )
-        if base_path.startswith('\\\\'):
-            return ntpath.join(base_path, path)
-        return os.path.join(base_path, path)
+            resolved = path
+        else:
+            if base_path is None:
+                raise ValueError(
+                    f"Resource uses relative path {path!r}, but this task has no base_path. "
+                    f"Use an absolute path or provide base_path."
+                )
+            if base_path.startswith('\\\\'):
+                resolved = ntpath.join(base_path, path)
+            else:
+                resolved = os.path.join(base_path, path)
+
+        # Normalize regardless of which branch produced it -- a relative
+        # path joined against a UNC base_path (e.g. latest_xlsx('.')) would
+        # otherwise carry a literal trailing '\.' all the way to smbclient
+        # over the real SMB connection. Locally harmless (filesystem calls
+        # resolve '.' transparently); not guaranteed to be, remotely, over
+        # the wire. ntpath.normpath preserves the UNC prefix correctly
+        # (verified directly: '\\\\srv\\share\\X\\.' -> '\\\\srv\\share\\X').
+        if resolved.startswith('\\\\'):
+            return ntpath.normpath(resolved)
+        return os.path.normpath(resolved)
 
     def require_file_access(self):
         if self.file_access is None:
@@ -85,7 +98,7 @@ class ResourceEnvironment:
         return self.file_access
 
 
-# === Section 3.1: generic resource core ===
+# === Generic resource core ===
 
 @dataclass(frozen=True)
 class ResourceSpec:
@@ -93,7 +106,7 @@ class ResourceSpec:
     tracker: bool = False
 
 
-# === Section 11.3: pipeline-resource binding ===
+# === Pipeline-resource binding ===
 
 @dataclass(frozen=True)
 class PipelineBinding:
@@ -110,7 +123,7 @@ def bind(pipeline_cls, **resource_bindings: ResourceSpec):
     return PipelineBinding(pipeline=pipeline_cls, resources=MappingProxyType(dict(resource_bindings)))
 
 
-# === Section 11.4: structural validation ===
+# === Structural validation ===
 
 def _validate_run_signature(pipeline_name, pipeline_cls):
     """Validates the complete bound-pipeline run() shape, not just its
@@ -135,6 +148,20 @@ def _validate_run_signature(pipeline_name, pipeline_cls):
         raise PipelineContractError(
             f"Pipeline '{pipeline_name}' ({pipeline_cls.__name__}): a bound pipeline's "
             f"run() must accept exactly run(ctx, *, ...resource roles), got run{sig}"
+        )
+
+    defaulted = [
+        name for name, param in sig.parameters.items()
+        if param.kind == inspect.Parameter.KEYWORD_ONLY and param.default is not inspect.Parameter.empty
+    ]
+    if defaulted:
+        raise PipelineContractError(
+            f"Pipeline '{pipeline_name}' ({pipeline_cls.__name__}): keyword-only parameter(s) "
+            f"{defaulted} have a default value. Every keyword-only parameter after ctx is "
+            f"reserved for an injected resource role, and bind() always supplies a value for "
+            f"each one -- a default can never actually be used under the current, required-only "
+            f"model, so having one can only mean this wasn't meant to be a resource role at all. "
+            f"Rename or restructure rather than default it."
         )
 
     return {
@@ -224,6 +251,10 @@ def compute_resource_wiring(resources, pipelines, run_sequence, env):
     validate_bindings(resources, pipelines)
 
     active_names = list(run_sequence)
+    missing = [name for name in active_names if name not in pipelines]
+    if missing:
+        raise PipelineContractError(f'run_sequence contains unknown pipeline(s): {missing}')
+
     active_spec_ids = set()
     for name in active_names:
         entry = pipelines[name]

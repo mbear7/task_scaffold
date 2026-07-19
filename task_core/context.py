@@ -137,6 +137,8 @@ class task_context:
 
     def get_resource(self, name):
         if name not in self._cache:
+            if name not in self._loaders:
+                raise KeyError(f'no loader registered for resource: {name!r}')
             self._cache[name] = self._loaders[name]()
         return self._cache[name]
 

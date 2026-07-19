@@ -529,19 +529,20 @@ class Test10DynamicDbContractOnBoundPipeline(unittest.TestCase):
             table_rows = property(lambda self: {})
 
         original_publisher_cls = tc.runner.DbPublisher
-        tc.runner.DbPublisher = FakeDbPublisher
-        try:
-            tc.run_pipelines(
-                task_name='test10',
-                build_context=lambda: tc.build_resource_context('test10', resources, pipelines, run_sequence, env),
-                pipelines=pipelines,
-                run_sequence=run_sequence,
-                output_excel=False,
-                output_db=True,
-                creds={'user': 'x', 'host': 'x', 'dbname': 'x'},
-            )
-        finally:
-            tc.runner.DbPublisher = original_publisher_cls
+        tc.run_pipelines(
+            task_name='test10',
+            build_context=lambda: tc.build_resource_context('test10', resources, pipelines, run_sequence, env),
+            pipelines=pipelines,
+            run_sequence=run_sequence,
+            output_excel=False,
+            output_db=True,
+            creds={'user': 'x', 'host': 'x', 'dbname': 'x'},
+            publisher_factory=FakeDbPublisher,
+        )
+        # publisher_factory is a plain argument -- confirms it didn't need
+        # to touch the real DbPublisher class at all, unlike the
+        # monkeypatch this replaced.
+        self.assertIs(tc.runner.DbPublisher, original_publisher_cls)
 
         self.assertEqual(len(published), 1)
         payload = published[0].published[0]
