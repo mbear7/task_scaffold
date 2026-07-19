@@ -1,0 +1,15 @@
+# task_core itself
+pandas
+numpy
+openpyxl
+sqlalchemy
+psycopg2
+petl
+lxml
+smbclient
+
+# Not a direct dependency of this project's own code (checked: no task
+# file imports babel directly) -- but petl_util (external, not shipped
+# here, see README) needs it, and tasks/hr_task.py, tasks/ops_task.py,
+# and tasks/hr_petl_task.py all depend on petl_util to actually run.
+babel
