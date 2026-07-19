@@ -112,7 +112,12 @@ class Test3InactiveResourceNeitherConstructedNorClosed(unittest.TestCase):
         self.assertEqual(load_log, ['active'], 'a resource that was never requested was still constructed')
 
 
-class Test4AllResourcesClosedWhenAPipelineRaises(unittest.TestCase):
+class TestAllLoadedResourcesClosedByContext(unittest.TestCase):
+    # Named for what this actually tests: task_context.close()'s own
+    # guarantee when multiple resources are loaded, exercised directly --
+    # not a real pipeline failure through run_pipelines(), which
+    # test_source_change_runner.py's test_publisher_and_context_closed_
+    # on_failure already covers separately.
     def test_multiple_resources_all_closed_even_on_failure(self):
         load_log = []
         r1 = InstrumentedResource('r1', load_log)

@@ -195,6 +195,62 @@ through manual verification earlier in this project's history (once in
 regression is caught automatically instead of needing to be rediscovered
 by hand a third time.
 
+`tests/test_file_resources.py` -- file selection determinism and
+fingerprinting: latest-file-by-modification-time, deterministic tie-break
+when modification times are exactly equal, file-set order and fingerprint
+signature both independent of whatever order the filesystem's own
+enumeration happens to return, fingerprint changes on add/remove/resize/
+retouch, fingerprinting reuses the already-selected files rather than
+re-listing the directory, and `on_empty='raise'|'empty'`. Real temp
+directories and real files throughout. Two things worth being honest
+about, both found only by actually trying to break the code and checking
+the test still caught it, not assumed from the test passing once:
+
+- The first version of the latest-file/tie-break tests passed even
+  against a completely broken selection (`file_infos[0]`, no mtime logic
+  at all) -- this filesystem's own `glob()` happened to return the newer
+  file first by coincidence, so the test wasn't actually proving what it
+  claimed to. Fixed by explicitly controlling file order through a small
+  wrapped `source_access`, so the result can no longer come from
+  coincidence.
+- An earlier version of `tests/test_source_change_runner.py`'s fake
+  connection mutated a single dict immediately on every `execute()`, with
+  no distinction between staged and committed state -- so
+  `FakeDbPublisher.rollback()` had nothing to actually undo, and the
+  existing rollback test (which never enabled source checking at all)
+  couldn't have caught this either way. Found by external review, not
+  here first. `FakeSourceStateConn` is now genuinely transaction-aware
+  (`committed_rows`/`pending_rows`), and `Test4SourceStateGenuinelyRollsBack`
+  forces a real `commit()` failure after source-state has genuinely been
+  staged, then confirms the durable, committed state survives untouched
+  -- the only way to actually exercise this, since a pipeline failing
+  mid-loop never reaches `update_source_state()` at all (it runs after
+  the loop in `runner.py`).
+- Also found by external review: every failure-path test covered a
+  pipeline failing during the loop, or the final `commit()` failing --
+  none covered `ctx.collect_source_fingerprints()` itself raising, which
+  happens earlier still, before any pipeline runs and before
+  `build_source_state_store()` is ever constructed.
+  `Test5FingerprintCollectionFailureCleanup` covers this directly: one
+  resource fingerprints successfully, a second's `source_fingerprint()`
+  raises, and the test confirms no pipeline ran, both resources (the
+  already-loaded good one and the one that failed) were closed, and the
+  publisher was rolled back and closed -- proven against `runner.py`'s
+  real code by breaking its cleanup twice, in two different, specific
+  ways, and confirming each broke a different assertion.
+- Two small precision fixes, also from external review: a `time.sleep()`
+  used to force one file to have a later modification time than another
+  in `test_file_resources.py`, replaced with explicit `os.utime()` values
+  (a sleep-based test can become flaky on filesystems with coarse
+  timestamp resolution); and a bare `assertRaises(Exception)` in the
+  failed-commit test, replaced with `assertRaises(RuntimeError)` so an
+  unrelated exception elsewhere in the test body couldn't accidentally
+  satisfy the assertion. Found the same imprecision in `test_binding.py`
+  too, not originally flagged -- fixed there as well, to the exact
+  exception a frozen dataclass actually raises
+  (`dataclasses.FrozenInstanceError`), confirmed empirically rather than
+  assumed before making the change.
+
 Every test added this round was verified to have genuine teeth, not just
 asserted to pass: each one was checked against a deliberately broken
 version of the real code it protects, confirmed to fail with a clear,

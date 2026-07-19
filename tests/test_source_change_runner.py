@@ -27,11 +27,36 @@ import task_core as tc
 
 class FakeSourceStateConn:
     """In-memory conn simulating just enough SQL behavior for
-    SourceStateStore's real code to run against -- no real database."""
+    SourceStateStore's real code to run against -- no real database.
+
+    Genuinely transaction-aware, not just a dict mutated in place:
+    execute() writes to pending_rows, layered over committed_rows for
+    reads (matching real SQL's read-your-own-writes-within-a-transaction
+    semantics). Only commit() promotes pending_rows to committed_rows;
+    rollback() discards pending_rows entirely. This distinction is the
+    whole point -- an earlier version of this fake mutated a single dict
+    immediately on every execute(), which meant FakeDbPublisher.rollback()
+    had nothing to actually undo, and no test could tell the difference
+    between "rollback works" and "rollback is a no-op because nothing
+    was ever staged in the first place." See
+    Test4SourceStateGenuinelyRollsBack below, which exists specifically
+    because this gap existed and was found by external review, not
+    caught here first.
+    """
 
     def __init__(self):
-        self.rows = {}  # (task_name, source_key) -> source_signature
+        self.committed_rows = {}  # durable state -- (task_name, source_key) -> source_signature
+        self.pending_rows = None  # None = no writes this transaction; dict = staged, not yet committed
         self.table_created = False
+
+    def _current_view(self):
+        if self.pending_rows is None:
+            return dict(self.committed_rows)
+        return dict(self.pending_rows)
+
+    def _ensure_pending(self):
+        if self.pending_rows is None:
+            self.pending_rows = dict(self.committed_rows)
 
     def execute(self, query, params=None):
         sql = str(query).lower().strip()
@@ -42,23 +67,34 @@ class FakeSourceStateConn:
             return None
         if sql.startswith('select'):
             task_name = params['task_name']
-            matching = [(sk, sig) for (tn, sk), sig in self.rows.items() if tn == task_name]
+            view = self._current_view()
+            matching = [(sk, sig) for (tn, sk), sig in view.items() if tn == task_name]
             return _FakeResult(matching)
         if sql.startswith('delete'):
+            self._ensure_pending()
             task_name = params['task_name']
             if 'keep_keys' in params:
                 keep = set(params['keep_keys'])
-                self.rows = {
-                    (tn, sk): sig for (tn, sk), sig in self.rows.items()
+                self.pending_rows = {
+                    (tn, sk): sig for (tn, sk), sig in self.pending_rows.items()
                     if not (tn == task_name and sk not in keep)
                 }
             else:
-                self.rows = {(tn, sk): sig for (tn, sk), sig in self.rows.items() if tn != task_name}
+                self.pending_rows = {(tn, sk): sig for (tn, sk), sig in self.pending_rows.items() if tn != task_name}
             return None
         if sql.startswith('insert'):
-            self.rows[(params['task_name'], params['source_key'])] = params['source_signature']
+            self._ensure_pending()
+            self.pending_rows[(params['task_name'], params['source_key'])] = params['source_signature']
             return None
         raise AssertionError(f'FakeSourceStateConn: unrecognized query: {sql!r}')
+
+    def commit(self):
+        if self.pending_rows is not None:
+            self.committed_rows = self.pending_rows
+        self.pending_rows = None
+
+    def rollback(self):
+        self.pending_rows = None
 
 
 class _FakeResult:
@@ -75,9 +111,22 @@ class FakeDbPublisher:
     committed_tables/written_tables/table_rows), plus call counters these
     tests need. ensure_connection() returns a real FakeSourceStateConn,
     not object() -- source-change tests need SourceStateStore's real code
-    to actually run, not just avoid crashing on the connection handle."""
+    to actually run, not just avoid crashing on the connection handle.
 
-    def __init__(self, *, creds, schema, logger=None):
+    commit()/rollback() also drive self.conn's own commit()/rollback(),
+    since a real DbPublisher's commit/rollback act on the one shared
+    connection/transaction source-state and DB payloads both go through.
+
+    fail_commit: if set, commit() raises instead of succeeding, once --
+    simulates a real commit failure (e.g. a constraint violation) after
+    source-state has already been staged via execute(), which is the
+    only way to actually exercise rollback undoing a staged source-state
+    write. A pipeline failing mid-loop never reaches update_source_state
+    at all (it runs after the loop in runner.py), so that scenario alone
+    can never prove this -- confirmed by inspecting runner.py directly,
+    not assumed."""
+
+    def __init__(self, *, creds, schema, logger=None, fail_commit=False):
         self.creds = creds
         self.schema = schema
         self.log = logger
@@ -89,6 +138,7 @@ class FakeDbPublisher:
         self.commit_calls = 0
         self.rollback_calls = 0
         self.close_calls = 0
+        self.fail_commit = fail_commit
 
     def ensure_connection(self):
         return self.conn
@@ -102,8 +152,12 @@ class FakeDbPublisher:
 
     def commit(self):
         self.commit_calls += 1
+        if self.fail_commit:
+            self.fail_commit = False  # fail once, matching a real transient commit failure
+            raise RuntimeError('simulated commit failure')
         self._committed = True
         self._committed_tables = list(self._written_tables)
+        self.conn.commit()
         return list(self._committed_tables)
 
     def rollback(self):
@@ -112,6 +166,7 @@ class FakeDbPublisher:
         self._committed_tables = []
         self._written_tables = []
         self._table_rows = {}
+        self.conn.rollback()
 
     def close(self):
         self.close_calls += 1
@@ -185,6 +240,126 @@ def make_context(*, resource_signature='sig-v1'):
         tracked_sources=[tc.TrackedResourceSource('files')],
     )
     return ctx, resource
+
+
+class Test4SourceStateGenuinelyRollsBack(unittest.TestCase):
+    """Exists because an earlier version of this file's fake conn wasn't
+    actually transaction-aware -- it mutated a single dict immediately on
+    every execute(), so FakeDbPublisher.rollback() had nothing to undo,
+    and no test could tell "rollback works" apart from "rollback is a
+    no-op because nothing was ever staged." Found by external review,
+    not caught here first. This directly protects the invariant a failed
+    task must never record its inputs as successfully processed."""
+
+    def test_failed_commit_after_staging_leaves_committed_state_untouched(self):
+        shared_conn = FakeSourceStateConn()
+        shared_conn.committed_rows = {('t', 'files'): 'sig-v1'}  # simulates a prior, successful run
+
+        class FailingPublisher(FakeDbPublisher):
+            def __init__(self, **kw):
+                super().__init__(**kw, fail_commit=True)
+                self.conn = shared_conn
+
+        config = tc.SourceChangeCheckConfig(enabled=True)
+        ran = []
+        pipeline = make_pipeline()
+        pipeline.run = classmethod(lambda cls, ctx: (ran.append(1), pd.DataFrame({'a': [1]}))[1])
+        pipelines = {'p': pipeline}
+
+        ctx, _ = make_context(resource_signature='sig-v2')  # genuinely changed vs the seeded sig-v1
+
+        with self.assertRaises(RuntimeError):
+            tc.run_pipelines(
+                task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
+                output_excel=False, output_db=True, creds={}, source_change_check=config,
+                publisher_factory=FailingPublisher,
+            )
+
+        self.assertEqual(len(ran), 1, 'pipeline should have run -- sources were genuinely changed')
+        # The actual regression this test exists to catch: even though
+        # update_source_state() genuinely staged sig-v2 (a real INSERT
+        # against pending_rows, confirmed by the pipeline having run),
+        # the forced commit() failure and subsequent rollback() must mean
+        # the durable, committed state is still sig-v1, not sig-v2.
+        self.assertEqual(
+            shared_conn.committed_rows, {('t', 'files'): 'sig-v1'},
+            'committed source state changed despite commit() failing -- rollback did not undo the staged write',
+        )
+        self.assertIsNone(shared_conn.pending_rows, 'rollback did not clear the pending transaction')
+
+
+class FakeFailingFingerprintResource:
+    """A resource whose source_fingerprint() itself raises -- for testing
+    cleanup when fingerprint collection fails partway through, before any
+    pipeline has even started."""
+
+    def __init__(self):
+        self.closed = False
+
+    def source_fingerprint(self, source_key):
+        raise RuntimeError('deliberate fingerprint failure')
+
+    def close(self):
+        self.closed = True
+
+
+class Test5FingerprintCollectionFailureCleanup(unittest.TestCase):
+    """collect_source_fingerprints() (runner.py, well before any pipeline
+    runs and before build_source_state_store() is ever constructed) is a
+    genuinely earlier failure point than anything else in this file
+    exercises -- every other test here fails either during the pipeline
+    loop or at the final commit(). The runner's exception handling is
+    generic (one try/except/finally covering the whole function), so this
+    should already work by construction, but that had never actually been
+    proven with a test until now."""
+
+    def test_second_resource_fingerprint_failure_cleans_up_correctly(self):
+        good_resource = FakeFileResource('sig-ok')
+        bad_resource = FakeFailingFingerprintResource()
+
+        ctx = tc.task_context(
+            task_name='t',
+            loaders={'good': lambda: good_resource, 'bad': lambda: bad_resource},
+            tracked_sources=[tc.TrackedResourceSource('good'), tc.TrackedResourceSource('bad')],
+        )
+
+        config = tc.SourceChangeCheckConfig(enabled=True)
+        ran = []
+        pipeline = make_pipeline()
+        pipeline.run = classmethod(lambda cls, ctx: (ran.append(1), pd.DataFrame({'a': [1]}))[1])
+        pipelines = {'p': pipeline}
+
+        published = []
+
+        class TrackingPublisher(FakeDbPublisher):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                published.append(self)
+
+        with self.assertRaises(RuntimeError):
+            tc.run_pipelines(
+                task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
+                output_excel=False, output_db=True, creds={}, source_change_check=config,
+                publisher_factory=TrackingPublisher,
+            )
+
+        self.assertEqual(len(ran), 0, 'a pipeline ran despite fingerprint collection failing')
+
+        pub = published[0]
+        self.assertEqual(pub.rollback_calls, 1, 'publisher.rollback() was not called')
+        self.assertEqual(pub.close_calls, 1, 'publisher.close() was not called')
+
+        self.assertTrue(good_resource.closed, 'the already-loaded good resource was not closed')
+        self.assertTrue(bad_resource.closed, 'the already-loaded bad resource was not closed')
+
+        # Structural, not just empirically absent: collect_source_
+        # fingerprints() happens before build_source_state_store() is
+        # ever constructed (confirmed by reading runner.py directly), so
+        # nothing here could have touched source state at all. Asserting
+        # the fake conn genuinely was never written to, not just that it
+        # stayed empty by coincidence.
+        self.assertIsNone(pub.conn.pending_rows)
+        self.assertEqual(pub.conn.committed_rows, {})
 
 
 class Test1SourceUnchangedSkipsExecution(unittest.TestCase):
@@ -371,9 +546,10 @@ class Test3TransactionAtomicity(unittest.TestCase):
         self.assertEqual(len(published), 0, 'a DbPublisher was created despite no db-output pipeline')
 
     def test_source_check_only_task_creates_one_publisher(self):
-        # output_db=False -- no table has db_table, but source checking
-        # alone must still create exactly one publisher (to read/write the
-        # technical source-state table), not skip creating one entirely.
+        # No pipeline has a DB output table, but output_db=True activates
+        # the technical source-state mechanism -- must still create
+        # exactly one publisher (to read/write the source-state table),
+        # not skip creating one entirely.
         config = tc.SourceChangeCheckConfig(enabled=True)
         pipelines = {'p': make_pipeline()}
         published = []

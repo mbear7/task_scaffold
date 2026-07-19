@@ -13,6 +13,7 @@ available in this environment (no network, not cached).
 Run from the project root with: python3 -m unittest tests.test_binding -v
 """
 
+import dataclasses
 import unittest
 
 import pandas as pd
@@ -300,7 +301,7 @@ class Test7ImmutableBindingMapping(unittest.TestCase):
                 pass
 
         binding = tc.bind(pipeline, source=spec)
-        with self.assertRaises(Exception):
+        with self.assertRaises(dataclasses.FrozenInstanceError):
             binding.resources = {}
 
     def test_original_kwargs_dict_mutation_does_not_leak_in(self):
