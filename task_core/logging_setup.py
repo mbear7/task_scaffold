@@ -2,7 +2,7 @@
 """Level 1 leaf: zero task_core dependencies. Only ever called by end users
 (ops_task.py-style task files), never imported by another task_core
 submodule -- kept out of __init__.py itself so the facade stays pure
-re-exports (see the migration plan's __init__.py-purity rule)."""
+re-exports, with no non-reexport logic of its own."""
 
 import logging
 

@@ -6,6 +6,7 @@ openpyxl_compat.py (level 1) for warning suppression.
 """
 
 from datetime import datetime, timezone
+import warnings
 
 from openpyxl.utils.cell import range_boundaries
 
@@ -71,6 +72,7 @@ class excel_resource:
         self._map_cache = {}
         self._range_cache = {}
         self._sheet_cache = {}
+        self._raw_cache = {}
 
     def source_fingerprint(self, source_key):
         if self._selection is None:
@@ -163,6 +165,26 @@ class excel_resource:
         return self._map_cache[key]
 
     def get_range(self, sheet, range_string, header=True):
+        # header=True/False produce an identical result -- confirmed
+        # directly, not assumed. A petl table's first row is always
+        # treated as its header by etl.header()/etl.data() regardless of
+        # how the table was constructed, so there is no way for this
+        # method's return value (always a petl table) to represent
+        # "headerless" at all. Use get_sheet_raw_rows() instead for a
+        # genuinely header-agnostic plain row sequence. Kept as its own
+        # method rather than changed in place: no real task in this
+        # project calls this with header=False anymore (hr_task.py's own
+        # former caller, sheet_to_raw_dataframe(), was migrated to
+        # get_sheet_raw_rows() instead), but an external caller relying
+        # on the old, documented-as-accidental behavior might still exist.
+        if header is False:
+            warnings.warn(
+                "get_range(header=False) has no effect -- a petl table's first row is always "
+                "treated as its header by etl.header()/etl.data() regardless of this argument. "
+                "Use get_sheet_raw_rows() for genuinely header-agnostic rows.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         key = (sheet, range_string, header)
         if key not in self._range_cache:
             with suppress_openpyxl_data_validation_warning():
@@ -187,6 +209,19 @@ class excel_resource:
         return self._range_cache[key]
 
     def get_sheet_rows(self, sheet, header=True):
+        # Same header=True/False no-op as get_range() above, same reason,
+        # same fix (get_sheet_raw_rows() below). No real task in this
+        # project calls this with header=False anymore -- hr_task.py's
+        # own former caller, sheet_to_raw_dataframe(), was migrated to
+        # get_sheet_raw_rows() instead.
+        if header is False:
+            warnings.warn(
+                "get_sheet_rows(header=False) has no effect -- a petl table's first row is always "
+                "treated as its header by etl.header()/etl.data() regardless of this argument. "
+                "Use get_sheet_raw_rows() for genuinely header-agnostic rows.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         key = (sheet, header)
         if key not in self._sheet_cache:
             with suppress_openpyxl_data_validation_warning():
@@ -201,21 +236,39 @@ class excel_resource:
                     self._sheet_cache[key] = etl.wrap(rows)
         return self._sheet_cache[key]
 
+    def get_sheet_raw_rows(self, sheet):
+        """Every row of the sheet, as a plain list of tuples -- no
+        header concept at all, unlike get_sheet_rows()/get_range(),
+        whose return value is always a petl table and therefore always
+        treats its own first row as a header once read via
+        etl.header()/etl.data(). Use this when row 0 needs to stay
+        available as genuine data (e.g. scanning for a header row that
+        could be anywhere in the sheet), instead of reconstructing it
+        via etl.header()/etl.data() on a get_sheet_rows(header=False)
+        result."""
+        if sheet not in self._raw_cache:
+            with suppress_openpyxl_data_validation_warning():
+                wb = self._ensure_workbook()
+                ws = wb[sheet]
+                self._raw_cache[sheet] = list(ws.values)
+        return self._raw_cache[sheet]
+
     def close(self):
         try:
-            if self._wb is not None:
-                close_fn = getattr(self._wb, 'close', None)
-                if close_fn is not None:
-                    close_fn()
-        finally:
             if self._workbook_cm is not None:
+                # open_workbook()'s own context manager (file_access.py)
+                # already does `finally: wb.close()` -- this __exit__()
+                # call closes the workbook; no separate, explicit
+                # self._wb.close() is needed alongside it.
                 self._workbook_cm.__exit__(None, None, None)
+        finally:
             self._workbook_cm = None
             self._wb = None
             self._table_cache.clear()
             self._map_cache.clear()
             self._range_cache.clear()
             self._sheet_cache.clear()
+            self._raw_cache.clear()
 
 
 

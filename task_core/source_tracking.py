@@ -118,11 +118,14 @@ class TrackedResourceSource:
 
 @dataclass(frozen=True)
 class TrackedDbQuerySource:
-    # Not wired into any task yet -- see task_core_review conversation:
-    # this exists so the mechanism is available once a real fingerprint
-    # query (and, ideally, a supporting index) is agreed with the owner of
-    # the source view. See db source tracking philosophy notes for query
-    # design guidance (max(updated_at)-style watermarks preferred).
+    # Not wired into any task yet -- this exists so the mechanism is
+    # available once a real fingerprint query (and, ideally, a
+    # supporting index) is agreed with the owner of the source view.
+    # Query design guidance: prefer a max(updated_at)-style watermark
+    # (a single scalar reflecting the most recent change) over selecting
+    # and hashing the full result set, since a watermark is cheap to
+    # compute repeatedly and doesn't require deciding what "the data"
+    # even means for a large or frequently-changing view.
     source_key: str
     resource_key: str
     query: str

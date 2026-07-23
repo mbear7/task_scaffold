@@ -14,6 +14,8 @@ import sqlalchemy as sa
 from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
+from task_core.cleanup import attempt_all_cleanup
+
 
 @dataclass(frozen=True)
 class DbTableResult:
@@ -106,6 +108,27 @@ def make_engine(creds):
 
 
 
+def _validate_unique_columns(columns, *, table_name):
+    # Must run before row dicts are built, not after -- once a row is
+    # {col: value for col, value in zip(columns, row)}, a duplicate
+    # column name has already silently collapsed to whichever value came
+    # last, with no trace of the collision left to detect. columns would
+    # still list the duplicate twice while rows lost a value entirely --
+    # an internally inconsistent DbPayload that fails much later, inside
+    # SQLAlchemy's CREATE TABLE with two same-named columns, rather than
+    # clearly here. Distinct original labels that stringify to the same
+    # value (1 and '1') hit this identically, since columns is already
+    # the stringified list by the time this runs.
+    seen = set()
+    duplicates = []
+    for col in columns:
+        if col in seen and col not in duplicates:
+            duplicates.append(col)
+        seen.add(col)
+    if duplicates:
+        raise DbPublishError(f'{table_name!r}: duplicate output column names: {duplicates!r}')
+
+
 def _apply_db_contract_columns(columns, rows, db_contract, *, table_name):
     if not db_contract:
         return list(columns), rows
@@ -166,6 +189,7 @@ def from_petl(tbl, *, table_name, schema, type_overrides=None, db_contract=None,
     columns = [str(col) for col in header]
     if not columns:
         raise DbPublishError(f'{table_name!r}: no columns to publish -- the source table has no header')
+    _validate_unique_columns(columns, table_name=table_name)
 
     rows = [
         {col: _normalize_value(value) for col, value in zip(columns, row, strict=True)}
@@ -194,6 +218,7 @@ def from_pandas(df: pd.DataFrame, *, table_name, schema, type_overrides=None, db
     columns = [str(col) for col in df.columns]
     if not columns:
         raise DbPublishError(f'{table_name!r}: no columns to publish -- the source DataFrame has no columns')
+    _validate_unique_columns(columns, table_name=table_name)
 
     prepared = df.copy()
     prepared = prepared.astype(object).where(pd.notna(prepared), None)
@@ -231,6 +256,8 @@ class DbPublisher:
         self.schema = schema
         self.log = logger or logging.getLogger(__name__)
         self.chunk_size = int(chunk_size)
+        if self.chunk_size < 1:
+            raise DbPublishError('chunk_size must be a positive integer')
         if type_infer_sample_size is None:
             self.type_infer_sample_size = None
         else:
@@ -299,28 +326,41 @@ class DbPublisher:
         self._table_rows[full_name] = table_result.rows
 
     def commit(self):
-        if self._tx is None:
+        if self._tx is not None:
+            self._tx.commit()
+            self._tx = None
+        elif self._conn is not None and self._conn.in_transaction():
+            # No explicit _tx -- but source-state writes (ensure_table/
+            # upsert_state, via SourceStateStore) go straight through
+            # ensure_connection(), never through _ensure_transaction(),
+            # so a source-check-only run (no db_table pipeline at all)
+            # never opens an explicit _tx. SQLAlchemy's own autobegin still
+            # opens an implicit one the moment anything executes, and that
+            # implicit transaction is what actually needs committing here.
+            self._conn.commit()
+        else:
             return []
 
-        self._tx.commit()
         self._committed = True
         self._committed_tables = list(self._written_tables)
         table_names = [item.full_name for item in self._committed_tables]
         self.log.info('db publish transaction committed, tables=%s', ', '.join(table_names) or 'none')
-        self._tx = None
         return list(self._committed_tables)
 
     def rollback(self):
-        if self._tx is None:
+        if self._tx is not None:
+            self._tx.rollback()
+            self._tx = None
+        elif self._conn is not None and self._conn.in_transaction():
+            self._conn.rollback()
+        else:
             return
 
-        self._tx.rollback()
         self._committed = False
         self._committed_tables = []
         self._written_tables = []
         self._table_rows = {}
         self.log.info('db publish transaction rolled back')
-        self._tx = None
 
     @property
     def committed(self):
@@ -339,13 +379,20 @@ class DbPublisher:
         return dict(self._table_rows)
 
     def close(self):
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        conn, self._conn = self._conn, None
+        engine, self._engine = self._engine, None
 
-        if self._engine is not None:
-            self._engine.dispose()
-            self._engine = None
+        steps = []
+        if conn is not None:
+            steps.append(('connection', conn.close))
+        if engine is not None:
+            steps.append(('engine', engine.dispose))
+
+        attempt_all_cleanup(
+            steps,
+            close_fn=lambda item: item[1](),
+            describe=lambda item: f'while closing DbPublisher {item[0]}',
+        )
 
     def _build_table(self, payload: DbPayload):
         metadata = sa.MetaData()

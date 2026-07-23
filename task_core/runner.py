@@ -39,6 +39,32 @@ if TYPE_CHECKING:
     from task_core.source_tracking import SourceChangeCheckConfig
 
 
+def _suppress_context_recursively(e):
+    # A grouped cleanup failure (BaseExceptionGroup/ExceptionGroup) has
+    # its own __context__ chained by Python the same way a single
+    # exception does, but so does *each exception nested inside it* --
+    # found by external review, confirmed directly: setting
+    # __suppress_context__ only on the outer group left every nested
+    # exception still showing its own, full chain back to primary_error,
+    # so the diagnostic-duplication problem this was meant to fix
+    # remained for any multi-error cleanup failure. Recurses through
+    # .exceptions for nested groups, arbitrarily deep, since one group's
+    # own sub-exceptions could themselves be groups.
+    #
+    # This mutates e (and everything nested inside it) permanently, not
+    # scoped to a single log call in any literal sense despite only
+    # affecting this function's own logging of it -- also found by
+    # external review, a fair correction to this comment's own, earlier
+    # wording. In practice this has no real consequence beyond that:
+    # every exception this touches came from cleanup_errors, discarded
+    # once run_pipelines() returns or raises, never reused or re-raised
+    # as itself anywhere else.
+    e.__suppress_context__ = True
+    if isinstance(e, BaseExceptionGroup):
+        for sub in e.exceptions:
+            _suppress_context_recursively(sub)
+
+
 def _underlying_pipeline_class(entry):
     # A PIPELINES entry may be a plain pipeline class (existing convention)
     # or a PipelineBinding (task_core/binding.py) wrapping one with its
@@ -65,6 +91,15 @@ def validate_pipeline_classes(pipelines, run_sequence):
     missing = [name for name in run_sequence if name not in pipelines]
     if missing:
         raise PipelineContractError(f'run_sequence contains unknown pipeline(s): {missing}')
+
+    seen = set()
+    duplicates = []
+    for name in run_sequence:
+        if name in seen and name not in duplicates:
+            duplicates.append(name)
+        seen.add(name)
+    if duplicates:
+        raise PipelineContractError(f'run_sequence contains duplicate pipeline(s): {duplicates}')
 
     return {
         name: validate_pipeline_class(pipelines[name], pipeline_name=name)
@@ -119,6 +154,49 @@ def run_pipelines(
     publisher = None
     pipeline_rows = {}
     excel_outputs = []
+
+    # Explicit, not inferred from sys.exc_info() -- confirmed directly
+    # that interpreter exception state is not a reliable signal of
+    # whether *this task* has a primary failure. A caller of
+    # run_pipelines() sitting inside its own, unrelated except: block
+    # made sys.exc_info() non-None for this call's entire duration, even
+    # when the task itself succeeded -- a resource cleanup failure during
+    # that genuinely-successful task incorrectly looked like it had
+    # something ambient to avoid masking, and got logged instead of
+    # raised, silently hiding a real, leaked resource. Only this
+    # function's own try/except genuinely knows whether this task failed.
+    primary_error = None
+    cleanup_errors = []
+    rollback_attempted = False
+
+    def try_step(fn, description):
+        try:
+            fn()
+        except BaseException as e:
+            # BaseException, not Exception -- same reasoning as
+            # cleanup.py's attempt_all_cleanup(): a KeyboardInterrupt
+            # raised by publisher.close()/rollback()/ctx.close() itself
+            # must not stop the remaining cleanup steps in this finally:
+            # block, or replace what's already propagating.
+            e.add_note(description)
+            cleanup_errors.append(e)
+
+    def try_rollback():
+        # Defensive, not currently load-bearing through any reachable
+        # path: try_step() below already catches rollback()'s own
+        # failure rather than letting it propagate, so the skip path's
+        # `try_rollback(); return skipped_result` always completes
+        # normally and the outer except: block never triggers from this
+        # specific scenario. This guard protects against a real
+        # possibility all the same -- some future change adding code
+        # between try_rollback() and that return which itself raises,
+        # which would trigger the outer except: and could otherwise
+        # attempt a second rollback() on the same publisher.
+        nonlocal rollback_attempted
+        if rollback_attempted or publisher is None:
+            return
+        rollback_attempted = True
+        try_step(publisher.rollback, 'while rolling back')
 
     try:
         has_db_outputs = output_db and any(
@@ -175,7 +253,7 @@ def run_pipelines(
 
             if unchanged and not force_run:
                 log.info('sources unchanged, skipping pipeline execution')
-                publisher.rollback()
+                try_rollback()
                 return RunResult(
                     task_name=ctx.task_name,
                     pipeline_rows={},
@@ -284,13 +362,60 @@ def run_pipelines(
             source_fingerprints=current_fingerprints,
         )
 
-    except Exception:
-        if publisher is not None:
-            publisher.rollback()
+    except BaseException as e:
+        # BaseException, not Exception: KeyboardInterrupt, SystemExit, and
+        # GeneratorExit are BaseException subclasses but not Exception
+        # ones, so an `except Exception:` here never caught them --
+        # primary_error stayed None during a genuine interruption,
+        # meaning a cleanup failure during that interruption looked like
+        # the only failure there was to report and replaced the
+        # interruption itself in what actually propagated. Confirmed
+        # directly before fixing. This does not change how the inner
+        # pipeline-loop wrapper behaves (it still only ever wraps
+        # Exception subclasses into PipelineError) -- that wrapper was
+        # already correct here, since KeyboardInterrupt isn't an
+        # Exception subclass either, so it was never caught and wrapped
+        # there in the first place; it needs no change, only this outer
+        # boundary did.
+        primary_error = e
+        try_rollback()
         log.exception('task %s failed', ctx.task_name)
         raise
 
     finally:
         if publisher is not None:
-            publisher.close()
-        ctx.close()
+            try_step(publisher.close, 'while closing publisher')
+        try_step(ctx.close, 'while closing task context')
+
+        if cleanup_errors:
+            if primary_error is not None:
+                # Logged, not raised: primary_error is already
+                # propagating (or about to, from the except: block's own
+                # `raise` above) -- these must never replace it. Each
+                # error's own, correct traceback is attached explicitly
+                # (not a plain log.exception() call here, which would
+                # read sys.exc_info() at *this* point and log whatever's
+                # currently ambient -- confirmed directly this was
+                # primary_error's own traceback, not the cleanup
+                # failure's, silently losing the actual cleanup error
+                # from diagnostics).
+                for e in cleanup_errors:
+                    # See _suppress_context_recursively()'s own docstring
+                    # for why this needs to recurse into a grouped
+                    # cleanup failure's own nested exceptions, not just
+                    # set this on the outer group. Confirmed directly,
+                    # not assumed, that __suppress_context__ is respected
+                    # by logging's own exc_info=(...) formatting, the
+                    # same mechanism `raise ... from None` uses for
+                    # uncaught tracebacks -- not a plain log.exception()
+                    # call here either, which would read sys.exc_info()
+                    # at *this* point and log whatever's currently
+                    # ambient, confirmed directly this was primary_error's
+                    # own traceback, not the cleanup failure's, silently
+                    # losing the actual cleanup error from diagnostics.
+                    _suppress_context_recursively(e)
+                    log.error('cleanup error during run_pipelines()', exc_info=(type(e), e, e.__traceback__))
+            elif len(cleanup_errors) == 1:
+                raise cleanup_errors[0]
+            else:
+                raise BaseExceptionGroup('multiple cleanup steps failed', cleanup_errors)

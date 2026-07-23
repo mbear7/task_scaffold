@@ -288,5 +288,104 @@ class Test8NoMatchAndOnEmpty(unittest.TestCase):
                 build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=tc.LOCAL_FILE_ACCESS)
 
 
+class Test9DirectFilePathRejectedByFolderScanning(unittest.TestCase):
+    """Found by external review, confirmed directly before fixing:
+    passing a direct file path to select_file_infos() (both local and
+    SMB branches) bypassed every filter entirely -- pattern, hidden,
+    system, temp, min_age_seconds -- since it just returned that one file
+    immediately without ever reaching the filtering loop. A caller
+    scanning for '*.xlsx' would get back a '.txt' file it explicitly
+    named, with no error anywhere. select_fixed_file() already exists as
+    the correct, dedicated API for "I know the exact file" -- confirmed
+    no real task in this project relies on the old, bypassing behavior
+    before making this change."""
+
+    def test_direct_file_path_is_rejected_not_silently_selected(self):
+        with TempDir() as d:
+            path = d / 'x.txt'
+            _write(path, b'not an xlsx')
+
+            with self.assertRaises(ValueError):
+                tc.LOCAL_FILE_ACCESS.select_file_infos(str(path), pattern='*.xlsx')
+
+    def test_select_fixed_file_still_works_correctly_for_this_case(self):
+        with TempDir() as d:
+            path = d / 'x.txt'
+            _write(path, b'not an xlsx')
+
+            result = tc.LOCAL_FILE_ACCESS.select_fixed_file(str(path))
+            self.assertEqual(result, str(path))
+
+    def test_folder_scanning_still_works_normally(self):
+        with TempDir() as d:
+            _write(d / 'a.xlsx')
+
+            result = tc.LOCAL_FILE_ACCESS.select_file_infos(str(d), pattern='*.xlsx')
+            self.assertEqual(len(result), 1)
+
+
+class Test10GetSheetRawRowsIsGenuinelyHeaderless(unittest.TestCase):
+    """Found by external review: get_sheet_rows()/get_range()'s header=
+    argument was a confirmed no-op -- [rows[0], *rows[1:]] is
+    mathematically identical to rows, so header=True/False produced
+    identical results. Not fixed in place, since hr_task.py's own
+    sheet_to_raw_dataframe() already depended on this exact, documented
+    behavior. get_sheet_raw_rows() is the new, genuinely header-agnostic
+    method -- migrated hr_task.py to it, removing its own etl.header()/
+    etl.data() reconstruction workaround entirely, confirmed unchanged
+    by the full hr_task.py regression."""
+
+    def test_row_0_is_genuinely_included_as_data(self):
+        with TempDir() as d:
+            path = d / 'x.xlsx'
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.append(['col-a', 'col-b'])
+            ws.append([1, 2])
+            wb.save(path)
+
+            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=tc.LOCAL_FILE_ACCESS)
+            raw = resource.get_sheet_raw_rows('Sheet')
+            self.assertEqual(raw, [('col-a', 'col-b'), (1, 2)])
+            resource.close()
+
+
+class Test11XlsxInfoDoesNotSwallowCloseFailures(unittest.TestCase):
+    """Found by external review: xlsx_info() explicitly caught and
+    discarded any failure from wb.close() (`except Exception: pass`),
+    which didn't follow the same "successful work must not silently hide
+    cleanup failure" policy applied everywhere else in this project. The
+    underlying binary stream still gets its own, separate cleanup via the
+    surrounding `with self.open_binary(...)` regardless of whether
+    wb.close() itself succeeds, so nothing is lost by letting this
+    propagate naturally."""
+
+    def test_close_failure_propagates_instead_of_being_swallowed(self):
+        with TempDir() as d:
+            path = d / 'x.xlsx'
+            _write_xlsx(path)
+
+            import openpyxl
+            original_close = openpyxl.Workbook.close
+
+            def failing_close(self):
+                raise OSError('workbook close failed')
+
+            openpyxl.Workbook.close = failing_close
+            try:
+                with self.assertRaises(OSError):
+                    tc.LOCAL_FILE_ACCESS.xlsx_info(str(path))
+            finally:
+                openpyxl.Workbook.close = original_close
+
+    def test_normal_xlsx_info_still_works(self):
+        with TempDir() as d:
+            path = d / 'x.xlsx'
+            _write_xlsx(path)
+            sheets, tables = tc.LOCAL_FILE_ACCESS.xlsx_info(str(path))
+            self.assertEqual(sheets, ['Sheet'])
+
+
 if __name__ == '__main__':
     unittest.main()

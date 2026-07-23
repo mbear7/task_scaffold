@@ -124,7 +124,23 @@ class FakeDbPublisher:
     write. A pipeline failing mid-loop never reaches update_source_state
     at all (it runs after the loop in runner.py), so that scenario alone
     can never prove this -- confirmed by inspecting runner.py directly,
-    not assumed."""
+    not assumed.
+
+    Deliberately simpler than the real DbPublisher: this commit()/
+    rollback() act unconditionally, unlike the real DbPublisher.commit(),
+    which only commits when its own, explicit _tx exists -- the exact gap
+    that let the real source-check-only commit bug through undetected by
+    every test in this file, since none of them exercise DbPublisher's
+    own commit()/rollback() logic at all, only whether run_pipelines()
+    calls them at the right times. That's intentional scope, not
+    permissiveness: this file tests the runner's orchestration (are
+    commit/rollback called when they should be), and
+    tests/test_db_publish.py separately tests DbPublisher's own,
+    real commit()/rollback() implementation directly, against a fake
+    SQLAlchemy connection that models the real autobegin quirk this fake
+    doesn't need to. Blurring that boundary by making this fake replicate
+    DbPublisher's own internals would just mean two tests checking the
+    same thing two different, redundant ways."""
 
     def __init__(self, *, creds, schema, logger=None, fail_commit=False):
         self.creds = creds
@@ -605,6 +621,29 @@ class Test3TransactionAtomicity(unittest.TestCase):
             )
         self.assertEqual(published[0].close_calls, 1, 'publisher.close() was not called on failure')
         self.assertTrue(resource.closed, 'ctx.close() did not close the resource on failure')
+
+    def test_publisher_close_failure_does_not_mask_the_real_pipeline_failure(self):
+        # Found by external review, confirmed directly before fixing: a
+        # pipeline's real ValueError was being completely replaced by an
+        # unrelated "publisher close failed" RuntimeError, with no trace
+        # of the actual cause anywhere in what propagated.
+        class CloseFailingPublisher(FakeDbPublisher):
+            def close(self):
+                raise RuntimeError('simulated publisher close failure')
+
+        pipelines = {'p': make_pipeline(db_table='t1', raises=True)}
+        resource = FakeFileResource('sig')
+        ctx = tc.task_context(task_name='t', loaders={'r': lambda: resource})
+        ctx.get_resource('r')
+
+        with self.assertRaises(tc.PipelineError) as cm:
+            tc.run_pipelines(
+                task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
+                output_excel=False, output_db=True, creds={}, publisher_factory=CloseFailingPublisher,
+            )
+
+        self.assertIn('failed during pipeline execution', str(cm.exception))
+        self.assertTrue(resource.closed, 'ctx.close() did not run despite publisher.close() also failing')
 
 
 if __name__ == '__main__':

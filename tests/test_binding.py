@@ -551,5 +551,80 @@ class Test10DynamicDbContractOnBoundPipeline(unittest.TestCase):
         self.assertNotIn('static_target', payload.columns, 'static contract should have been fully replaced, not merged')
 
 
+class Test4DuplicateRunSequenceRejected(unittest.TestCase):
+    """Found by external review, confirmed directly before fixing: a
+    duplicated name in run_sequence ran the pipeline twice, with
+    pipeline_rows silently retaining only the final run's count -- no
+    error anywhere, and real consequences (duplicate Excel export, a DB
+    table dropped and recreated twice, duplicated shared-state
+    publication)."""
+
+    def test_run_pipelines_rejects_duplicate_run_sequence(self):
+        call_count = [0]
+
+        class pipeline:
+            spec = tc.PipelineSpec()
+
+            @classmethod
+            def run(cls, ctx):
+                call_count[0] += 1
+                import petl as etl
+                return etl.wrap([('a',), (1,)])
+
+        ctx = tc.task_context(task_name='t', loaders={})
+        with self.assertRaises(tc.PipelineContractError):
+            tc.run_pipelines(
+                task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline},
+                run_sequence=['p', 'p'], output_excel=False, output_db=False,
+            )
+        self.assertEqual(call_count[0], 0, 'pipeline ran before validation could reject the duplicate')
+
+    def test_compute_resource_wiring_rejects_duplicate_run_sequence(self):
+        # A separate validation path, reachable standalone (a task's own
+        # build_context() calls this directly) -- not just protected
+        # when reached through run_pipelines().
+        spec, _ = make_resource()
+
+        class pipeline:
+            @classmethod
+            def run(cls, ctx, *, source):
+                pass
+
+        env = tc.ResourceEnvironment()
+        with self.assertRaises(tc.PipelineContractError):
+            tc.compute_resource_wiring(
+                {'r': spec}, {'p': tc.bind(pipeline, source=spec)}, ['p', 'p'], env,
+            )
+
+    def test_non_duplicate_run_sequence_still_works(self):
+        ran = []
+
+        class p1:
+            spec = tc.PipelineSpec()
+
+            @classmethod
+            def run(cls, ctx):
+                ran.append('p1')
+                import petl as etl
+                return etl.wrap([('a',), (1,)])
+
+        class p2:
+            spec = tc.PipelineSpec()
+
+            @classmethod
+            def run(cls, ctx):
+                ran.append('p2')
+                import petl as etl
+                return etl.wrap([('a',), (1,)])
+
+        ctx = tc.task_context(task_name='t', loaders={})
+        result = tc.run_pipelines(
+            task_name='t', build_context=lambda: ctx, pipelines={'p1': p1, 'p2': p2},
+            run_sequence=['p1', 'p2'], output_excel=False, output_db=False,
+        )
+        self.assertEqual(ran, ['p1', 'p2'])
+        self.assertEqual(result.pipeline_rows, {'p1': 1, 'p2': 1})
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -62,6 +62,13 @@ class ResourceEnvironment:
     base_path: str | None = None
     file_access: object | None = None
     credentials: Mapping[str, object] = field(default_factory=dict)
+    # Confirmed unused anywhere in this project (grep found nothing
+    # beyond this definition). Possibly a legitimate extension point for
+    # a custom loader that needs arbitrary configuration beyond
+    # base_path/file_access/credentials -- but no real resource in this
+    # project needs one yet, so this needs either documentation of a real
+    # use case or removal once one does or doesn't materialize, not
+    # indefinite, undocumented presence.
     config: Mapping[str, object] = field(default_factory=dict)
 
     def resolve_path(self, path):
@@ -254,6 +261,15 @@ def compute_resource_wiring(resources, pipelines, run_sequence, env):
     missing = [name for name in active_names if name not in pipelines]
     if missing:
         raise PipelineContractError(f'run_sequence contains unknown pipeline(s): {missing}')
+
+    seen = set()
+    duplicates = []
+    for name in active_names:
+        if name in seen and name not in duplicates:
+            duplicates.append(name)
+        seen.add(name)
+    if duplicates:
+        raise PipelineContractError(f'run_sequence contains duplicate pipeline(s): {duplicates}')
 
     active_spec_ids = set()
     for name in active_names:

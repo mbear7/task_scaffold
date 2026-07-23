@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Level 1: local/SMB file selection and Excel-workbook-metadata access.
-Needs nothing from task_core -- file_access.py does not need types.py or
-source_tracking.py at all.
+Depends on openpyxl_compat.py, a same-level (level 1) lateral dependency
+for warning suppression -- does not need types.py or source_tracking.py
+at all.
 
 _table_ref() lives here, not in resources/excel.py, deliberately: it's
 called from inside xlsx_info(), a file_access method -- putting it in
@@ -16,7 +17,6 @@ from fnmatch import fnmatch
 from pathlib import Path
 import gc
 import io
-import re
 import stat
 import time
 from typing import Any
@@ -62,6 +62,13 @@ def _has_windows_attr(path, attr_flag):
     except AttributeError:
         return False
 
+
+
+# Compatibility surface -- confirmed unused anywhere in this project,
+# even internally (grep found nothing beyond these definitions
+# themselves). The real filtering loop in _select_local_file_infos below
+# uses its own, private _has_windows_attr_from_stat() directly, not
+# these. Not removed without checking for external consumers first.
 
 
 def is_hidden_file(path):
@@ -227,14 +234,14 @@ class file_access:
             raise FileNotFoundError(f'Path not found: {folder}')
 
         if folder.is_file():
-            st = folder.stat()
-            return [
-                SelectedFile(
-                    path=str(folder),
-                    relative_path=folder.name,
-                    stat_result=st,
-                )
-            ]
+            raise ValueError(
+                f'select_file_infos() is for scanning a folder, not selecting a specific file: '
+                f'{folder} is a file, not a directory. Use select_fixed_file() instead -- '
+                f'select_file_infos() applying its filters (pattern, hidden/system/temp, '
+                f'min_age_seconds) to an explicitly-named file would be a meaningless, '
+                f'surprising contract either way (skip them all, or reject a file the caller '
+                f'named directly because it happens not to match a glob pattern).'
+            )
 
         iterator = folder.rglob(pattern) if recursive else folder.glob(pattern)
         now = time.time()
@@ -298,14 +305,10 @@ class file_access:
             raise FileNotFoundError(f'Path not found: {folder_path}') from e
 
         if stat.S_ISREG(root_st.st_mode):
-            name = str(folder_path).rstrip('\\/').rsplit('\\', 1)[-1].rsplit('/', 1)[-1]
-            return [
-                SelectedFile(
-                    path=str(folder_path),
-                    relative_path=name,
-                    stat_result=root_st,
-                )
-            ]
+            raise ValueError(
+                f'select_file_infos() is for scanning a folder, not selecting a specific file: '
+                f'{folder_path} is a file, not a directory. Use select_fixed_file() instead.'
+            )
 
         if not stat.S_ISDIR(root_st.st_mode):
             raise FileNotFoundError(f'Path not found: {folder_path}')
@@ -464,11 +467,7 @@ class file_access:
                     # into this scope, so each worksheet reference is
                     # already dropped as soon as the next iteration starts --
                     # at least as prompt as the old explicit del, often more so.
-                    try:
-                        wb.close()
-                    except Exception:
-                        pass
-
+                    wb.close()
                     del wb
 
             gc.collect()
@@ -512,6 +511,13 @@ def select_file_infos(
         min_age_seconds=min_age_seconds,
         recursive=recursive,
     )
+
+
+# Compatibility surface -- confirmed unused anywhere in this project
+# (grep found nothing beyond these definitions and their own calls into
+# the underlying class methods). Every real caller uses select_file_infos()
+# directly instead. Not removed without checking for external consumers
+# first.
 
 
 def select_files(

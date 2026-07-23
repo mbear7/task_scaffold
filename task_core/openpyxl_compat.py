@@ -9,7 +9,7 @@ import warnings
 
 @contextmanager
 def suppress_openpyxl_data_validation_warning():
-    # Name kept as-is to avoid touching all ten call sites across
+    # Name kept as-is to avoid touching every call site across
     # resources/excel.py, table_adapters.py, file_access.py -- but this now
     # also covers two more openpyxl "extension not supported" warnings hit in
     # real source files: Slicer List (table/PivotTable slicers) and the

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-hr_task.py -- staff-schedule reporting task, migrated from funnel_pandas.py's
-ssch pipeline onto task_core's mixed-engine machinery (table_adapter='pandas').
-
-funnel_pandas.py is untouched -- its other seven pipelines are unaffected.
-New, independent task file (same relationship ops_task.py has to task_core),
-not a merge into ops_task.py and not a refactor of funnel_pandas.py.
+hr_task.py -- the full HR reporting task on task_core's mixed-engine
+machinery (table_adapter='pandas' throughout): staff, prepare_funnel,
+funnel_closed, funnel_open, declined_close, declined_open, ssch, and
+recruiters. Originally began as a migration of funnel_pandas.py's ssch
+pipeline specifically; every other pipeline was migrated here over time
+since, and funnel_pandas.py is no longer this task's source of truth for
+any of them.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import re
 
 import numpy as np
 import pandas as pd
-import petl as etl
 
 from petl_util import MONTH_MAP
 
@@ -55,7 +55,7 @@ SOURCE_CHANGE_CHECK = SourceChangeCheckConfig(
 )
 
 # Epoch of clean source data -- vacancies opened before this are legacy
-# artifacts from previous years, deliberately excluded (funnel_open.process).
+# artifacts from previous years, deliberately excluded (funnel_open.run).
 MIN_VACANCY_OPEN_DATE = dt.date(2025, 1, 1)
 
 # Shared by preprocess_sheet (prepare_funnel) and recruiters.process_workbook --
@@ -174,14 +174,13 @@ def parse_date_value(value):
 # downstream pipelines via publish_result. ===
 
 def sheet_to_raw_dataframe(resource, sheet_name):
-    # get_sheet_rows() always treats the sheet's own first row as petl's
-    # header (confirmed directly: header=True/False produce identical
-    # results), unlike pd.read_excel(..., header=None), which the logic
-    # below expects -- row 0 needs to stay available as real data, since
-    # the actual header could be anywhere. Uses etl.header()/etl.data(),
-    # the portable petl API, not table attributes.
-    tbl = resource.get_sheet_rows(sheet_name, header=False)
-    raw_rows = [list(etl.header(tbl)), *[list(r) for r in etl.data(tbl)]]
+    # get_sheet_raw_rows() is genuinely headerless (a plain row sequence,
+    # not a petl table), unlike get_sheet_rows()/get_range() -- a petl
+    # table always treats its own first row as its header once read via
+    # etl.header()/etl.data(), regardless of the header= argument used to
+    # build it. Row 0 needs to stay available as real data here, since
+    # the actual header could be anywhere in the sheet.
+    raw_rows = [list(r) for r in resource.get_sheet_raw_rows(sheet_name)]
     return pd.DataFrame(raw_rows)
 
 
@@ -200,8 +199,8 @@ def find_header_row(raw):
 
 
 def split_customer(df):
-    # Shared with recruiters (not yet migrated) -- do not change this
-    # without checking that pipeline too once it exists here.
+    # Shared with recruiters -- do not change this without checking that
+    # pipeline too.
     parts = df['Заказчик'].astype('string').str.split(' / ', expand=True).iloc[:, :4]
     while parts.shape[1] < 4:
         parts[parts.shape[1]] = pd.NA
@@ -1276,8 +1275,8 @@ class funnel_open:
         return out
 
 
-# === Shared by staff and recruiters (not yet migrated) -- error-value
-# cleaning and dynamic, column-name-pattern-driven type coercion. ===
+# === Shared by staff and recruiters -- error-value cleaning and
+# dynamic, column-name-pattern-driven type coercion. ===
 
 ERROR_LITERALS = {
     '#N/A', '#N/A!', '#DIV/0', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?',

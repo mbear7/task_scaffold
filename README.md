@@ -141,7 +141,168 @@ reusable, independently meaningful steps, not indirection for its own
 sake, and folding `run()` into them wasn't the same kind of question as
 folding `process()` into `run()`.
 
+## Cleanup priority: masking a real failure vs. hiding a real one
+
+Found by external review: `task_context.close()` and `run_pipelines()`'s
+publisher-close step both *always* logged cleanup failures and never
+raised them. That was deliberate, and correctly solved a real problem --
+a cleanup failure replacing a genuine pipeline failure -- but it solved
+it too broadly. A cleanup failure on an otherwise-*successful* run was
+just as silently swallowed as one during a real failure, meaning a task
+could report success while genuinely leaking an SMB stream or a DB
+connection, forever, invisibly.
+
+This went through two rounds of external review before landing on the
+current design, and the first fix's own rejected approach is worth
+recording, briefly, precisely because it looked reasonable and wasn't:
+it decided whether to log or raise a cleanup failure by checking
+`sys.exc_info()` -- whether Python currently has *any* exception being
+handled, anywhere up the call stack. The second review found this
+unreliable, and confirmed it directly: a caller of `run_pipelines()`
+sitting inside its own, unrelated `except:` block (`except ValueError:
+run_pipelines(...)`) makes `sys.exc_info()` non-`None` for the call's
+entire duration, even when the task itself completes with no error at
+all -- a resource cleanup failure during that genuinely-successful task
+incorrectly looked like it had something ambient to avoid masking, and
+got logged instead of raised, silently hiding a real, leaked resource
+anyway. There is no reliable way to infer "does *this task* have a
+primary failure" from interpreter state; only `run_pipelines()`'s own
+`try`/`except` genuinely knows.
+
+### Explicit tracking, in `run_pipelines()` itself
+
+`run_pipelines()` sets a plain local, `primary_error = None`, and
+assigns it inside its own outer `except BaseException as e:` block --
+nowhere else, and never inferred from anything ambient. Its `finally:`
+block attempts every cleanup step (publisher close, then context close,
+via a small local `try_step()` helper that catches and collects rather
+than raising immediately) and only then decides what to do with
+whatever it collected: if `primary_error is not None`, every collected
+cleanup failure is logged, and the function's own `raise` (from the
+`except` block above) is what actually propagates -- untouched. If
+`primary_error is None`, whatever was collected is raised instead: a
+single exception if only one thing failed, an `ExceptionGroup` if more
+than one did.
+
+The `except` clause is `except BaseException`, not `except Exception` --
+found by a third round of review: `KeyboardInterrupt`, `SystemExit`, and
+`GeneratorExit` are `BaseException` subclasses, not `Exception` ones, so
+an `Exception`-scoped clause here never caught them, leaving
+`primary_error` at `None` during a genuine interruption -- a cleanup
+failure during that interruption then incorrectly looked like the only
+failure there was to report, and replaced the interruption itself in
+what actually propagated. Confirmed directly before fixing. This does
+not affect the inner pipeline-loop wrapper a few lines up, which still
+only ever catches `Exception` when deciding whether to wrap a failure
+into `PipelineError` -- it already left `KeyboardInterrupt` alone,
+correctly, since that wrapper was never in its path either.
+
+### `task_core/cleanup.py`: `attempt_all_cleanup()`
+
+A small, level-1 module holding one function, used by both
+`task_context.close()` (its own multi-resource loop) and
+`DbPublisher.close()` (its own connection/engine steps, below). It takes
+no suppress/log parameter of any kind: every item it's given is
+attempted regardless of an earlier one failing, and it always raises at
+the end if anything failed -- a single exception, or an `ExceptionGroup`
+for more than one. The decision of whether to let that propagate or
+catch and log it belongs entirely to whichever caller actually has a
+primary-failure signal to consult, which is why `task_context.close()`
+itself, called on its own, always raises a genuine cleanup failure too
+(`run_pipelines()` is the one that catches this and decides, via
+`try_step()`, described above). Deduplication by object identity --
+the same resource object cached under two different loader keys is
+closed exactly once, not twice -- happens in `context.py`'s own
+`close()`, building the list it hands to `attempt_all_cleanup()`, not
+inside `attempt_all_cleanup()` itself.
+
+Lives in its own module rather than inside `context.py` or `runner.py`
+directly: `runner.py` has an existing, deliberate boundary (it
+duck-types `ctx`, and only imports `context.py` under `TYPE_CHECKING`,
+never at runtime) that putting this logic in `context.py` would have
+broken just to share it.
+
+### `DbPublisher.close()` isolates its own two steps
+
+Found by external review, confirmed directly: `close()` used to call
+`self._conn.close()` then `self._engine.dispose()` as two unguarded,
+sequential statements. If the connection failed to close, engine
+disposal was never even attempted -- and since `run_pipelines()` has
+already made its one cleanup attempt at the publisher level by the time
+this runs, there was no retry, a genuine, permanent leak of the engine's
+connection pool. `close()` now treats these as two independent steps
+through `attempt_all_cleanup()`, the same helper `task_context.close()`
+uses, rather than a third, separate implementation of the same pattern.
+
+### Diagnostics: cleanup logs don't duplicate the primary traceback
+
+A cleanup exception collected in `run_pipelines()`'s `finally:` block is
+caught while `primary_error` is already the active exception, so Python
+automatically chains it as that cleanup exception's `__context__` --
+and since `primary_error` is already logged separately, every cleanup
+log entry was repeating the entire primary traceback too. Found by
+external review; not a correctness bug, but a real diagnostics-noise
+one. Fixed by setting `__suppress_context__ = True` on each cleanup
+exception before logging it -- confirmed directly, not assumed, that
+this is respected by `logging`'s own `exc_info=(...)` formatting, the
+same mechanism `raise ... from None` uses for uncaught tracebacks. This
+mutates the exception object permanently, not scoped to that one log
+call in any literal sense (a fair correction from a further review round
+to this section's own, earlier wording) -- in practice this has no real
+consequence beyond the logging itself, since every exception this
+touches is discarded once `run_pipelines()` returns or raises, never
+reused or re-raised as itself anywhere else.
+
+That fix covered a single cleanup exception correctly, but not a
+*grouped* one: a further review round found that `__suppress_context__`
+set only on the outer `BaseExceptionGroup`/`ExceptionGroup` left every
+exception nested inside it still showing its own, full `__context__`
+chain back to `primary_error` -- confirmed directly, with two resources
+each failing to close, that the second one's traceback in the log still
+carried the complete primary traceback with it. Fixed with a small,
+recursive helper (`_suppress_context_recursively()`) that walks into
+`.exceptions` for any nested group, arbitrarily deep, rather than a
+single, top-level-only assignment.
+
+### Cleanup itself needed the same `BaseException` treatment
+
+Widening `run_pipelines()`'s own outer boundary to `BaseException`
+(above) protects a `KeyboardInterrupt`/`SystemExit` raised by the
+*pipeline* -- but a further review round found the two places that
+actually perform cleanup, `cleanup.py`'s `attempt_all_cleanup()` and
+`run_pipelines()`'s own `try_step()`, both still caught only `Exception`.
+An interruption raised *during a resource's own `close()`* wasn't
+protected at all: it could still stop every subsequent resource from
+getting its own close attempt, and still replace whatever primary
+pipeline failure was already propagating -- confirmed directly, with a
+`RuntimeError` pipeline failure and a `KeyboardInterrupt` from one
+resource's `close()`, that the `KeyboardInterrupt` both propagated in
+place of the real failure and pre-empted a second resource's own cleanup
+entirely.
+
+Both now catch `BaseException`. The one further wrinkle: constructing
+`ExceptionGroup` directly with a genuine `BaseException`-only member
+(`KeyboardInterrupt` etc.) raises `TypeError` -- confirmed directly --
+so every group-construction site uses `BaseExceptionGroup` instead. This
+isn't a compromise: `BaseExceptionGroup` automatically becomes a plain
+`ExceptionGroup` instance when every member it's given happens to be an
+`Exception` subclass (confirmed directly, not assumed), so ordinary,
+all-`Exception` multi-resource cleanup failures -- the common case --
+are entirely unaffected and remain catchable via `except ExceptionGroup:`
+specifically, not just the broader `BaseExceptionGroup`.
+
+Every claim above -- explicit tracking over interpreter-state inference,
+`attempt_all_cleanup()`'s actual no-suppress-parameter shape, `close()`'s
+step isolation, `BaseException` handling in both the outer boundary and
+cleanup itself, recursive traceback suppression, and the
+`BaseExceptionGroup`/`ExceptionGroup` auto-downcast this all depends on
+-- is covered by a test in `tests/test_cleanup.py` or
+`tests/test_db_publish.py` that was checked against a deliberately
+reverted version of the real fix and confirmed to fail, not just written
+and trusted.
+
 ## Running tests
+
 
 No external test framework -- `pytest` isn't assumed to be available, so
 this uses `unittest` (standard library).
@@ -264,6 +425,12 @@ verification for those happens by actually running them, in-session, with
 real data, not by growing a parallel test suite around each one.
 
 ## Dependencies
+
+**Python 3.11 or newer is required.** `task_core/cleanup.py` and
+`runner.py` use the builtin `ExceptionGroup` (for raising more than one
+cleanup failure together), added in 3.11 -- not stated anywhere else in
+this project until now. Found by external review; this project has been
+built and verified against Python 3.12.3 specifically.
 
 See `requirements.txt`. `lxml`/`petl`/`smbclient`/`sqlalchemy`/`psycopg2`
 are real `task_core` dependencies. `petl_util` itself is not in

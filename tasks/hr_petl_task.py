@@ -63,8 +63,11 @@ def read_ssch2_sheet(file_set, selected_file, *, sheet=0):
 
     with file_set.open_file(selected_file) as src:
         wb = load_workbook(src, read_only=True, data_only=True)
-        ws = wb.worksheets[sheet] if isinstance(sheet, int) else wb[sheet]
-        rows = [list(row) for row in ws.iter_rows(values_only=True)]
+        try:
+            ws = wb.worksheets[sheet] if isinstance(sheet, int) else wb[sheet]
+            rows = [list(row) for row in ws.iter_rows(values_only=True)]
+        finally:
+            wb.close()
 
     if len(metadata) != len(rows):
         log.warning(
@@ -99,7 +102,14 @@ class ssch2:
         excel_name='ssch2.xlsx',
         db_table='hr_ssch2',
         # No db_contract needed -- columns are stable across files.
-        # table_adapter left unset (petl) -- exercises the petl branch.
+        # table_adapter deliberately left unset (petl) -- unlike
+        # ops_task.py's pipelines, which now set table_adapter='petl'
+        # explicitly per types.py's own stated policy (new pipelines
+        # should set this explicitly, not rely on None). This file's own
+        # module docstring states its purpose is demonstrating the petl
+        # branch via the left-unset pathway specifically -- setting it
+        # explicitly here would remove the only place in this project
+        # that still exercises that legacy-compatible path at all.
     )
 
     @staticmethod

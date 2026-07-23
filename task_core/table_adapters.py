@@ -80,8 +80,7 @@ class _PandasAdapter:
         if not isinstance(tbl, pd.DataFrame):
             raise PipelineContractError(
                 f"expected a pandas DataFrame, got {type(tbl).__name__} -- "
-                f"set table_adapter='petl' (or leave it unset) if this "
-                f"pipeline should use petl"
+                f"set table_adapter='petl' if this pipeline should use petl"
             )
 
     def nrows(self, tbl):

@@ -139,6 +139,7 @@ class nsi_911:
         excel_name='nsi_911.xlsx',
         db_table='ops_nsi_911',
         db_table_id_pix=280,
+        table_adapter='petl',
         db_output=[
             'id', 'name', 'created', 'closed', 'state', 'client_login', 'category', 'agent', 'responsible',
             'unit', 'date', 'days_diff', 'time_elapsed', 'sla3', 'sla6', 'status', 'metric', 'block', 'person',
@@ -197,6 +198,7 @@ class mdm:
         excel_name='mdm.xlsx',
         db_table='ops_mdm',
         db_table_id_pix=281,
+        table_adapter='petl',
         db_output=['type', 'id', 'created_by', 'be', 'status', 'date_start', 'date_end', 'date', 'total_days', 'dur_amend', 'proc_days', 'sla', 'metric', 'block'],
     )
 
@@ -244,6 +246,7 @@ class tickets_1c:
         excel_name='tickets_1c.xlsx',
         db_table='ops_tickets_1c',
         db_table_id_pix=282,
+        table_adapter='petl',
         db_output=[
             'op_type', 'date_start', 'date_end', 'proc_mins', 'unit', 'serviced_by', 'is_error', 'error_kind', 'input_attempts',
             'date', 'diff_days', 'sla', 'total_mins', 'total_days', 'metric', 'block', 'person',
@@ -295,6 +298,7 @@ class ca:
         excel_name='ca.xlsx',
         db_table='ops_ca',
         db_table_id_pix=283,
+        table_adapter='petl',
     )
 
     @classmethod
@@ -327,6 +331,7 @@ class db_strat:
     spec = PipelineSpec(
         excel_name='db_strat.xlsx',
         db_table='ops_db_strat',
+        table_adapter='petl',
     )
 
     @classmethod
@@ -342,6 +347,7 @@ class cal:
         excel_name='cal.xlsx',
         db_table='ops_cal',
         db_table_id_pix=284,
+        table_adapter='petl',
     )
 
     @classmethod
@@ -389,7 +395,7 @@ def main(base_path=BASE_PATH, output_creds=None, strat_db_creds=None, pg_schema=
 if __name__ == '__main__':
     result = main()
     if result.skipped:
-        # The outer DAG decides what result.skipped should mean (Airflow
-        # skipped, success, etc.) -- this task file only reports it.
+        # Whatever external orchestrator calls this (e.g. Airflow) decides
+        # what result.skipped should mean to it (its own "skipped" state,
+        # a success, etc.) -- this task file only reports the fact.
         logging.getLogger(TASK_NAME).info('Scaffold skipped task: %s', result.skip_reason)
-    pix_ids = result.db_committed_table_ids_pix

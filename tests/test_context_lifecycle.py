@@ -151,6 +151,60 @@ class TestAllLoadedResourcesClosedByContext(unittest.TestCase):
         self.assertEqual(r2.close_calls, 1)
 
 
+class TestCloseAttemptsEveryResourceEvenIfOneFails(unittest.TestCase):
+    """Found by external review, not here first: the original close()
+    stopped at the first resource whose own close() raised, silently
+    leaking every resource after it. Confirmed directly before fixing --
+    a second, perfectly healthy resource was never closed at all."""
+
+    def test_a_failing_close_does_not_prevent_other_resources_closing(self):
+        class BadResource:
+            def close(self):
+                raise RuntimeError('this resource fails to close')
+
+        class GoodResource:
+            def __init__(self):
+                self.closed = False
+            def close(self):
+                self.closed = True
+
+        bad = BadResource()
+        good = GoodResource()
+        ctx = tc.task_context(task_name='t', loaders={'bad': lambda: bad, 'good': lambda: good})
+        ctx.get_resource('bad')
+        ctx.get_resource('good')
+
+        # Standalone call, no ambient exception -- close() now correctly
+        # raises the cleanup failure (see tests/test_cleanup.py for the
+        # full reasoning), rather than always logging and never raising.
+        # The core invariant this test exists for is unchanged: every
+        # resource still gets attempted despite an earlier one failing.
+        with self.assertRaises(RuntimeError):
+            ctx.close()
+
+        self.assertTrue(good.closed, 'a resource after a failing one was never closed')
+
+    def test_close_is_idempotent(self):
+        resource = InstrumentedResource('r', [])
+        ctx = tc.task_context(task_name='t', loaders={'r': lambda: resource})
+        ctx.get_resource('r')
+
+        ctx.close()
+        ctx.close()  # must not re-attempt or raise
+
+        self.assertEqual(resource.close_calls, 1)
+
+    def test_same_object_under_two_loader_keys_closed_once(self):
+        shared = InstrumentedResource('shared', [])
+        ctx = tc.task_context(task_name='t', loaders={'alias1': lambda: shared, 'alias2': lambda: shared})
+        ctx.get_resource('alias1')
+        ctx.get_resource('alias2')
+
+        ctx.close()
+
+        self.assertEqual(shared.close_calls, 1, 'the same object under two aliases was closed more than once')
+
+
 class Test5ResultAndSharedDiagnostics(unittest.TestCase):
     def test_get_result_missing_gives_clear_message(self):
         ctx = tc.task_context(task_name='t', loaders={})

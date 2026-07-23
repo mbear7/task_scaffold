@@ -10,8 +10,8 @@ this module import-free.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 # Closed set for PipelineSpec.table_adapter. None is legacy-only, kept
@@ -47,13 +47,21 @@ class PipelineSpec:
             raise TypeError('db_table must be str or None')
 
         if self.db_output is not None:
-            if (
-                isinstance(self.db_output, (str, Mapping))
-                or not isinstance(self.db_output, Iterable)
-            ):
-                raise TypeError('db_output must be a sequence of strings or None')
+            # Require the declared contract (list[str] | tuple[str, ...] |
+            # None) exactly, not any Iterable -- a generator would pass
+            # isinstance(..., Iterable), get silently consumed by the
+            # all(isinstance(item, str) ...) check below, and leave
+            # self.db_output holding an exhausted generator forever after
+            # (list(spec.db_output) == [] on every later read, with no
+            # error anywhere). Sets are also excluded despite being
+            # Iterable and non-string/Mapping -- db_output's order is
+            # meaningful (it's a column projection/order), and a set
+            # doesn't preserve one.
+            if not isinstance(self.db_output, (list, tuple)):
+                raise TypeError('db_output must be a list or tuple of strings, or None')
             if not all(isinstance(item, str) for item in self.db_output):
                 raise TypeError('db_output must contain only strings')
+            object.__setattr__(self, 'db_output', tuple(self.db_output))
 
         if self.db_contract is not None:
             if not isinstance(self.db_contract, dict):
@@ -63,9 +71,20 @@ class PipelineSpec:
                 for key, value in self.db_contract.items()
             ):
                 raise TypeError('db_contract must map strings to strings')
+            # frozen=True only ever blocked reassigning self.db_contract
+            # itself, never mutating the dict it points to -- confirmed
+            # directly: spec.db_contract['x'] = 'y' worked fine despite
+            # the dataclass being frozen, contradicting export.py's
+            # stated guarantee that publish configuration is captured
+            # before run() and cannot change during execution.
+            # MappingProxyType actually closes that, matching the same
+            # treatment already given to PipelineBinding.resources.
+            object.__setattr__(self, 'db_contract', MappingProxyType(dict(self.db_contract)))
 
-        if self.db_type_overrides is not None and not isinstance(self.db_type_overrides, dict):
-            raise TypeError('db_type_overrides must be dict or None')
+        if self.db_type_overrides is not None:
+            if not isinstance(self.db_type_overrides, dict):
+                raise TypeError('db_type_overrides must be dict or None')
+            object.__setattr__(self, 'db_type_overrides', MappingProxyType(dict(self.db_type_overrides)))
 
         if not isinstance(self.db_updated_at, (bool, str)):
             raise TypeError('db_updated_at must be bool or str')
@@ -91,9 +110,10 @@ class DbRunResult:
     had_outputs: bool
     committed: bool
     # Typed list[Any], not list[DbTableResult]: DbTableResult is defined in
-    # db_publish.py. Even though db_publish.py sits outside the task_core
-    # package, it's still an implementation module -- the same reasoning as
-    # RunResult.source_fingerprints (section 2a) applies: types.py stays
+    # db_publish.py. Even though db_publish.py now lives inside task_core
+    # (task_core/db_publish.py), it's still an implementation module one
+    # level up from types.py -- the same reasoning as
+    # RunResult.source_fingerprints below applies: types.py stays
     # stdlib-only, full stop, not "stdlib-only except peer modules that
     # happen to be convenient."
     committed_tables: list[Any]

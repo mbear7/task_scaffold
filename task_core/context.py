@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Level 2: task_context. Depends on source_tracking.py (dispatch types,
-SourceFingerprint, make_source_signature, _json_safe_scalar) and
-types.py (SourceCheckError). Does NOT depend on resources/ -- loaders
-are injected by the caller (ops_task.py-style build_context()
-functions), never imported here.
+SourceFingerprint, make_source_signature, _json_safe_scalar), types.py
+(SourceCheckError), and cleanup.py (attempt_all_cleanup, level 1) for
+close()'s own cleanup-priority logic. Does NOT depend on resources/ --
+loaders are injected by the caller (a task's own build_context(), whether
+hand-rolled or built via build_resource_context()), never imported here.
 """
 
+import logging
+
+from task_core.cleanup import attempt_all_cleanup
 from task_core.types import SourceCheckError
 from task_core.source_tracking import (
     TrackedResourceSource,
@@ -18,12 +22,14 @@ from task_core.source_tracking import (
 
 
 class task_context:
-    def __init__(self, task_name, loaders, tracked_sources=None, resource_keys_by_spec_id=None):
+    def __init__(self, task_name, loaders, tracked_sources=None, resource_keys_by_spec_id=None, logger=None):
         self.task_name = task_name
         self._loaders = loaders
         self._cache = {}
         self._results = {}
         self._shared = {}
+        self._closed = False
+        self.log = logger or logging.getLogger(__name__)
         self.tracked_sources = list(tracked_sources) if tracked_sources else []
         # Populated by build_resource_context() (task_core/binding.py) for
         # tasks using the RESOURCES/bind() model -- maps a ResourceSpec's
@@ -136,6 +142,8 @@ class task_context:
         )
 
     def get_resource(self, name):
+        if self._closed:
+            raise RuntimeError(f'{self.task_name}: task_context is already closed')
         if name not in self._cache:
             if name not in self._loaders:
                 raise KeyError(f'no loader registered for resource: {name!r}')
@@ -158,6 +166,11 @@ class task_context:
         self._shared[name] = value
 
     def get_shared(self, name, default=None):
+        # Compatibility surface -- confirmed unused anywhere in this
+        # project (grep found nothing); every real caller uses
+        # require_shared() instead, which fails clearly on a missing key
+        # rather than silently returning a default. Not removed without
+        # checking for external consumers first.
         return self._shared.get(name, default)
 
     def require_shared(self, name):
@@ -174,10 +187,36 @@ class task_context:
         self._shared[name].append(value)
 
     def close(self):
-        for obj in self._cache.values():
+        if self._closed:
+            return
+        self._closed = True
+
+        seen_ids = set()
+        to_close = []
+        for name, obj in self._cache.items():
+            if id(obj) in seen_ids:
+                continue  # same object cached under two loader keys -- close it once, not twice
+            seen_ids.add(id(obj))
+
             close_fn = getattr(obj, 'close', None)
             if close_fn is not None:
-                close_fn()
+                to_close.append((name, close_fn))
+
+        self._cache = {}
+
+        # Always attempts every resource and always raises collected
+        # failures -- this method has no way of knowing, on its own,
+        # whether its caller already has some other, primary failure to
+        # protect from being masked (confirmed directly: inferring this
+        # from sys.exc_info() is unreliable -- see cleanup.py's own
+        # module docstring). run_pipelines() is the caller that actually
+        # knows, and catches whatever this raises to make that decision
+        # itself, explicitly.
+        attempt_all_cleanup(
+            to_close,
+            close_fn=lambda item: item[1](),
+            describe=lambda item: f'while closing resource {item[0]!r}',
+        )
 
 
 # Example:
