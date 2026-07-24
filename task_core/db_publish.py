@@ -15,6 +15,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
+from task_core.types import find_duplicates
 
 
 @dataclass(frozen=True)
@@ -119,12 +120,7 @@ def _validate_unique_columns(columns, *, table_name):
     # clearly here. Distinct original labels that stringify to the same
     # value (1 and '1') hit this identically, since columns is already
     # the stringified list by the time this runs.
-    seen = set()
-    duplicates = []
-    for col in columns:
-        if col in seen and col not in duplicates:
-            duplicates.append(col)
-        seen.add(col)
+    duplicates = find_duplicates(columns)
     if duplicates:
         raise DbPublishError(f'{table_name!r}: duplicate output column names: {duplicates!r}')
 

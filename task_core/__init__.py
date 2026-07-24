@@ -8,9 +8,17 @@ This is the acceptance test for the whole package migration: every name
 below must resolve exactly as it did when task_core was a single flat
 file, so that existing *_task.py files (ops_task.py and friends) need zero
 source changes.
+
+One recorded, deliberate behavior exception to that guarantee (v0.2.0):
+select_file_infos() given a *file* path now raises ValueError directing
+callers to select_fixed_file(), instead of silently returning a
+single-file selection with every filter argument ignored. The name still
+resolves; this one behavior intentionally does not. See README
+("Dependencies" section's changelog note) and file_access.py's own error
+message for the rationale.
 """
 
-__version__ = '0.1.1'
+__version__ = '0.2.0'
 
 from task_core.types import (
     DbRunResult,

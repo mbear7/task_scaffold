@@ -27,6 +27,7 @@ from task_core.types import (
     PipelineError,
     RunResult,
     SourceCheckError,
+    find_duplicates,
     get_pipeline_spec,
 )
 from task_core.source_state import build_source_state_store, update_source_state
@@ -92,12 +93,7 @@ def validate_pipeline_classes(pipelines, run_sequence):
     if missing:
         raise PipelineContractError(f'run_sequence contains unknown pipeline(s): {missing}')
 
-    seen = set()
-    duplicates = []
-    for name in run_sequence:
-        if name in seen and name not in duplicates:
-            duplicates.append(name)
-        seen.add(name)
+    duplicates = find_duplicates(run_sequence)
     if duplicates:
         raise PipelineContractError(f'run_sequence contains duplicate pipeline(s): {duplicates}')
 
@@ -199,10 +195,7 @@ def run_pipelines(
         try_step(publisher.rollback, 'while rolling back')
 
     try:
-        has_db_outputs = output_db and any(
-            specs[name].db_table
-            for name in run_sequence
-        )
+        has_db_outputs = output_db and any(specs[name].db_table for name in run_sequence)
 
         source_check_enabled = (
             output_db
@@ -389,30 +382,21 @@ def run_pipelines(
 
         if cleanup_errors:
             if primary_error is not None:
-                # Logged, not raised: primary_error is already
-                # propagating (or about to, from the except: block's own
-                # `raise` above) -- these must never replace it. Each
-                # error's own, correct traceback is attached explicitly
-                # (not a plain log.exception() call here, which would
-                # read sys.exc_info() at *this* point and log whatever's
-                # currently ambient -- confirmed directly this was
-                # primary_error's own traceback, not the cleanup
-                # failure's, silently losing the actual cleanup error
-                # from diagnostics).
+                # Logged, not raised: primary_error is already propagating
+                # (or about to, from the except: block's own `raise` above)
+                # -- these must never replace it. Each error's own, correct
+                # traceback is attached explicitly via exc_info=(...): a
+                # plain log.exception() here would read sys.exc_info() at
+                # *this* point and log whatever's currently ambient --
+                # confirmed directly that was primary_error's own traceback,
+                # not the cleanup failure's, silently losing the actual
+                # cleanup error from diagnostics. __suppress_context__ is
+                # respected by that same exc_info formatting (the `raise
+                # ... from None` mechanism); see
+                # _suppress_context_recursively()'s docstring for why it
+                # must recurse into a grouped failure's nested exceptions
+                # rather than mark only the outer group.
                 for e in cleanup_errors:
-                    # See _suppress_context_recursively()'s own docstring
-                    # for why this needs to recurse into a grouped
-                    # cleanup failure's own nested exceptions, not just
-                    # set this on the outer group. Confirmed directly,
-                    # not assumed, that __suppress_context__ is respected
-                    # by logging's own exc_info=(...) formatting, the
-                    # same mechanism `raise ... from None` uses for
-                    # uncaught tracebacks -- not a plain log.exception()
-                    # call here either, which would read sys.exc_info()
-                    # at *this* point and log whatever's currently
-                    # ambient, confirmed directly this was primary_error's
-                    # own traceback, not the cleanup failure's, silently
-                    # losing the actual cleanup error from diagnostics.
                     _suppress_context_recursively(e)
                     log.error('cleanup error during run_pipelines()', exc_info=(type(e), e, e.__traceback__))
             elif len(cleanup_errors) == 1:

@@ -77,10 +77,18 @@ def month_start_date(value):
     return ts.to_period('M').to_timestamp().date()
 
 
-def normalize_header_label(value):
+def is_blank_header_label(value):
     if value is None:
-        return None
+        return True
+    if isinstance(value, str) and value == '':
+        return True
     if isinstance(value, float) and pd.isna(value):
+        return True
+    return False
+
+
+def normalize_header_label(value):
+    if is_blank_header_label(value):
         return None
     if not isinstance(value, str):
         return value
@@ -101,12 +109,63 @@ def check_no_duplicate_headers(labels, file_name):
     seen = {}
     duplicates = {}
     for i, label in enumerate(labels):
+        if is_blank_header_label(label):
+            continue
         if label in seen:
             duplicates.setdefault(label, [seen[label]]).append(i)
         else:
             seen[label] = i
     if duplicates:
         raise ValueError(f'{file_name}: duplicate header labels: {duplicates!r}')
+
+
+def select_unique_required_columns(df, required_cols, location):
+    # Deliberately a *narrower* duplicate policy than
+    # check_no_duplicate_headers() above -- two policies coexist in this
+    # file on purpose, not by accident. Pipelines that project down to a
+    # fixed required-column set immediately (staff, recruiters) only need
+    # uniqueness among the columns they actually keep; a duplicate among
+    # headers they're about to discard is not their problem. Pipelines
+    # that keep wide columns for later processing (prepare_funnel's
+    # sheets, ssch's promoted tables, where drop_other/melt happens much
+    # further downstream) check ALL headers via
+    # check_no_duplicate_headers(), because any of those columns may be
+    # touched later.
+    required_cols = list(required_cols)
+    required_set = set(required_cols)
+
+    if len(required_set) != len(required_cols):
+        duplicate_requirements = sorted({
+            col for col in required_cols if required_cols.count(col) > 1
+        })
+        raise ValueError(
+            f'{location}: required column list contains duplicates: '
+            f'{duplicate_requirements!r}'
+        )
+
+    positions = {col: [] for col in required_cols}
+    for index, label in enumerate(df.columns):
+        if label in required_set:
+            positions[label].append(index)
+
+    missing = [col for col in required_cols if not positions[col]]
+    duplicates = {
+        col: indexes
+        for col, indexes in positions.items()
+        if len(indexes) > 1
+    }
+
+    if missing or duplicates:
+        problems = []
+        if missing:
+            problems.append(f'missing: {missing!r}')
+        if duplicates:
+            problems.append(f'duplicates: {duplicates!r}')
+        raise ValueError(
+            f'{location}: invalid required headers: ' + '; '.join(problems)
+        )
+
+    return df.iloc[:, [positions[col][0] for col in required_cols]].copy()
 
 
 def parse_date_value(value):
@@ -1481,7 +1540,6 @@ class staff:
         hdr = trimmed.iloc[header_idx:].copy().reset_index(drop=True)
         hdr.columns = [normalize_header_label(value) for value in hdr.iloc[0].tolist()]
         hdr = hdr.iloc[1:].reset_index(drop=True)
-        check_no_duplicate_headers(list(hdr.columns), f'{file_name}::{sheet_name}')
 
         required_cols = [
             'Блок',
@@ -1492,9 +1550,11 @@ class staff:
             'Кол-во шт. ед.',
             'Кол-во занимаемых шт. ед.',
         ]
-        missing = [col for col in required_cols if col not in hdr.columns]
-        if missing:
-            raise ValueError(f'{file_name}::{sheet_name}: missing required columns after header promotion: {missing!r}')
+        hdr = select_unique_required_columns(
+            hdr,
+            required_cols,
+            f'{file_name}::{sheet_name}',
+        )
 
         out = (
             apply_dynamic_types(
@@ -1622,17 +1682,15 @@ class recruiters:
         hdr = raw.iloc[header_idx:].copy().reset_index(drop=True)
         hdr.columns = [normalize_header_label(value) for value in hdr.iloc[0].tolist()]
         hdr = hdr.iloc[1:].reset_index(drop=True)
-        unnamed = [c for c in hdr.columns if pd.isna(c) or str(c).strip() == '']
-        if unnamed:
-            hdr = hdr.drop(columns=unnamed)
-        check_no_duplicate_headers(list(hdr.columns), f'{resource.file_path}::{cls.source_sheet}')
 
         required_cols = ['Id', 'Название вакансии', 'Заказчик', 'Ответственный рекрутер', 'Статус', 'Дата открытия', 'Дата закрытия', 'Плановое закрытие']
-        missing = [col for col in required_cols if col not in hdr.columns]
-        if missing:
-            raise ValueError(f'{resource.file_path}::{cls.source_sheet}: missing required columns after header promotion: {missing!r}')
+        hdr = select_unique_required_columns(
+            hdr,
+            required_cols,
+            f'{resource.file_path}::{cls.source_sheet}',
+        )
 
-        base = split_customer(apply_dynamic_types(hdr[required_cols].copy(), resource.file_path, cls.source_sheet))
+        base = split_customer(apply_dynamic_types(hdr, resource.file_path, cls.source_sheet))
         base = base.drop(columns=['Заказчик'])
         flt1 = base[
             base['ЮР'].eq(TARGET_LEGAL_ENTITY)

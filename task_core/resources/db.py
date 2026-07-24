@@ -10,16 +10,12 @@ import petl as etl
 from task_core.db_publish import validate_pg_creds
 
 
-_SAFE_TABLE_IDENTIFIER_RE = re.compile(
-    r'^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$'
-)
+_SAFE_TABLE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$')
 
 
 def _validate_table_identifier(table):
     if not isinstance(table, str) or not _SAFE_TABLE_IDENTIFIER_RE.match(table):
-        raise ValueError(
-            f'Unsafe table identifier: {table!r}. Use query= for custom SQL.'
-        )
+        raise ValueError(f'Unsafe table identifier: {table!r}. Use query= for custom SQL.')
     return table
 
 

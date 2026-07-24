@@ -52,7 +52,7 @@ from types import MappingProxyType
 from typing import Callable, Mapping
 
 from task_core.source_tracking import TrackedResourceSource
-from task_core.types import PipelineContractError
+from task_core.types import PipelineContractError, find_duplicates
 
 
 # === Resource environment ===
@@ -62,14 +62,12 @@ class ResourceEnvironment:
     base_path: str | None = None
     file_access: object | None = None
     credentials: Mapping[str, object] = field(default_factory=dict)
-    # Confirmed unused anywhere in this project (grep found nothing
-    # beyond this definition). Possibly a legitimate extension point for
-    # a custom loader that needs arbitrary configuration beyond
-    # base_path/file_access/credentials -- but no real resource in this
-    # project needs one yet, so this needs either documentation of a real
-    # use case or removal once one does or doesn't materialize, not
-    # indefinite, undocumented presence.
-    config: Mapping[str, object] = field(default_factory=dict)
+    # A previous revision also carried a generic `config` mapping here,
+    # annotated as unused-decide-or-remove. Removed (v0.2.0): nothing in
+    # this project ever read it, credentials already covers the
+    # custom-loader need, and removal was free precisely while unused.
+    # Re-add it the day a real loader needs arbitrary configuration --
+    # with that loader as its documented use case.
 
     def resolve_path(self, path):
         path = os.fspath(path)
@@ -262,12 +260,7 @@ def compute_resource_wiring(resources, pipelines, run_sequence, env):
     if missing:
         raise PipelineContractError(f'run_sequence contains unknown pipeline(s): {missing}')
 
-    seen = set()
-    duplicates = []
-    for name in active_names:
-        if name in seen and name not in duplicates:
-            duplicates.append(name)
-        seen.add(name)
+    duplicates = find_duplicates(active_names)
     if duplicates:
         raise PipelineContractError(f'run_sequence contains duplicate pipeline(s): {duplicates}')
 

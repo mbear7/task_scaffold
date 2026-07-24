@@ -10,9 +10,42 @@ this module import-free.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
+
+# Runtime floor for the whole package, enforced at import time -- not just
+# documented in the README. cleanup.py and runner.py use e.add_note() and
+# the ExceptionGroup builtins (3.11+); on 3.10 nothing would fail until a
+# cleanup error actually occurred, at which point add_note() would raise
+# AttributeError *inside the exception handler*, masking the real failure
+# -- precisely the failure mode the cleanup redesign exists to eliminate.
+# The check lives here, not in __init__.py, because the facade is pure
+# re-exports by standing rule, and types.py is the first module every
+# import path through the facade loads anyway.
+if sys.version_info < (3, 11):
+    raise RuntimeError(
+        f'task_core requires Python 3.11 or newer (found {sys.version.split()[0]}): '
+        'cleanup-failure handling uses ExceptionGroup and BaseException.add_note(), '
+        'which do not exist before 3.11.'
+    )
+
+
+def find_duplicates(items):
+    """Values appearing more than once in items, in first-occurrence order,
+    each listed once. The one shared implementation of an idiom previously
+    hand-rolled in runner.py, binding.py, and db_publish.py -- order matters
+    (error messages should report duplicates in the order the caller's data
+    presents them), which is why this isn't a set operation."""
+    seen = set()
+    duplicates = []
+    for item in items:
+        if item in seen and item not in duplicates:
+            duplicates.append(item)
+        seen.add(item)
+    return duplicates
+
 
 # Closed set for PipelineSpec.table_adapter. None is legacy-only, kept
 # solely so pre-existing specs (written before this field existed) never

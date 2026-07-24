@@ -17,6 +17,7 @@ execution.
 import unittest
 
 import task_core as tc
+from task_core.types import find_duplicates
 
 
 class Test1DbOutputRejectsNonListTuple(unittest.TestCase):
@@ -97,3 +98,22 @@ class Test2DbContractAndTypeOverridesGenuinelyImmutable(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestFindDuplicates(unittest.TestCase):
+    """find_duplicates() is the one shared implementation of the
+    order-preserving duplicate-finder previously hand-rolled in
+    runner.py, binding.py, and db_publish.py -- these tests pin the
+    properties those three call sites rely on for their error messages."""
+
+    def test_no_duplicates_returns_empty_list(self):
+        self.assertEqual(find_duplicates(['a', 'b', 'c']), [])
+        self.assertEqual(find_duplicates([]), [])
+
+    def test_first_occurrence_order_each_duplicate_once(self):
+        # 'b' duplicates before 'a' does -- reported in that order, and a
+        # triple still appears exactly once.
+        self.assertEqual(find_duplicates(['a', 'b', 'b', 'a', 'b']), ['b', 'a'])
+
+    def test_works_on_any_iterable_of_hashables(self):
+        self.assertEqual(find_duplicates(iter((1, 2, 1))), [1])

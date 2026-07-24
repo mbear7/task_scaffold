@@ -59,12 +59,7 @@ class SourceFingerprint:
 # MD5 is acceptable here: this is a non-security change-detection digest
 # over file metadata, not a security hash.
 def make_source_signature(payload):
-    normalized = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(',', ':'),
-    )
+    normalized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     return hashlib.md5(normalized.encode('utf-8')).hexdigest()
 
 

@@ -275,13 +275,7 @@ class file_access:
             except ValueError:
                 relative_path = fn.name
 
-            files.append(
-                SelectedFile(
-                    path=str(fn),
-                    relative_path=relative_path,
-                    stat_result=st,
-                )
-            )
+            files.append(SelectedFile(path=str(fn), relative_path=relative_path, stat_result=st))
 
         if not files:
             raise NoMatchingFilesError(f'No files found in {folder} for pattern {pattern!r}')
@@ -350,13 +344,7 @@ class file_access:
                     if age_seconds < float(min_age_seconds):
                         continue
 
-                files.append(
-                    SelectedFile(
-                        path=full_path,
-                        relative_path=rel_path,
-                        stat_result=st,
-                    )
-                )
+                files.append(SelectedFile(path=full_path, relative_path=rel_path, stat_result=st))
 
         if not files:
             raise NoMatchingFilesError(f'No files found in {folder_path} for pattern {pattern!r}')

@@ -14,10 +14,7 @@ def setup_logging(task_name, level=logging.INFO, smb_level=logging.WARNING):
     # (very verbose) protocol-level logging out of routine task logs; pass
     # logging.DEBUG here to see actual SMB session/auth/tree-connect
     # traffic when diagnosing DFS access issues.
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-    )
+    logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     logging.getLogger('smbprotocol').setLevel(smb_level)
     logging.getLogger('smbclient').setLevel(smb_level)
 

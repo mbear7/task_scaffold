@@ -52,6 +52,14 @@ script, which can't find `task_core`:
 python3 -m tasks.hr_task
 ```
 
+Also run *tests and interactive debugging* from the project root, never
+from inside `task_core/` itself: with the working directory inside the
+package, `task_core/types.py` shadows Python's own stdlib `types` module
+and the interpreter fails during startup imports with a circular-import
+error that looks like package corruption (`cannot import name
+'GenericAlias' from partially initialized module 'types'`). Nothing is
+corrupt -- just cd back to the project root.
+
 ## task_core is standalone; tasks depend on real, external things
 
 `task_core` itself depends on no external, ad hoc utility module for
@@ -141,6 +149,36 @@ reusable, independently meaningful steps, not indirection for its own
 sake, and folding `run()` into them wasn't the same kind of question as
 folding `process()` into `run()`.
 
+## Formatting: one thought, one line
+
+Formatting tracks logical units, not syntax trees. A single logical step
+stays on a single line even when that line is long --
+`.convert('grade', lambda x: round_half_up(x, 1) if x not in (None, '') else None)`
+is one thought, and exploding it across five lines makes the reader
+reassemble it while destroying the shape of the pipeline around it (a
+petl chain's readability *is* its one-transformation-per-line shape).
+Expanded formatting is used only when at least one of these applies:
+
+- the expression has multiple logical steps
+- nesting makes it hard to scan
+- error handling is involved
+- intermediate names materially improve meaning
+- the line becomes genuinely difficult to read
+
+The same test governs helper extraction: extract when the name carries
+meaning the expression can't, or when there are real multiple call sites
+with drift risk -- never merely to shorten a line. A once-called helper
+whose body is shorter than its signature is indirection, not clarity.
+
+Scope: this convention binds `tasks/` fully -- dense, pipeline-shaped
+code read by someone who knows the domain. `task_core` sits deliberately
+further toward the explicit end (infrastructure is read by people
+debugging it without context), but the same criteria still apply there;
+only the threshold differs. Corollary: no auto-formatter (black etc.)
+runs on this repository -- default configurations mechanically produce
+exactly the exploded style this convention exists to prevent, and would
+win every argument by being automated.
+
 ## Cleanup priority: masking a real failure vs. hiding a real one
 
 Found by external review: `task_context.close()` and `run_pipelines()`'s
@@ -183,6 +221,15 @@ cleanup failure is logged, and the function's own `raise` (from the
 `primary_error is None`, whatever was collected is raised instead: a
 single exception if only one thing failed, an `ExceptionGroup` if more
 than one did.
+
+The operational consequence of raising on an otherwise-successful run is
+deliberate and safe: if the DB commit already landed and only cleanup
+then failed, the task surfaces as failed to its orchestrator -- but the
+source state committed in that same transaction, so the orchestrator's
+retry finds sources unchanged and *skips*. No double-publish, and the
+leaked-resource failure still gets seen instead of swallowed. That
+retry-skips property is what makes the aggressive raise policy
+operationally safe, and it's load-bearing on purpose.
 
 The `except` clause is `except BaseException`, not `except Exception` --
 found by a third round of review: `KeyboardInterrupt`, `SystemExit`, and
@@ -300,6 +347,59 @@ cleanup itself, recursive traceback suppression, and the
 `tests/test_db_publish.py` that was checked against a deliberately
 reverted version of the real fix and confirmed to fail, not just written
 and trusted.
+
+## NaN in Excel export: a real fix that silently regressed once already
+
+`normalize_for_excel()` (`table_adapters.py`) rejects a genuine NaN the
+same way it rejects a tz-aware datetime: writing NaN as-is produces
+structurally malformed worksheet XML -- a numeric-typed cell with an
+empty `<v></v>` (the petl adapter's `toxlsx()`), or a string-typed cell
+with no content at all (the pandas adapter's `to_excel()`) -- confirmed
+directly by reading the raw XML both adapters produce, not by trusting
+what comes back through `openpyxl.load_workbook()`, which is lenient
+enough on read to silently paper over both shapes as a clean `None`
+either way. That leniency on read is exactly why the malformation went
+unnoticed in the first place, and exactly why it isn't a reliable signal
+that real, desktop Excel would open the file cleanly without a repair
+prompt.
+
+This fix was made, verified by hand, and then quietly lost: a later
+rebuild of this project started from a point before the fix existed,
+and nothing caught the loss, because the fix had never been captured as
+a persistent, automated test -- only checked once, by hand, in the
+session where it was made. `tests/test_table_adapters.py` (previously
+nonexistent -- `table_adapters.py` had no test coverage of any kind
+before this) exists specifically to close that gap: every test that
+touches Excel export reads the real, on-disk worksheet XML out of the
+`.xlsx` file's own zip archive directly, the same way the original
+verification did, not an in-memory table/DataFrame value and not a
+value read back through `openpyxl` -- because an in-memory check is
+exactly the kind of check that wouldn't have caught either the original
+bug or its later regression.
+
+Worth being direct about a limitation found while building that
+coverage, not smoothed over: the pandas adapter has a second, deeper
+issue this fix does not resolve. `pandas.DataFrame.to_excel()` writes
+that same structurally malformed cell for *any* missing value by
+default (`na_rep=''`), confirmed directly with a completely NaN-free,
+pre-existing `None` -- this fix cannot make the pandas adapter's Excel
+output as clean as the petl adapter's; fixing that would mean bypassing
+pandas's own native Excel writer entirely, well outside this fix's
+scope. What this fix guarantees for the pandas adapter, and what
+`tests/test_table_adapters.py` holds it to specifically: NaN must not be
+*worse* than a genuine, pre-existing `None` would already be -- the two
+must produce byte-identical XML, which they do.
+
+A second thing worth being equally direct about, found only by proving
+that new coverage has genuine teeth, not assumed: the pandas adapter's
+own numeric/datetime-dtype column-conversion loop (separate from
+`normalize_for_excel()` itself) currently changes nothing observable --
+confirmed directly that `pandas.to_excel()` already treats an untouched,
+native NaN identically to a pre-converted `None`, with or without that
+loop. It's kept anyway, as defensive, forward-looking code against a
+future pandas version changing that equivalence -- not because the
+tests currently prove it does anything today. Recording this here so it
+isn't mistaken for proven, tested behavior it isn't.
 
 ## Running tests
 
@@ -426,11 +526,24 @@ real data, not by growing a parallel test suite around each one.
 
 ## Dependencies
 
-**Python 3.11 or newer is required.** `task_core/cleanup.py` and
-`runner.py` use the builtin `ExceptionGroup` (for raising more than one
-cleanup failure together), added in 3.11 -- not stated anywhere else in
-this project until now. Found by external review; this project has been
-built and verified against Python 3.12.3 specifically.
+**Python 3.11 or newer is required, and enforced at import time** --
+`task_core/types.py` raises a clear `RuntimeError` on anything older,
+rather than leaving 3.10 to fail only when a cleanup error actually
+occurs (at which point `e.add_note(...)`'s `AttributeError` inside the
+exception handler would mask the real failure -- exactly the failure
+mode the cleanup redesign exists to eliminate). `task_core/cleanup.py`
+and `runner.py` use the builtin `ExceptionGroup` (for raising more than
+one cleanup failure together) and `BaseException.add_note()`, both added
+in 3.11. This project has been built and verified against Python 3.12.3
+specifically.
+
+Changelog note (v0.2.0): `select_file_infos()` given a *file* path now
+raises `ValueError` directing callers to `select_fixed_file()`, instead
+of silently returning a single-file selection with every filter argument
+ignored -- the facade's "every name resolves exactly as before"
+guarantee is name-level everywhere and behavior-level everywhere except
+this one recorded, deliberate break (also noted in
+`task_core/__init__.py`'s own docstring).
 
 See `requirements.txt`. `lxml`/`petl`/`smbclient`/`sqlalchemy`/`psycopg2`
 are real `task_core` dependencies. `petl_util` itself is not in

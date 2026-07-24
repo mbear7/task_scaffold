@@ -36,12 +36,34 @@ def normalize_for_excel(value):
     # db_resource reading a timestamptz column) flows into Excel export.
     # Deliberately conservative: checks for a meaningful .tzinfo value
     # first, never calls .replace() just because some unrelated object
-    # happens to expose a same-named method. Deliberately not pre-emptively
-    # handling other hypothetical quirks (Decimal, bytes, NaN, ...) that
-    # haven't actually been hit -- add them here, one confirmed case at a
-    # time, without needing to touch either adapter's to_excel().
+    # happens to expose a same-named method.
     if getattr(value, 'tzinfo', None) is not None:
         return value.replace(tzinfo=None)
+
+    # NaN (np.nan, pd.NA, or any other value that fails value == value,
+    # the same check db_publish.py's _normalize_value already uses) is
+    # the second confirmed case, not a hypothetical one: writing it
+    # as-is produces structurally malformed XML -- a numeric-typed cell
+    # with an empty <v></v> (petl's toxlsx()) or an inlineStr-typed cell
+    # with no content at all (pandas's to_excel()) -- confirmed directly
+    # by inspecting the raw XML both adapters produce. Both happen to
+    # read back as None via openpyxl's own leniency, which is exactly
+    # why this went unnoticed: it isn't the same guarantee as the clean,
+    # standard XLSX a genuine None produces (the cell correctly omitted
+    # entirely), and isn't a reliable signal that real, desktop Excel
+    # would open the file cleanly, without a repair prompt.
+    #
+    # This exact fix silently regressed once already (v0.2.0 was rebuilt
+    # from a point before it existed, with no persistent test catching
+    # the loss) -- see tests/test_table_adapters.py, which asserts
+    # against the raw, on-disk worksheet XML specifically, not just an
+    # in-memory table/DataFrame value, precisely because that's what let
+    # the regression through unnoticed the first time.
+    try:
+        if value != value:
+            return None
+    except Exception:
+        pass
 
     return value
 
@@ -106,6 +128,24 @@ class _PandasAdapter:
         # petl adapter uses via etl.convertall(tbl, normalize_for_excel).
         for col in df.select_dtypes(include=['object']).columns:
             df[col] = df[col].map(normalize_for_excel)
+
+        # Numeric/datetime-dtype columns with a missing value: confirmed
+        # directly that pandas's own df.to_excel() already treats an
+        # untouched, native nan identically to a pre-converted None here
+        # (both hit the same, separate na_rep='' limitation regardless),
+        # so this loop currently changes nothing observable for the
+        # pandas adapter specifically. Kept anyway as defensive,
+        # forward-looking code -- if a future pandas version ever
+        # differentiates nan from None here the way it currently doesn't,
+        # this is already in place rather than needing to be
+        # rediscovered. Only touches a column that actually has a
+        # missing value, not every numeric/datetime column, so a column
+        # with none is completely unaffected either way.
+        for col in df.columns:
+            if df[col].dtype == object:
+                continue  # already handled above
+            if df[col].isna().any():
+                df[col] = df[col].astype(object).where(df[col].notna(), None)
 
         with pd.ExcelWriter(path, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='data')
