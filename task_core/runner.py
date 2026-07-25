@@ -17,9 +17,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import logging
+import os
 from typing import TYPE_CHECKING
 
-from task_core.db_publish import DbPublisher
+from task_core.db_publish import MAX_IDENTIFIER_BYTES, DbPublisher
 
 from task_core.types import (
     DbRunResult,
@@ -88,6 +89,126 @@ def validate_pipeline_class(task_cls, *, pipeline_name=None):
     return spec
 
 
+def _normalized_output_target(kind, value):
+    """The form two declared targets are compared in to decide whether they
+    are the same physical output.
+
+    casefold() on both kinds, deliberately, and deliberately NOT
+    os.path.normcase() -- which is a no-op on POSIX and lowercases on
+    Windows, and would therefore make this validation give different
+    answers depending on where it happened to run. A task that validates
+    clean on a developer's machine and then collides on the server is
+    worse than a rule that is merely strict. Casefolding everywhere is
+    deterministic, and it is the correct answer for both targets anyway:
+    Windows filesystems treat Report.xlsx and report.xlsx as one file, and
+    PostgreSQL folds unquoted identifiers to lower case, so Sales and
+    sales are one table.
+
+    The cost is rejecting two names that genuinely differ only by case on
+    a case-sensitive filesystem. That combination is already broken on the
+    platform this ships to, so refusing it everywhere loses nothing real.
+
+    normpath() additionally collapses './out.xlsx' and 'out.xlsx', which
+    are unambiguously the same file on every platform.
+    """
+    if kind == 'excel_name':
+        # Windows filesystems genuinely treat Report.xlsx and report.xlsx as
+        # one file, so casefolding is correct here and stays.
+        # abspath, not just normpath: to_excel() writes relative to the
+        # process working directory, so 'out.xlsx' and
+        # '/cwd/out.xlsx' are the same physical file while normpath alone
+        # keeps them as different keys -- confirmed directly, leaving the
+        # original silent-overwrite class reachable. (Symlink aliases would
+        # need realpath(); not handled here.)
+        return os.path.abspath(os.path.normpath(value)).casefold()
+
+    # Correction to the original version of this function, which casefolded
+    # db_table too, on the stated grounds that PostgreSQL folds unquoted
+    # identifiers so 'Sales' and 'sales' are one table. That reasoning does
+    # not hold in this codebase: nothing here ever emits an unquoted
+    # mixed-case identifier. Confirmed directly against the real postgresql
+    # dialect's preparer -- SQLAlchemy quotes 'Sales' to preserve it, which
+    # defeats the folding:
+    #
+    #     'sales' -> sales      CREATE TABLE bsr.sales
+    #     'Sales' -> "Sales"    CREATE TABLE bsr."Sales"
+    #
+    # They are two different tables, so casefolding here rejected a pair
+    # that would actually have worked. Over-strict rather than unsafe, but
+    # wrong. Exact match is correct under both identifier modes: under
+    # 'portable' every name is lower case already, so exact and casefolded
+    # comparison coincide; under 'quoted' case is significant and only
+    # exact match is right. No mode-dependent comparison is needed.
+    # The original string, unchanged. An earlier version stripped
+    # whitespace, which contradicted the exact-comparison semantics it
+    # claimed: under 'quoted' mode "report" and "report " are two valid,
+    # distinct identifiers, and stripping treated them as one.
+    return value
+
+
+def _reject_duplicate_output_targets(specs):
+    """Two active pipelines writing the same output silently destroyed each
+    other's work. Confirmed directly, both kinds:
+
+    excel_name -- to_excel() writes a whole workbook via toxlsx(path);
+    PipelineSpec has no sheet field, so there is no same-file-different-
+    sheet arrangement to protect. Two pipelines declaring 'same.xlsx' both
+    ran, both reported success, excel_outputs listed the name twice, and
+    only the second pipeline's rows existed on disk.
+
+    db_table -- worse, because it happens inside the committed
+    transaction. publish() does DROP + CREATE, so the second pipeline
+    dropped the table the first had just filled. Reproduced against a real
+    SQLAlchemy engine: three rows after pipeline one, one row after
+    pipeline two, one row after commit. row_counts is keyed by table name,
+    so it reported {'same_table': 1} and the three lost rows left no trace
+    in the RunResult at all.
+
+    Checked here, in validate_pipeline_classes(), because this is the last
+    point before build_context() -- so a task with colliding targets fails
+    before any resource is constructed, any remote file is opened, or any
+    connection is made, rather than partway through a run that has already
+    done real work.
+
+    Checked unconditionally rather than only when output_excel/output_db
+    are on. A duplicate declaration is a defect in the task definition,
+    not a property of one invocation; gating it on this run's flags would
+    let it hide until the first run that happens to enable that output.
+
+    find_duplicates() (types.py) is deliberately not reused: it returns the
+    duplicated values, and the useful part of this error is WHICH pipelines
+    collide, which needs the owners kept alongside them.
+    """
+    owners = {}
+    for name, spec in specs.items():
+        for kind in ('excel_name', 'db_table'):
+            value = getattr(spec, kind)
+            if not value:
+                continue
+            key = (kind, _normalized_output_target(kind, value))
+            owners.setdefault(key, []).append((name, value))
+
+    collisions = [
+        (kind, pipelines_and_values)
+        for (kind, _), pipelines_and_values in owners.items()
+        if len(pipelines_and_values) > 1
+    ]
+    if not collisions:
+        return
+
+    described = '; '.join(
+        '{} -> {}'.format(
+            kind,
+            ', '.join(f'{name}={value!r}' for name, value in pipelines_and_values),
+        )
+        for kind, pipelines_and_values in collisions
+    )
+    raise PipelineContractError(
+        f'pipelines in run_sequence declare the same output target, which would '
+        f'silently overwrite each other: {described}'
+    )
+
+
 def validate_pipeline_classes(pipelines, run_sequence):
     missing = [name for name in run_sequence if name not in pipelines]
     if missing:
@@ -97,10 +218,12 @@ def validate_pipeline_classes(pipelines, run_sequence):
     if duplicates:
         raise PipelineContractError(f'run_sequence contains duplicate pipeline(s): {duplicates}')
 
-    return {
+    specs = {
         name: validate_pipeline_class(pipelines[name], pipeline_name=name)
         for name in run_sequence
     }
+    _reject_duplicate_output_targets(specs)
+    return specs
 
 
 def _build_db_run_result(*, output_db, has_db_outputs, publisher=None):
@@ -136,6 +259,7 @@ def run_pipelines(
     source_change_check=None,
     force_run=False,
     publisher_factory=DbPublisher,
+    db_max_identifier_bytes=MAX_IDENTIFIER_BYTES,
 ):
     """publisher_factory: the DbPublisher constructor to use, real by
     default. Pass a fake here for tests -- e.g. tc.run_pipelines(...,
@@ -146,6 +270,44 @@ def run_pipelines(
     time), not re-read from the module namespace on every call."""
     log = logging.getLogger(task_name)
     specs = validate_pipeline_classes(pipelines, run_sequence)
+
+    # Backend-specific preflight, invoked by an engine-neutral runner. The
+    # knowledge of what a valid PostgreSQL identifier is stays behind
+    # publisher_factory; this module only knows there is a backend to ask,
+    # and that here -- after structural validation, before build_context()
+    # -- is when to ask it. A classmethod, so nothing is constructed that
+    # would need closing if build_context() raises next.
+    #
+    # Deliberately NOT gated on output_db: an unpublishable declared name
+    # is a defect in the task, not a property of one invocation. The hook
+    # performs no backend I/O, so a run with DB output disabled still
+    # touches nothing. It no-ops when no spec declares db_table.
+    # Resolved from the factory when it provides one, falling back to the
+    # REAL backend policy -- never to a no-op. publisher_factory is
+    # duck-typed and is legitimately a plain callable in places
+    # (lambda **kw: FakePublisher(**kw, close_error=...) is a useful test
+    # idiom), so a callable with no classmethod to ask must still get
+    # validated rather than quietly skipped. Skipping on absence is exactly
+    # how discard_pending_read() ended up with zero coverage.
+    preflight = getattr(publisher_factory, 'preflight', DbPublisher.preflight)
+    # The source-state table is passed in as a reserved target: a
+    # source-check-enabled run creates and writes it, so its identifiers
+    # need the same byte validation as any business table, and no pipeline
+    # may publish over it.
+    source_state_target = None
+    if source_change_check is not None and getattr(source_change_check, 'enabled', False):
+        source_state_target = (
+            getattr(source_change_check, 'schema', None),
+            getattr(source_change_check, 'table', None),
+        )
+
+    preflight(
+        specs,
+        schema=pg_schema,
+        source_state_target=source_state_target,
+        max_identifier_bytes=db_max_identifier_bytes,
+    )
+
     ctx = build_context()
     publisher = None
     pipeline_rows = {}
@@ -308,6 +470,28 @@ def run_pipelines(
 
             adapter.validate(out_tbl)
 
+            # Repeated traversal of out_tbl is expected whenever anything
+            # beyond the always-run nrows() call below will also traverse
+            # it -- confirmed directly, not assumed, that this must happen
+            # before nrows(), the first traversal: stabilize() has zero
+            # effect unless applied before whatever traversal is first,
+            # since that traversal is what populates the caching it
+            # relies on. For a lazy petl transformation chain, every
+            # later traversal otherwise re-runs the entire chain from
+            # scratch; for a db_resource-backed table specifically, each
+            # traversal re-issues the underlying SQL query, which is a
+            # correctness risk, not just a performance one -- a changing
+            # source table could produce different row counts between
+            # nrows() and whatever publishes afterward.
+            needs_stabilization = (
+                spec.publish_result
+                or spec.debug_display
+                or (output_excel and spec.excel_name)
+                or (output_db and spec.db_table)
+            )
+            if needs_stabilization:
+                out_tbl = adapter.stabilize(out_tbl, repeated=True)
+
             rows = adapter.nrows(out_tbl)
             pipeline_rows[pipeline_name] = rows
             log.info('pipeline %s finished, rows=%s', pipeline_name, rows)
@@ -336,6 +520,11 @@ def run_pipelines(
                     config=source_change_check,
                 )
                 log.info('source state updated, source_count=%s', len(current_fingerprints))
+            # commit() performs the staging swap itself, immediately
+            # before committing -- deliberately not a separate call here.
+            # Doing it from the runner made publish()+commit() silently
+            # incorrect for any direct caller, and expanded the
+            # publisher_factory protocol that exists as an extension seam.
             publisher.commit()
 
         db_result = _build_db_run_result(

@@ -10,6 +10,7 @@ this module import-free.
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -59,6 +60,30 @@ def find_duplicates(items):
 VALID_TABLE_ADAPTERS = frozenset({None, 'petl', 'pandas'})
 
 
+# The scaffold's portable identifier convention. Deliberately NOT a
+# PostgreSQL rule -- this module is level 0 and engine-neutral, and every
+# PostgreSQL-specific fact (the 63-byte limit, staging-name generation,
+# normalization and collision rules) lives in db_publish.py instead.
+#
+# Lower case only, not [A-Za-z_]. Uppercase is exactly what makes an
+# identifier case-fragile: SQLAlchemy quotes a mixed-case name to preserve
+# it, quoting defeats PostgreSQL's folding, and 'Sales' then becomes a
+# genuinely different table from 'sales'. Confirmed directly against the
+# real postgresql dialect's identifier preparer:
+#
+#     'sales' -> sales          CREATE TABLE bsr.sales
+#     'Sales' -> "Sales"        CREATE TABLE bsr."Sales"
+#
+# So this pattern means something worth the name 'portable': an identifier
+# that behaves identically whether it is quoted or not, and therefore never
+# needs quoting in hand-written SQL downstream. Confirmed directly that all
+# 159 identifiers this project currently publishes -- 13 table names, 145
+# column names, 1 schema -- already satisfy it, as do the source-state
+# schema/table ('bsr', 'task_scaffold_meta'), so tightening from the
+# previous [A-Za-z_] form broke nothing.
+PORTABLE_IDENTIFIER_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
+
+
 @dataclass(frozen=True)
 class PipelineSpec:
     excel_name: str | None = None
@@ -71,6 +96,24 @@ class PipelineSpec:
     publish_result: bool = False
     debug_display: bool = False
     table_adapter: str | None = None
+    # 'portable' enforces PORTABLE_IDENTIFIER_RE on this pipeline's declared
+    # db_table and declared output column names. 'quoted' permits names
+    # outside that convention -- and only that: non-empty, no NUL byte, the
+    # backend's identifier byte limit, duplicate-target detection,
+    # generated-name safety and column-name uniqueness all still apply.
+    #
+    # A mode rather than a boolean deliberately: 'allow_unsafe_identifiers'
+    # would conflate Unicode, quoting, punctuation, case sensitivity and
+    # actual SQL injection safety into one word that describes none of them.
+    # This names the behavior being selected instead.
+    #
+    # Note this does NOT govern the schema, which is task-wide (pg_schema)
+    # rather than per-pipeline and is always validated as portable. Letting
+    # a per-spec flag reach a per-run value would need an arbitrary
+    # resolution rule across specs (strictest wins? any wins?), and a
+    # non-portable schema is a deliberate run-level decision, not something
+    # one pipeline should be able to enable for every other.
+    db_identifier_mode: str = 'portable'
 
     def __post_init__(self):
         if self.excel_name is not None and not isinstance(self.excel_name, str):
@@ -78,6 +121,11 @@ class PipelineSpec:
 
         if self.db_table is not None and not isinstance(self.db_table, str):
             raise TypeError('db_table must be str or None')
+
+        if self.db_identifier_mode not in ('portable', 'quoted'):
+            raise ValueError(
+                f"db_identifier_mode must be 'portable' or 'quoted', got {self.db_identifier_mode!r}"
+            )
 
         if self.db_output is not None:
             # Require the declared contract (list[str] | tuple[str, ...] |

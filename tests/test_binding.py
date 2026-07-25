@@ -19,6 +19,7 @@ import unittest
 import pandas as pd
 
 import task_core as tc
+from task_core.db_publish import DbPublishError
 
 
 def make_resource(tag='r', tracker=False, on_load=None):
@@ -509,6 +510,9 @@ class Test10DynamicDbContractOnBoundPipeline(unittest.TestCase):
         published = []
 
         class FakeDbPublisher:
+            @classmethod
+            def preflight(cls, specs, *, schema, **kwargs):
+                pass
             def __init__(self, *, creds, schema, logger=None):
                 self.published = []
                 published.append(self)
@@ -528,7 +532,6 @@ class Test10DynamicDbContractOnBoundPipeline(unittest.TestCase):
             committed_tables = property(lambda self: [])
             written_tables = property(lambda self: self.published)
             table_rows = property(lambda self: {})
-
         original_publisher_cls = tc.runner.DbPublisher
         tc.run_pipelines(
             task_name='test10',
@@ -624,6 +627,298 @@ class Test4DuplicateRunSequenceRejected(unittest.TestCase):
         )
         self.assertEqual(ran, ['p1', 'p2'])
         self.assertEqual(result.pipeline_rows, {'p1': 1, 'p2': 1})
+
+
+class Test11DuplicateOutputTargetsRejected(unittest.TestCase):
+    """Raised in review, confirmed directly before fixing: two active
+    pipelines declaring the same output target silently destroyed each
+    other's work, with the run reporting success.
+
+    excel_name -- the adapter's to_excel() writes a whole workbook via
+    toxlsx(path), and PipelineSpec has no sheet field, so there is no
+    same-file-different-sheet arrangement this could be breaking. Two
+    pipelines declaring 'same.xlsx' both ran, excel_outputs listed the
+    name twice, and only the second pipeline's rows existed on disk.
+
+    db_table -- worse, because it lands inside the committed transaction.
+    publish() does DROP + CREATE, so the second pipeline dropped the table
+    the first had just filled. Reproduced against a real SQLAlchemy
+    engine: 3 rows after pipeline one, 1 row after pipeline two, 1 row
+    after commit. row_counts is keyed by table name, so the RunResult
+    reported {'same_table': 1} and the three lost rows left no trace.
+
+    Sibling of Test4DuplicateRunSequenceRejected above -- the same class
+    of silent-overwrite defect, reached by declaring one target twice
+    rather than one pipeline twice.
+    """
+
+    def _pipeline(self, **spec_kwargs):
+        class pipeline:
+            spec = tc.PipelineSpec(**spec_kwargs)
+
+            @classmethod
+            def run(cls, ctx):
+                import petl as etl
+                return etl.wrap([('v',), ('x',)])
+
+        return pipeline
+
+    def _run(self, pipelines, run_sequence, **kwargs):
+        return tc.run_pipelines(
+            task_name='t',
+            build_context=lambda: tc.task_context(task_name='t', loaders={}),
+            pipelines=pipelines, run_sequence=run_sequence,
+            output_excel=False, output_db=False, **kwargs
+        )
+
+    def test_duplicate_excel_name_is_rejected(self):
+        with self.assertRaises(tc.PipelineContractError) as caught:
+            self._run({'a': self._pipeline(excel_name='same.xlsx'),
+                       'b': self._pipeline(excel_name='same.xlsx')}, ['a', 'b'])
+        message = str(caught.exception)
+        # The useful part of this error is WHICH pipelines collide -- a
+        # message naming only the target leaves the reader grepping.
+        self.assertIn('a=', message)
+        self.assertIn('b=', message)
+        self.assertIn('same.xlsx', message)
+
+    def test_duplicate_db_table_is_rejected(self):
+        with self.assertRaises(tc.PipelineContractError):
+            self._run({'a': self._pipeline(db_table='t1'),
+                       'b': self._pipeline(db_table='t1')}, ['a', 'b'])
+
+    def test_rejection_happens_before_any_resource_is_built(self):
+        # The whole point of validating here rather than at export time:
+        # nothing remote is opened, no connection is made, no pipeline runs.
+        built = []
+        ran = []
+
+        class pipeline_a:
+            spec = tc.PipelineSpec(excel_name='same.xlsx')
+
+            @classmethod
+            def run(cls, ctx):
+                ran.append('a')
+
+        class pipeline_b:
+            spec = tc.PipelineSpec(excel_name='same.xlsx')
+
+            @classmethod
+            def run(cls, ctx):
+                ran.append('b')
+
+        def build_context():
+            built.append(1)
+            return tc.task_context(task_name='t', loaders={})
+
+        with self.assertRaises(tc.PipelineContractError):
+            tc.run_pipelines(
+                task_name='t', build_context=build_context,
+                pipelines={'a': pipeline_a, 'b': pipeline_b},
+                run_sequence=['a', 'b'], output_excel=False, output_db=False,
+            )
+
+        self.assertEqual(built, [], 'build_context() ran before validation rejected the collision')
+        self.assertEqual(ran, [])
+
+    def test_excel_targets_differing_only_by_case_are_rejected(self):
+        # Windows filesystems genuinely treat Report.xlsx and report.xlsx as
+        # one file. Casefolded on every platform deliberately, so this
+        # validation cannot pass on a developer machine and then collide on
+        # the server.
+        with self.assertRaises(tc.PipelineContractError):
+            self._run({'a': self._pipeline(excel_name='Report.xlsx'),
+                       'b': self._pipeline(excel_name='report.xlsx')}, ['a', 'b'])
+
+    def test_db_targets_differing_only_by_case_are_not_a_collision(self):
+        """Corrects the original version of this check, which casefolded
+        db_table on the stated grounds that PostgreSQL folds unquoted
+        identifiers so 'Sales' and 'sales' are one table. That reasoning
+        does not hold here: nothing in this project ever emits an unquoted
+        mixed-case identifier. Confirmed directly against the real
+        postgresql dialect's preparer -- SQLAlchemy quotes 'Sales' to
+        preserve it, which defeats the folding:
+
+            'sales' -> sales      CREATE TABLE bsr.sales
+            'Sales' -> "Sales"    CREATE TABLE bsr."Sales"
+
+        Two different tables. Casefolding rejected a pair that would
+        actually have worked -- over-strict rather than unsafe, but wrong.
+
+        Exact match is right under both identifier modes: under 'portable'
+        every name is lower case already, so exact and casefolded
+        comparison coincide, and under 'quoted' case is significant and
+        only exact match is correct. Note these must declare
+        db_identifier_mode='quoted', because 'Sales' is not a portable
+        identifier and preflight rejects it otherwise -- which is the
+        layer that actually discourages mixed case now.
+        """
+        result = self._run(
+            {'a': self._pipeline(db_table='Sales', db_identifier_mode='quoted'),
+             'b': self._pipeline(db_table='sales', db_identifier_mode='quoted')},
+            ['a', 'b'],
+        )
+        self.assertFalse(result.skipped)
+
+    def test_paths_differing_only_by_a_dot_prefix_are_rejected(self):
+        with self.assertRaises(tc.PipelineContractError):
+            self._run({'a': self._pipeline(excel_name='out.xlsx'),
+                       'b': self._pipeline(excel_name='./out.xlsx')}, ['a', 'b'])
+
+
+    def test_the_same_file_reached_by_relative_and_absolute_path_collides(self):
+        # to_excel() writes relative to the process working directory, so
+        # 'out.xlsx' and '<cwd>/out.xlsx' are one physical file. normpath
+        # alone kept them as distinct keys -- confirmed directly, leaving
+        # the original silent-overwrite class reachable through a spelling
+        # difference.
+        import os
+        absolute = os.path.join(os.getcwd(), 'out.xlsx')
+        with self.assertRaises(tc.PipelineContractError):
+            self._run({'a': self._pipeline(excel_name='out.xlsx'),
+                       'b': self._pipeline(excel_name=absolute)}, ['a', 'b'])
+
+    def test_db_table_comparison_does_not_strip_whitespace(self):
+        # An earlier version stripped, which contradicted the exact-match
+        # semantics it claimed: under 'quoted' mode "report" and "report "
+        # are two valid, distinct PostgreSQL identifiers, and treating them
+        # as one is over-rejection.
+        result = self._run(
+            {'a': self._pipeline(db_table='report', db_identifier_mode='quoted'),
+             'b': self._pipeline(db_table='report ', db_identifier_mode='quoted')},
+            ['a', 'b'],
+        )
+        self.assertFalse(result.skipped)
+
+    def test_a_collision_outside_run_sequence_is_allowed(self):
+        # Only ACTIVE targets collide. A pipeline that isn't running can
+        # declare whatever it likes.
+        result = self._run({'a': self._pipeline(excel_name='same.xlsx'),
+                            'b': self._pipeline(excel_name='same.xlsx')}, ['a'])
+        self.assertFalse(result.skipped)
+
+    def test_an_excel_name_matching_a_db_table_is_allowed(self):
+        # Different kinds of target are different namespaces -- a workbook
+        # called 'sales' does not collide with a table called 'sales'.
+        result = self._run({'a': self._pipeline(excel_name='sales'),
+                            'b': self._pipeline(db_table='sales')}, ['a', 'b'])
+        self.assertFalse(result.skipped)
+
+    def test_distinct_targets_and_absent_targets_still_work(self):
+        result = self._run({'a': self._pipeline(excel_name='a.xlsx'),
+                            'b': self._pipeline(excel_name='b.xlsx'),
+                            'c': self._pipeline()}, ['a', 'b', 'c'])
+        self.assertFalse(result.skipped)
+
+
+
+class Test12RunnerInvokesBackendPreflightBeforeBuildingResources(unittest.TestCase):
+    """run_pipelines() calls the backend's preflight hook after
+    validate_pipeline_classes() and before build_context().
+
+    This exists because testing the hook in isolation proves nothing about
+    the runner. Confirmed directly: with Test11 in
+    tests/test_db_publish.py exercising DbPublisher.preflight() directly,
+    deleting the call from runner.py left all 264 tests passing. That is
+    the third time in this project the same mistake has been made -- see
+    the README on stabilize() and on discard_pending_read() -- so it is
+    recorded here rather than quietly corrected.
+
+    The ordering, not merely the call, is the property: preflight exists to
+    fail before any resource is constructed, any remote file is opened, or
+    any connection is made. A hook invoked after build_context() would
+    still validate, and would have lost the entire point.
+    """
+
+    def _pipeline(self, **spec_kwargs):
+        class pipeline:
+            spec = tc.PipelineSpec(**spec_kwargs)
+
+            @classmethod
+            def run(cls, ctx):
+                import petl as etl
+                return etl.wrap([('v',), ('x',)])
+
+        return pipeline
+
+    def test_a_bad_declared_name_fails_before_build_context_runs(self):
+        built = []
+
+        def build_context():
+            built.append(1)
+            return tc.task_context(task_name='t', loaders={})
+
+        with self.assertRaises(DbPublishError):
+            tc.run_pipelines(
+                task_name='t', build_context=build_context,
+                pipelines={'p': self._pipeline(db_table='x' * 70)},
+                run_sequence=['p'], output_excel=False, output_db=False,
+            )
+
+        self.assertEqual(built, [], 'build_context() ran before preflight rejected the declaration')
+
+    def test_preflight_runs_even_when_db_output_is_disabled(self):
+        # A declared name PostgreSQL cannot store is a defect in the task,
+        # not a property of one invocation. Gating this on output_db would
+        # let it hide until the first run that enabled DB output.
+        with self.assertRaises(DbPublishError):
+            tc.run_pipelines(
+                task_name='t',
+                build_context=lambda: tc.task_context(task_name='t', loaders={}),
+                pipelines={'p': self._pipeline(db_table='отчет')},
+                run_sequence=['p'], output_excel=False, output_db=False,
+            )
+
+    def test_preflight_performs_no_backend_io_when_db_output_is_disabled(self):
+        # The other half of the same decision: always validate, never connect.
+        connects = []
+
+        class ConnectionWatchingPublisher:
+            @classmethod
+            def preflight(cls, specs, *, schema, **kwargs):
+                from task_core.db_publish import DbPublisher
+                return DbPublisher.preflight(specs, schema=schema, **kwargs)
+
+            def __init__(self, **kwargs):
+                connects.append('constructed')
+
+        result = tc.run_pipelines(
+            task_name='t',
+            build_context=lambda: tc.task_context(task_name='t', loaders={}),
+            pipelines={'p': self._pipeline(db_table='hr_staff')},
+            run_sequence=['p'], output_excel=False, output_db=False,
+            publisher_factory=ConnectionWatchingPublisher,
+        )
+
+        self.assertFalse(result.skipped)
+        self.assertEqual(connects, [], 'a publisher was constructed on a DB-disabled run')
+
+    def test_a_task_declaring_no_db_table_is_not_subjected_to_backend_policy(self):
+        # The hook no-ops entirely, so a non-portable schema is irrelevant
+        # to a genuinely DB-free task.
+        result = tc.run_pipelines(
+            task_name='t',
+            build_context=lambda: tc.task_context(task_name='t', loaders={}),
+            pipelines={'p': self._pipeline()},
+            run_sequence=['p'], output_excel=False, output_db=False,
+            pg_schema='Схема',
+        )
+        self.assertFalse(result.skipped)
+
+    def test_a_factory_without_its_own_hook_still_gets_validated(self):
+        # publisher_factory is duck-typed and is legitimately a plain
+        # callable in places. Resolution falls back to the REAL backend
+        # policy, never to a no-op -- skipping on absence is how
+        # discard_pending_read() ended up with no coverage at all.
+        with self.assertRaises(DbPublishError):
+            tc.run_pipelines(
+                task_name='t',
+                build_context=lambda: tc.task_context(task_name='t', loaders={}),
+                pipelines={'p': self._pipeline(db_table='Sales')},
+                run_sequence=['p'], output_excel=False, output_db=False,
+                publisher_factory=lambda **kwargs: None,
+            )
+
 
 
 if __name__ == '__main__':

@@ -423,42 +423,99 @@ class file_access:
 
     @contextmanager
     def open_workbook(self, path, *, buffered=False, **kwargs):
-        with self.open_binary(path, buffered=buffered) as src:
-            wb = load_workbook(src, **kwargs)
-            try:
-                yield wb
-            finally:
-                wb.close()
+        # Same del wb + gc.collect() treatment as xlsx_info() below, and for
+        # a stronger reason than xlsx_info() has: this is the workbook
+        # excel_resource RETAINS for its whole lifetime (see
+        # _ensure_workbook()), so in SMB non-buffered mode the remote stream
+        # stays open until close(). xlsx_info()'s workbook lives for
+        # milliseconds; this one can live for the entire task. If openpyxl
+        # object cycles genuinely keep XLSX/ZIP handles open on SMB/DFS after
+        # an explicit close() -- the confirmed production finding
+        # gc.collect() exists here for at all -- then this path is where
+        # that costs the most, and it previously had no gc.collect() on it
+        # whatsoever. Confirmed directly by counting calls: xlsx_info() made
+        # exactly 1, open_workbook() and excel_resource.close() made 0.
+        #
+        # Structure mirrors xlsx_info() deliberately rather than
+        # approximately: del wb in its OWN inner finally, so a raising
+        # wb.close() cannot skip it and leave wb a live local at collect
+        # time; and gc.collect() in an OUTER finally, so it runs whether
+        # load_workbook() succeeded, the body raised, or wb.close() itself
+        # raised -- and so that it runs only after open_binary()'s own
+        # context has exited, never while the underlying stream could still
+        # hold a reference.
+        try:
+            with self.open_binary(path, buffered=buffered) as src:
+                wb = load_workbook(src, **kwargs)
+                # The try: starts AFTER the assignment, so a failing
+                # load_workbook() never reaches `del wb` with wb unbound.
+                try:
+                    yield wb
+                finally:
+                    try:
+                        wb.close()
+                    finally:
+                        del wb
+        finally:
+            gc.collect()
 
     def xlsx_info(self, path, tables=True, *, buffered=False):
         with suppress_openpyxl_data_validation_warning():
-            with self.open_binary(path, buffered=buffered) as src:
-                wb = load_workbook(
-                    src,
-                    # When only sheet names are needed we can use read_only=True
-                    # for a lighter/faster open. Named table metadata lives on
-                    # ws.tables, which requires normal workbook mode.
-                    read_only=not tables,
-                    data_only=True,
-                    keep_links=False,
-                )
-                try:
-                    sheets = wb.sheetnames
-                    t = {
-                        tbl_name: {'sheet': sht_name, 'range_string': _table_ref(tbl)}
-                        for sht_name in sheets
-                        for tbl_name, tbl in wb[sht_name].tables.items()
-                    } if tables else {}
-                finally:
-                    # No explicit `del ws` needed here (unlike the old
-                    # for-loop version): comprehension variables don't leak
-                    # into this scope, so each worksheet reference is
-                    # already dropped as soon as the next iteration starts --
-                    # at least as prompt as the old explicit del, often more so.
-                    wb.close()
-                    del wb
-
-            gc.collect()
+            try:
+                with self.open_binary(path, buffered=buffered) as src:
+                    wb = load_workbook(
+                        src,
+                        # When only sheet names are needed we can use read_only=True
+                        # for a lighter/faster open. Named table metadata lives on
+                        # ws.tables, which requires normal workbook mode.
+                        read_only=not tables,
+                        data_only=True,
+                        keep_links=False,
+                    )
+                    try:
+                        sheets = wb.sheetnames
+                        t = {
+                            tbl_name: {'sheet': sht_name, 'range_string': _table_ref(tbl)}
+                            for sht_name in sheets
+                            for tbl_name, tbl in wb[sht_name].tables.items()
+                        } if tables else {}
+                    finally:
+                        # No explicit `del ws` needed here (unlike the old
+                        # for-loop version): comprehension variables don't leak
+                        # into this scope, so each worksheet reference is
+                        # already dropped as soon as the next iteration starts --
+                        # at least as prompt as the old explicit del, often more so.
+                        #
+                        # del wb in its own, inner finally -- found by a
+                        # further review, confirmed directly: if
+                        # wb.close() itself raised, del wb was skipped
+                        # entirely (an exception from one statement in a
+                        # finally: block skips the rest of that same
+                        # block), leaving wb as a live, reachable local
+                        # variable at the point the outer gc.collect()
+                        # below runs -- weakening the exact stuck-handle
+                        # workaround it exists to guarantee, on the one
+                        # path (a failing close()) where that guarantee
+                        # matters most.
+                        try:
+                            wb.close()
+                        finally:
+                            del wb
+            finally:
+                # Required in production: openpyxl object cycles can otherwise
+                # keep XLSX/ZIP handles open on SMB/DFS after explicit close().
+                # This outer try/finally, not just the inner workbook-close one
+                # above, so gc.collect() runs on every path, not only success --
+                # a failure during metadata scanning (load_workbook() itself
+                # raising, or the table-metadata comprehension above it) still
+                # risks the same stuck-handle behavior this exists to prevent,
+                # and previously skipped gc.collect() entirely in that case.
+                # Deliberately still outside the inner workbook-close finally,
+                # not merged into it: gc.collect() runs once, after the
+                # workbook is closed and the underlying stream itself has
+                # also exited via open_binary()'s own __exit__, not any
+                # earlier, while either could still be holding a reference.
+                gc.collect()
 
         return sheets, t
 

@@ -32,8 +32,33 @@ FakeDbPublisher couldn't.
 """
 
 import unittest
+from datetime import date, datetime
+from decimal import Decimal
 
-from task_core.db_publish import DbPublisher
+import pandas as pd
+from sqlalchemy import exc as sa_exc
+
+import task_core as tc
+from task_core.db_publish import (
+    MAX_IDENTIFIER_BYTES,
+    STAGING_NAME_KIND,
+    DbPublishError,
+    DbPublishInvariantError,
+    DbPublisher,
+    new_run_token,
+    staging_table_name,
+    staging_target_token,
+    validate_identifier,
+    validate_portable_identifier,
+    DbPayload,
+    from_pandas,
+    is_missing,
+    _infer_column_type,
+    _normalize_value,
+)
+
+
+_CREDS = {'user': 'x', 'host': 'x', 'dbname': 'x'}
 
 
 class FakeSqlaTransaction:
@@ -76,6 +101,30 @@ class FakeSqlaConnection:
         return self._engine._select(stmt, params, self._pending)
 
     def begin(self):
+        if self._in_transaction:
+            # Real SQLAlchemy 2.0 REJECTS this, it does not quietly hand back
+            # a second Transaction -- confirmed directly against the genuine
+            # package (2.0.43) driving a real SQLite engine:
+            #
+            #   InvalidRequestError: This connection has already initialized
+            #   a SQLAlchemy Transaction() object via begin() or autobegin;
+            #   can't call begin() here unless rollback() or commit() is
+            #   called first.
+            #
+            # This fake previously just set the flag and returned, which made
+            # it strictly MORE PERMISSIVE than the library it stands in for --
+            # and that gap was load-bearing, not cosmetic: with it,
+            # run_pipelines()'s publisher.discard_pending_read() call could be
+            # deleted outright and all 217 tests still passed, while the real
+            # library raises on the first publish() of any source-check-enabled
+            # run that also has DB outputs. Confirmed directly both ways before
+            # changing this.
+            raise sa_exc.InvalidRequestError(
+                'This connection has already initialized a SQLAlchemy '
+                'Transaction() object via begin() or autobegin; '
+                "can't call begin() here unless rollback() or commit() "
+                'is called first.'
+            )
         self._in_transaction = True
         return FakeSqlaTransaction(self)
 
@@ -394,6 +443,860 @@ class Test5CloseIsolatesItsOwnCleanupSteps(unittest.TestCase):
     def test_close_with_nothing_ever_connected_does_not_raise(self):
         publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr')
         publisher.close()
+
+
+class Test6IsMissingHandlesPdNaCorrectly(unittest.TestCase):
+    """Found during an optimization review: _normalize_value() (and,
+    independently, table_adapters.py's normalize_for_excel()) used a
+    bare `value != value` check to detect a missing value. That's
+    correct for a plain NaN, but pd.NA specifically breaks it outright
+    -- pd.NA != pd.NA doesn't return True, it raises TypeError
+    ("boolean value of NA is ambiguous"), confirmed directly. The
+    surrounding except Exception: pass silently swallowed that,
+    meaning a raw pd.NA fell through unconverted instead of becoming
+    None -- a real, live gap, not just a stale comment; confirmed
+    directly against both functions in isolation before this fix,
+    since a prior "verification" of _normalize_value only ever tested
+    it through from_pandas()'s full path, which has an earlier
+    conversion step that already turns pd.NA into None before
+    _normalize_value ever sees it."""
+
+    def test_is_missing_recognizes_every_missing_representation(self):
+        self.assertTrue(is_missing(pd.NA))
+        self.assertTrue(is_missing(float('nan')))
+        self.assertTrue(is_missing(None))
+        self.assertTrue(is_missing(pd.NaT))
+
+    def test_is_missing_does_not_flag_ordinary_values(self):
+        self.assertFalse(is_missing(5))
+        self.assertFalse(is_missing(0))
+        self.assertFalse(is_missing(''))
+        self.assertFalse(is_missing('text'))
+        self.assertFalse(is_missing(datetime.now()))
+
+    def test_is_missing_safely_handles_array_like_values(self):
+        # pd.isna() itself returns an array, not a scalar, for these --
+        # confirmed directly this must not raise, and must not
+        # incorrectly report a real, non-missing value as missing.
+        self.assertFalse(is_missing([1, 2, 3]))
+        self.assertFalse(is_missing([5]))
+        self.assertFalse(is_missing([]))
+        self.assertFalse(is_missing({'a': 1}))
+
+    def test_is_missing_does_not_corrupt_one_element_containers_holding_a_missing_value(self):
+        # Found by a further review: distinct from the array test
+        # above, which only ever tried [5] -- a non-missing value.
+        # bool() on a MULTI-element array raises (caught by the
+        # except Exception: pass fallback, confirmed by the test
+        # above), but bool() on a SINGLE-element array succeeds rather
+        # than raising, so a genuine, non-missing container holding one
+        # missing value slipped past that fallback entirely and got
+        # silently, incorrectly treated as itself being the missing
+        # marker. A container is never itself "the missing marker"
+        # regardless of its own size -- only ever something that might
+        # hold missing values inside it, a separate question this
+        # function was never meant to answer.
+        import numpy as np
+        self.assertFalse(is_missing([None]))
+        self.assertFalse(is_missing([float('nan')]))
+        self.assertFalse(is_missing(np.array([np.nan])))
+        self.assertFalse(is_missing(pd.Index([None])))
+        self.assertFalse(is_missing([pd.NA]))
+
+        # And the actual, real-world consequence this caused --
+        # confirmed directly, not just the predicate in isolation.
+        self.assertEqual(_normalize_value([None]), [None])
+        from task_core.table_adapters import normalize_for_excel
+        self.assertEqual(normalize_for_excel([None]), [None])
+
+    def test_normalize_value_converts_a_raw_pd_na_to_none(self):
+        # Directly, in isolation -- not through from_pandas()'s own
+        # prior conversion step, which would mask this exact gap.
+        result = _normalize_value(pd.NA)
+        self.assertIsNone(result)
+
+    def test_from_pandas_with_a_nullable_int64_column_still_works(self):
+        # Regression check: from_pandas() already handled this
+        # correctly via its own prior .astype(object).where(...) step,
+        # before _normalize_value ever saw the value -- confirm this
+        # fix doesn't change that already-correct path.
+        df = pd.DataFrame({'a': ['x', 'y'], 'rank': pd.array([1, None], dtype='Int64')})
+        payload = from_pandas(df, table_name='t', schema='s')
+        self.assertEqual(payload.rows, [{'a': 'x', 'rank': 1}, {'a': 'y', 'rank': None}])
+
+
+class Test7NormalizeValueDoesNotCollapseNonScalarContainers(unittest.TestCase):
+    """Found by a further review: is_missing() itself was already
+    correct (Test6 above), but _normalize_value() has its own, separate
+    duck-typed conversion logic after the missing-value check --
+    to_pydatetime()/.item() -- that still silently collapsed a
+    one-element container down to its sole element, via a completely
+    different mechanism than is_missing()'s own pd.isna()/is_scalar()
+    check. numpy's own .item() is genuinely designed to do exactly that
+    for an array of size 1, confirmed directly: np.array([5]).item()
+    succeeds and returns the plain int 5, silently discarding the array
+    itself. Fixed with the same pd.api.types.is_scalar() idea, applied
+    one level earlier -- stopping the whole conversion block, not just
+    is_missing()'s own check, for anything that isn't genuinely a
+    scalar in the first place."""
+
+    def test_containers_are_preserved_intact(self):
+        import numpy as np
+        self.assertEqual(list(_normalize_value(np.array([5]))), [5])
+        self.assertTrue(pd.isna(_normalize_value(np.array([np.nan]))).all())
+        self.assertEqual(list(_normalize_value(pd.Index([None]))), [None])
+        self.assertEqual(
+            list(_normalize_value(pd.DatetimeIndex(['2020-01-01']))),
+            list(pd.DatetimeIndex(['2020-01-01'])),
+        )
+        self.assertEqual(list(_normalize_value(pd.Series([5]))), [5])
+
+    def test_genuine_scalars_still_normalize_correctly(self):
+        # The fix must not be so broad it stops genuine scalar
+        # conversion -- confirmed directly these still work.
+        import numpy as np
+        result = _normalize_value(pd.Timestamp('2020-01-01'))
+        self.assertEqual(result, datetime(2020, 1, 1))
+        self.assertNotIsInstance(result, pd.Timestamp)
+
+        result2 = _normalize_value(np.int64(5))
+        self.assertEqual(result2, 5)
+        self.assertIsInstance(result2, int)
+        self.assertNotIsInstance(result2, np.integer)
+
+    def test_missing_values_still_correctly_become_none(self):
+        # Regression check: this fix sits right after is_missing()'s own
+        # check, must not interfere with it.
+        self.assertIsNone(_normalize_value(pd.NA))
+        self.assertIsNone(_normalize_value(float('nan')))
+        self.assertIsNone(_normalize_value(None))
+
+
+class Test8SampledTypeInferenceIsVerifiedAgainstUnsampledRows(unittest.TestCase):
+    """Type inference samples the first `type_infer_sample_size` rows
+    (default 5000). A column whose sampled prefix is narrower than its
+    real data therefore produced a narrower column type than the data
+    needs -- confirmed directly: 5000 int rows followed by a single 3.5
+    inferred BigInteger, not Numeric.
+
+    For most narrowings that is merely a loud failure at insert time
+    ('N/A' into bigint errors). For exactly two of them it is silent data
+    corruption, confirmed directly against a real PostgreSQL instance by
+    the project owner rather than assumed from documentation:
+
+        insert into (v bigint) values (3.5)  -> stores 4, no error
+        insert into (v date) values (timestamp '2024-01-01 13:30')
+                                             -> stores 2024-01-01, time dropped
+
+    Both are data-dependent, surface only once a table grows past the
+    sample, and leave the task reporting success with a correct row count.
+
+    The fix keeps the sample as the inference window and adds a
+    verification pass over the remaining rows for those two types only.
+    These tests hold it to producing the identical answer a full scan
+    would, which is the property that actually matters -- not merely that
+    it differs from the old, sampled-only behavior.
+    """
+
+    SAMPLE = 10  # small sample so these tests stay fast; the mechanism is
+                 # identical at the real default of 5000
+
+    def _both(self, rows):
+        """(verified answer, full-scan answer) for the same rows."""
+        verified = _infer_column_type(rows, 'v', sample_size=self.SAMPLE)
+        full = _infer_column_type(rows, 'v', sample_size=None)
+        return type(verified).__name__, type(full).__name__
+
+    def test_int_column_with_a_float_beyond_the_sample_becomes_numeric(self):
+        # The exact silent-rounding case: without verification this stays
+        # BigInteger and PostgreSQL rounds 3.5 to 4 on insert.
+        rows = [{'v': i} for i in range(self.SAMPLE)] + [{'v': 3.5}]
+        verified, full = self._both(rows)
+        self.assertEqual(verified, 'Numeric')
+        self.assertEqual(verified, full)
+
+    def test_int_column_with_a_decimal_beyond_the_sample_becomes_numeric(self):
+        # Decimal is the other member of the 'numeric' family and reaches
+        # the same rounding cast; covered separately so a fix that only
+        # special-cased float wouldn't pass.
+        rows = [{'v': i} for i in range(self.SAMPLE)] + [{'v': Decimal('2.5')}]
+        verified, full = self._both(rows)
+        self.assertEqual(verified, 'Numeric')
+        self.assertEqual(verified, full)
+
+    def test_date_column_with_a_datetime_beyond_the_sample_becomes_datetime(self):
+        # The silent time-truncation case. datetime is a subclass of date,
+        # which is exactly why the verification uses `type(v) is date`
+        # rather than isinstance() -- isinstance would accept the datetime
+        # as consistent with a Date column and let the truncation through.
+        rows = [{'v': date(2024, 1, 1)} for _ in range(self.SAMPLE)]
+        rows.append({'v': datetime(2024, 1, 1, 13, 30)})
+        verified, full = self._both(rows)
+        self.assertEqual(verified, 'DateTime')
+        self.assertEqual(verified, full)
+
+    def test_int_column_with_text_beyond_the_sample_becomes_text(self):
+        # Would have failed loudly at insert time rather than corrupting
+        # anything, but the verification pass must still resolve it the
+        # way a full scan does -- widening to Numeric here would be wrong.
+        rows = [{'v': i} for i in range(self.SAMPLE)] + [{'v': 'N/A'}]
+        verified, full = self._both(rows)
+        self.assertEqual(verified, 'Text')
+        self.assertEqual(verified, full)
+
+    def test_int_column_with_a_bool_beyond_the_sample_becomes_text(self):
+        # bool is a subclass of int, so an isinstance()-based verification
+        # would treat True as consistent with BigInteger and never
+        # re-infer. A full scan resolves {'int', 'bool'} to Text.
+        rows = [{'v': i} for i in range(self.SAMPLE)] + [{'v': True}]
+        verified, full = self._both(rows)
+        self.assertEqual(verified, 'Text')
+        self.assertEqual(verified, full)
+
+    def test_clean_columns_are_unchanged_and_keep_their_narrow_type(self):
+        # The common case: verification must not widen anything on its own.
+        # If it did, every int column in the project would silently become
+        # Numeric, which is a worse regression than the bug being fixed.
+        int_rows = [{'v': i} for i in range(self.SAMPLE * 3)]
+        self.assertEqual(self._both(int_rows), ('BigInteger', 'BigInteger'))
+
+        date_rows = [{'v': date(2024, 1, 1)} for _ in range(self.SAMPLE * 3)]
+        self.assertEqual(self._both(date_rows), ('Date', 'Date'))
+
+    def test_nones_beyond_the_sample_do_not_trigger_rewidening(self):
+        # None is absent data, not an incompatible value -- the scan
+        # already skips it, and the verification pass must too, or every
+        # nullable int column would re-infer needlessly on every publish.
+        #
+        # Asserting the resulting TYPE alone would be a vacuous test: a
+        # re-inference triggered by None still returns BigInteger, so the
+        # outcome is identical either way and the assertion could never
+        # fail. Confirmed directly by trying it. What actually
+        # distinguishes correct from broken here is the COST -- whether
+        # the full re-inference pass ran at all -- so this counts reads
+        # instead, the same way test_verification_only_scans_rows_beyond_
+        # the_sample does.
+        class CountingDict(dict):
+            reads = 0
+
+            def get(self, key, default=None):
+                type(self).reads += 1
+                return super().get(key, default)
+
+        rows = [CountingDict(v=i) for i in range(self.SAMPLE)]
+        rows += [CountingDict(v=None) for _ in range(self.SAMPLE * 5)]
+
+        CountingDict.reads = 0
+        result = _infer_column_type(rows, 'v', sample_size=self.SAMPLE)
+
+        self.assertEqual(type(result).__name__, 'BigInteger')
+        # Sample, plus one verification sweep of the unsampled rows --
+        # and crucially NOT a third, full re-inference pass over all of
+        # them, which is what a None-triggered re-widen would cost.
+        self.assertEqual(CountingDict.reads, len(rows))
+
+    def test_verification_only_scans_rows_beyond_the_sample(self):
+        # The whole point of this shape over a full scan is that the
+        # expensive part is skipped for every non-narrowable column.
+        # A text column must never reach the verification loop at all.
+        class CountingDict(dict):
+            reads = 0
+
+            def get(self, key, default=None):
+                type(self).reads += 1
+                return super().get(key, default)
+
+        rows = [CountingDict(v=f'text {i}') for i in range(self.SAMPLE * 10)]
+        CountingDict.reads = 0
+        result = _infer_column_type(rows, 'v', sample_size=self.SAMPLE)
+        self.assertEqual(type(result).__name__, 'Text')
+        # Sample only: the inferred type isn't narrowable, so no row past
+        # the sample is ever read.
+        self.assertEqual(CountingDict.reads, self.SAMPLE)
+
+    def test_explicit_full_scan_still_means_full_scan(self):
+        # sample_size=None must keep its original meaning exactly -- the
+        # verification pass is skipped because there is nothing left to
+        # verify, not because inference got weaker.
+        rows = [{'v': i} for i in range(self.SAMPLE)] + [{'v': 3.5}]
+        result = _infer_column_type(rows, 'v', sample_size=None)
+        self.assertEqual(type(result).__name__, 'Numeric')
+
+
+
+class Test9DiscardPendingReadEnablesTheFirstExplicitTransaction(unittest.TestCase):
+    """run_pipelines() calls publisher.discard_pending_read() between the
+    source-state read and the pipeline loop. Nothing tested it. Confirmed
+    directly by deleting that call from runner.py: all 217 tests still
+    passed, because FakeSqlaConnection.begin() used to accept a second
+    begin() on an already-transacted connection where real SQLAlchemy
+    rejects it.
+
+    The real behavior, confirmed against genuine SQLAlchemy 2.0.43 driving
+    a real SQLite engine (not reasoned about from documentation):
+
+        conn.execute(...)        -> autobegin, in_transaction() is True
+        conn.begin()             -> InvalidRequestError
+
+    That matters because SourceStateStore's reads and DDL go through
+    publisher.ensure_connection(), never through _ensure_transaction(), so
+    a source-check-enabled run reaches the pipeline loop with an implicit
+    transaction already open on the connection. The first publish() then
+    calls _ensure_transaction() -> conn.begin() and, without the discard,
+    raises -- on every such run, in production, immediately.
+
+    These tests drive the real DbPublisher against the corrected fake, so
+    the mechanism is covered here regardless of whether the sandbox has a
+    real SQLAlchemy available.
+    """
+
+    def _publisher_on_open_connection(self):
+        """A DbPublisher whose connection has an autobegun transaction --
+        exactly the state a source-state read leaves behind."""
+        publisher = DbPublisher(creds=_CREDS, schema='bsr')
+        publisher._engine = FakeSqlaEngine()
+        conn = publisher.ensure_connection()
+        conn.execute('select 1 from task_scaffold_meta', {'task_name': 't'})
+        return publisher, conn
+
+    def test_a_source_state_read_leaves_an_implicit_transaction_open(self):
+        # The precondition the discard exists for. If this ever stops being
+        # true, the rest of this class is testing nothing.
+        publisher, conn = self._publisher_on_open_connection()
+        self.assertIsNone(publisher._tx)
+        self.assertTrue(conn.in_transaction())
+
+    def test_begin_without_discarding_the_pending_read_is_rejected(self):
+        publisher, _ = self._publisher_on_open_connection()
+        with self.assertRaises(sa_exc.InvalidRequestError):
+            publisher._ensure_transaction()
+
+    def test_discard_pending_read_lets_the_first_publish_open_its_transaction(self):
+        publisher, conn = self._publisher_on_open_connection()
+        publisher.discard_pending_read()
+        self.assertFalse(conn.in_transaction())
+        publisher._ensure_transaction()
+        self.assertIsNotNone(publisher._tx)
+        self.assertTrue(conn.in_transaction())
+
+    def test_discard_pending_read_does_not_touch_an_explicit_transaction(self):
+        # Once _tx exists, the pipeline loop owns the transaction and the
+        # discard must be a no-op -- rolling back here would silently throw
+        # away an already-published table mid-run.
+        publisher = DbPublisher(creds=_CREDS, schema='bsr')
+        publisher._engine = FakeSqlaEngine()
+        publisher._ensure_transaction()
+        tx_before = publisher._tx
+        conn = publisher._conn
+
+        publisher.discard_pending_read()
+
+        self.assertIs(publisher._tx, tx_before)
+        self.assertTrue(conn.in_transaction())
+
+    def test_discard_pending_read_is_safe_before_any_connection_exists(self):
+        # run_pipelines() can reach the discard with a publisher that has
+        # never connected (create_if_missing=False, nothing executed yet).
+        publisher = DbPublisher(creds=_CREDS, schema='bsr')
+        self.assertIsNone(publisher._conn)
+        publisher.discard_pending_read()   # must not raise, must not connect
+        self.assertIsNone(publisher._conn)
+
+
+
+class Test10ZeroDimensionalArraysAreScalarsNotContainers(unittest.TestCase):
+    """The scalar guard added for one-element containers
+    (Test7 above) drew its line at pd.api.types.is_scalar(), which says
+    False for np.array(5). Correct as a statement about types -- it is an
+    ndarray -- and wrong for what these two functions need to decide. A
+    zero-dimensional array wraps exactly one scalar and has no container
+    semantics to preserve, so np.array(5) reached the DB driver as an
+    array instead of the int 5, while np.array([5]) is a genuine
+    one-element container and must stay one. `.ndim == 0` is exactly that
+    line, and it is the same line for both callers.
+
+    Raised by external review as a narrow normalization-policy question.
+    Investigating it turned up a second, older asymmetry the review did
+    not reach, confirmed directly across dtypes: pd.isna() returns a plain
+    numpy bool for a TYPED zero-dim array (float64, datetime64) but a
+    zero-dim ARRAY for an object-dtype one. So np.array(np.nan) already
+    normalized to None while np.array(pd.NaT), np.array(None) and
+    np.array(pd.NA) did not -- four values that all hold nothing,
+    behaving two different ways based only on the dtype numpy inferred.
+
+    The review's own suggested one-liner would have fixed the first half
+    and made the second half worse: with the guard relaxed but is_missing()
+    left alone, np.array(pd.NaT) stops being an array and becomes a bare
+    pd.NaT handed to the driver -- confirmed directly before choosing the
+    shared-predicate shape instead.
+    """
+
+    def test_a_zero_dim_array_normalizes_to_its_scalar(self):
+        import numpy as np
+        self.assertEqual(_normalize_value(np.array(5)), 5)
+        self.assertIsInstance(_normalize_value(np.array(5)), int)
+        self.assertEqual(_normalize_value(np.array('x')), 'x')
+
+    def test_every_zero_dim_missing_value_normalizes_to_none_regardless_of_dtype(self):
+        # The asymmetry. float64 and datetime64 already worked; the three
+        # object-dtype cases did not.
+        import numpy as np
+        for value in (np.array(np.nan), np.array(pd.NaT), np.array(None), np.array(pd.NA)):
+            with self.subTest(dtype=str(value.dtype)):
+                self.assertTrue(is_missing(value))
+                self.assertIsNone(_normalize_value(value))
+
+    def test_one_element_containers_are_still_preserved(self):
+        # The property Test7 exists for must survive this change -- a
+        # one-element container is not a scalar no matter how it is spelled.
+        import numpy as np
+        for value in (np.array([5]), np.array([None]), pd.Series([5]), [5], [None]):
+            with self.subTest(value=repr(value)):
+                self.assertFalse(is_missing(value))
+                result = _normalize_value(value)
+                self.assertIs(type(result), type(value))
+
+    def test_multi_element_containers_are_still_preserved(self):
+        import numpy as np
+        for value in (np.array([1, 2]), [1, 2], pd.Series([1, 2])):
+            with self.subTest(value=repr(value)):
+                self.assertFalse(is_missing(value))
+                self.assertIs(type(_normalize_value(value)), type(value))
+
+    def test_genuine_numpy_and_pandas_scalars_are_unaffected(self):
+        # numpy scalars report .ndim == 0 too, but are already is_scalar(),
+        # so the first branch short-circuits and nothing changes for them.
+        import numpy as np
+        result = _normalize_value(np.int64(5))
+        self.assertEqual(result, 5)
+        self.assertIsInstance(result, int)
+        self.assertNotIsInstance(result, np.integer)
+        self.assertEqual(_normalize_value(pd.Timestamp('2020-01-01')), datetime(2020, 1, 1))
+        for missing in (pd.NA, float('nan'), pd.NaT, None):
+            self.assertIsNone(_normalize_value(missing))
+
+
+
+class Test11IdentifierValidationPreflightAndRuntime(unittest.TestCase):
+    """Every PostgreSQL identifier this code constructs or accepts is
+    validated against the byte limit before it reaches SQL, and its
+    uniqueness-bearing suffix is never truncated.
+
+    Two tiers, because neither alone is sufficient. Preflight is pure and
+    connection-free, so a bad declaration fails before any resource is
+    built -- but it cannot see column names that come from data, and it
+    has to assume a limit rather than read one. Runtime sees the real
+    columns and the real server value, but only after the pipeline has
+    already done its work.
+
+    The failure being prevented is silent: PostgreSQL truncates an
+    over-long identifier and emits a NOTICE, not an error, and psycopg2
+    exposes notices on the connection where nothing here reads them. The
+    name would simply differ from the one this code believes it created.
+    """
+
+    def _payload(self, **kwargs):
+        import petl as etl
+        from task_core.db_publish import from_petl
+        kwargs.setdefault('table_name', 't')
+        kwargs.setdefault('schema', None)
+        tbl = kwargs.pop('tbl', etl.wrap([['v'], ['x']]))
+        return from_petl(tbl, **kwargs)
+
+    def _publisher(self, **kwargs):
+        # A real SQLAlchemy engine (in-memory SQLite, no driver needed)
+        # rather than FakeSqlaEngine: these tests drive genuine DDL through
+        # sa.Table.create(), which needs a real bind. It also means the
+        # server-limit fallback is exercised for real -- SQLite has no
+        # max_identifier_length, so _effective_identifier_limit() takes its
+        # documented fallback to the configured value.
+        import sqlalchemy as sa
+        publisher = DbPublisher(creds=_CREDS, schema=None, **kwargs)
+        publisher._engine = sa.create_engine('sqlite://')
+        self.addCleanup(publisher.close)
+        return publisher
+
+    # --- the naming rule itself -------------------------------------
+
+    def test_only_the_readable_prefix_is_ever_shortened(self):
+        run_token = new_run_token()
+        name = staging_table_name('bsr', 'x' * 200, run_token)
+        self.assertLessEqual(len(name.encode('utf-8')), MAX_IDENTIFIER_BYTES)
+        # The uniqueness-bearing suffix survives whole -- truncating it
+        # would defeat the entire reason it exists.
+        self.assertTrue(name.endswith(f'_{run_token}'))
+        self.assertIn(f'__{STAGING_NAME_KIND}_', name)
+
+    def test_truncation_is_by_bytes_and_never_splits_a_character(self):
+        # Characters would not be enough: confirmed directly that a
+        # 62-character Cyrillic name is 116 UTF-8 bytes.
+        name = staging_table_name('bsr', 'ы' * 200, new_run_token())
+        self.assertLessEqual(len(name.encode('utf-8')), MAX_IDENTIFIER_BYTES)
+        self.assertEqual(name.encode('utf-8').decode('utf-8'), name)
+
+    def test_the_target_token_does_not_depend_on_the_run(self):
+        # This is what makes static collision checking exact rather than
+        # probabilistic. Fold the run into the hash and two targets could
+        # collide under one run and not another.
+        first = staging_target_token('bsr', 'sales')
+        second = staging_target_token('bsr', 'sales')
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, staging_target_token('bsr', 'other'))
+        self.assertNotEqual(first, staging_target_token('other_schema', 'sales'))
+
+    def test_two_targets_sharing_a_truncated_prefix_get_distinct_names(self):
+        run_token = new_run_token()
+        a = 'sales_pipeline_report_by_region_and_quarter_northern'
+        b = 'sales_pipeline_report_by_region_and_quarter_southern'
+        self.assertNotEqual(
+            staging_table_name('bsr', a, run_token),
+            staging_table_name('bsr', b, run_token),
+        )
+
+    def test_concurrent_runs_get_different_physical_names(self):
+        name = 'sales'
+        self.assertNotEqual(
+            staging_table_name('bsr', name, new_run_token()),
+            staging_table_name('bsr', name, new_run_token()),
+        )
+
+    # --- preflight ---------------------------------------------------
+
+    def test_preflight_rejects_an_over_long_declared_table(self):
+        specs = {'p': tc.PipelineSpec(db_table='x' * 70)}
+        with self.assertRaises(DbPublishError) as caught:
+            DbPublisher.preflight(specs, schema='bsr')
+        self.assertIn('p:', str(caught.exception))
+
+    def test_preflight_rejects_a_non_portable_declared_name(self):
+        for spec in (tc.PipelineSpec(db_table='отчет'),
+                     tc.PipelineSpec(db_table='Sales'),
+                     tc.PipelineSpec(db_table='t', db_output=['Блок']),
+                     tc.PipelineSpec(db_table='t', db_updated_at='Загружено')):
+            with self.subTest(spec=spec):
+                with self.assertRaises(DbPublishError):
+                    DbPublisher.preflight({'p': spec}, schema='bsr')
+
+    def test_quoted_mode_permits_non_portable_names_but_not_over_long_ones(self):
+        DbPublisher.preflight(
+            {'p': tc.PipelineSpec(db_table='отчет', db_output=['Блок'],
+                                  db_identifier_mode='quoted')},
+            schema='bsr',
+        )
+        with self.assertRaises(DbPublishError):
+            DbPublisher.preflight(
+                {'p': tc.PipelineSpec(db_table='ы' * 40, db_identifier_mode='quoted')},
+                schema='bsr',
+            )
+
+    def test_preflight_validates_the_schema_as_portable_regardless_of_mode(self):
+        # Schema is task-wide, so no per-spec flag may reach it.
+        with self.assertRaises(DbPublishError):
+            DbPublisher.preflight(
+                {'p': tc.PipelineSpec(db_table='t', db_identifier_mode='quoted')},
+                schema='Схема',
+            )
+
+    def test_preflight_is_a_no_op_when_nothing_declares_a_db_table(self):
+        # A genuinely DB-free task should not have backend policy applied.
+        DbPublisher.preflight({'p': tc.PipelineSpec(excel_name='out.xlsx')}, schema='Схема')
+
+    def test_preflight_catches_a_staging_collision_before_anything_is_built(self):
+        specs = {
+            'a': tc.PipelineSpec(db_table='sales_pipeline_report_by_region_x_northern'),
+            'b': tc.PipelineSpec(db_table='sales_pipeline_report_by_region_x_northern'),
+        }
+        # Same target twice is caught upstream by validate_pipeline_classes;
+        # reaching preflight directly proves preflight itself sees it too.
+        with self.assertRaises(DbPublishError):
+            DbPublisher.preflight(specs, schema='bsr')
+
+    def test_preflight_opens_no_connection(self):
+        engine_calls = []
+
+        class ExplodingEngine:
+            def connect(self):
+                engine_calls.append(1)
+                raise AssertionError('preflight must not connect')
+
+        DbPublisher.preflight({'p': tc.PipelineSpec(db_table='hr_staff')}, schema='bsr')
+        self.assertEqual(engine_calls, [])
+
+    # --- runtime -----------------------------------------------------
+
+    def test_column_names_are_validated_after_the_contract_is_applied(self):
+        # Placement is load-bearing: run before the contract and this
+        # rejects raw Cyrillic spreadsheet headers, which is 77 of the 79
+        # source names in this project and would break every hr_task
+        # pipeline. Run after, the renamed targets pass.
+        publisher = self._publisher()
+        import petl as etl
+        renamed = self._payload(tbl=etl.wrap([['Блок'], ['x']]), db_contract={'Блок': 'block'})
+        self.assertEqual(renamed.columns, ['block'])
+        publisher.publish(renamed)
+
+        publisher = self._publisher()
+        unrenamed = self._payload(tbl=etl.wrap([['Блок'], ['x']]))
+        with self.assertRaises(DbPublishError):
+            publisher.publish(unrenamed)
+
+    def test_quoted_payload_mode_permits_a_non_portable_column(self):
+        import petl as etl
+        publisher = self._publisher()
+        payload = self._payload(tbl=etl.wrap([['Блок'], ['x']]), identifier_mode='quoted')
+        publisher.publish(payload)
+
+    def test_an_injected_limit_tightens_validation(self):
+        publisher = self._publisher(max_identifier_bytes=20)
+        with self.assertRaises(DbPublishError):
+            publisher.publish(self._payload(table_name='a_fairly_long_table_name'))
+
+    def test_the_generated_name_registry_catches_a_repeated_target(self):
+        # Impossible by construction and already excluded by preflight --
+        # which is exactly why it is asserted. Raises the INVARIANT error,
+        # not the task-author-facing one.
+        publisher = self._publisher()
+        payload = self._payload(table_name='dup')
+        publisher.publish(payload)
+        with self.assertRaises(DbPublishInvariantError) as caught:
+            publisher.publish(payload)
+        self.assertIn('internal invariant violated', str(caught.exception))
+
+    def test_the_invariant_error_is_still_a_db_publish_error(self):
+        # Existing cleanup paths catch DbPublishError; they must keep
+        # catching this, while isinstance still tells the two apart.
+        self.assertTrue(issubclass(DbPublishInvariantError, DbPublishError))
+
+    def test_validate_identifier_rejects_empty_and_nul_in_both_modes(self):
+        for bad in ('', 'a\x00b'):
+            with self.subTest(value=bad):
+                with self.assertRaises(DbPublishError):
+                    validate_identifier(bad, MAX_IDENTIFIER_BYTES, kind='table name')
+
+
+
+class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
+    """The publication phase itself, driven through the real DbPublisher
+    against a real SQLAlchemy engine -- previously covered only indirectly,
+    through fakes in runner tests and through naming/preflight logic. The
+    method at the centre of the publication architecture had no direct
+    test.
+
+    Also covers the corrections from external review, each confirmed
+    directly before fixing.
+    """
+
+    def _publisher(self, **kwargs):
+        import sqlalchemy as sa
+        publisher = DbPublisher(creds=_CREDS, schema=None, **kwargs)
+        publisher._engine = sa.create_engine('sqlite://')
+        self.addCleanup(publisher.close)
+        return publisher
+
+    def _seed(self, publisher, ddl, insert):
+        import sqlalchemy as sa
+        conn = publisher.ensure_connection()
+        conn.execute(sa.text(ddl))
+        conn.execute(sa.text(insert))
+        publisher.commit()
+        publisher.discard_pending_read()
+        return conn
+
+    def _payload(self, table_name, tbl):
+        from task_core.db_publish import from_petl
+        return from_petl(tbl, table_name=table_name, schema=None)
+
+    def _tables(self, conn):
+        import sqlalchemy as sa
+        return conn.execute(sa.text(
+            "select name from sqlite_master where type='table'")).scalars().all()
+
+    # --- the swap itself ---------------------------------------------
+
+    def test_the_live_table_is_untouched_until_commit(self):
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table t (v bigint)', 'insert into t values (1),(2),(3)')
+
+        publisher.publish(self._payload('t', etl.wrap([['v'], [9]])))
+        self.assertEqual(conn.execute(sa.text('select v from t')).scalars().all(), [1, 2, 3])
+
+        publisher.commit()
+        self.assertEqual(conn.execute(sa.text('select v from t')).scalars().all(), [9])
+
+    def test_schema_evolution_survives_the_swap(self):
+        # The property that made DROP+CREATE worth keeping over TRUNCATE.
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table t (v bigint)', 'insert into t values (1)')
+
+        publisher.publish(self._payload('t', etl.wrap([['v', 'extra'], [1.5, 'a']])))
+        publisher.commit()
+
+        columns = conn.execute(sa.text('select name from pragma_table_info("t")')).scalars().all()
+        self.assertEqual(columns, ['v', 'extra'])
+
+    def test_no_staging_table_survives_a_successful_run(self):
+        import petl as etl
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table t (v int)', 'insert into t values (1)')
+        publisher.publish(self._payload('t', etl.wrap([['v'], [9]])))
+        publisher.commit()
+        self.assertEqual(self._tables(conn), ['t'])
+
+    def test_rollback_after_staging_leaves_the_live_table_untouched(self):
+        """Asserts the live table only, deliberately, NOT the absence of a
+        staging table.
+
+        Orphan-residue behavior cannot be tested on this backend and it
+        would be dishonest to pretend otherwise. Confirmed directly:
+        pysqlite does not begin a transaction for DDL, so CREATE TABLE is
+        auto-committed and survives a rollback, while DML rolls back
+        correctly. PostgreSQL has genuine transactional DDL and does not
+        behave this way -- but that is documentation, not something this
+        suite can demonstrate, and this session has already turned up two
+        cases where documented and actual needed checking separately.
+
+        What this test does cover is the property that matters either way:
+        a rolled-back run never modifies the live table.
+        """
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table t (v int)', 'insert into t values (1)')
+
+        publisher.publish(self._payload('t', etl.wrap([['v'], [9]])))
+        publisher.rollback()
+
+        self.assertEqual(conn.execute(sa.text('select v from t')).scalars().all(), [1])
+
+    def test_several_tables_swap_together(self):
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table a (v int)', 'insert into a values (1)')
+        conn.execute(sa.text('create table b (v int)'))
+        conn.execute(sa.text('insert into b values (2)'))
+        publisher.commit()
+        publisher.discard_pending_read()
+
+        publisher.publish(self._payload('a', etl.wrap([['v'], [10]])))
+        publisher.publish(self._payload('b', etl.wrap([['v'], [20]])))
+        publisher.commit()
+
+        self.assertEqual(conn.execute(sa.text('select v from a')).scalar(), 10)
+        self.assertEqual(conn.execute(sa.text('select v from b')).scalar(), 20)
+        self.assertEqual(sorted(self._tables(conn)), ['a', 'b'])
+
+    def test_commit_alone_publishes_without_any_separate_finalize_call(self):
+        """The regression that made finalization private. With the swap
+        exposed as a public method the runner had to remember to call,
+        publish() + commit() reported committed=True and
+        committed_tables=['None.t'] while the live table still held its old
+        rows and the staging table was committed permanently -- a publisher
+        reporting success having published nothing. Confirmed directly
+        before the fix.
+        """
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table t (v int)', 'insert into t values (1)')
+
+        publisher.publish(self._payload('t', etl.wrap([['v'], [99]])))
+        publisher.commit()
+
+        self.assertTrue(publisher.committed)
+        self.assertEqual(conn.execute(sa.text('select v from t')).scalars().all(), [99])
+        self.assertEqual(self._tables(conn), ['t'])
+
+    def test_the_publisher_protocol_did_not_grow_a_finalize_method(self):
+        # publisher_factory is an advertised testing and extension seam.
+        # A publisher written against the previous contract died with
+        # AttributeError at the end of an otherwise successful run when
+        # finalization was public -- confirmed directly.
+        self.assertFalse(hasattr(DbPublisher, 'finalize_published_tables'))
+
+    # --- review corrections ------------------------------------------
+
+    def test_a_portable_identifier_may_not_carry_a_trailing_newline(self):
+        # Python's `$` matches before a trailing newline, so match()
+        # accepted 'foo\n'. fullmatch() is the fix, in both users of the
+        # shared pattern.
+        with self.assertRaises(DbPublishError):
+            validate_portable_identifier('foo\n', kind='table name')
+
+    def test_an_unrecognised_payload_identifier_mode_is_rejected(self):
+        # `mode == 'portable'` meant any typo silently selected the
+        # permissive branch. PipelineSpec validates its own field, but a
+        # DbPayload built directly does not pass through it.
+        publisher = self._publisher()
+        payload = DbPayload(table_name='t', schema=None, columns=['x'],
+                            rows=[{'x': 1}], identifier_mode='portbale')
+        with self.assertRaises(DbPublishError):
+            publisher.publish(payload)
+
+    def test_the_source_state_table_is_a_reserved_target(self):
+        """A pipeline declaring the source-state table as its db_table
+        destroyed the stored fingerprints and still reported success.
+        Reproduced end to end: the run updated fingerprints in the real
+        table, then the swap dropped it and renamed the pipeline's staging
+        table over it. The staging design is what lets this succeed
+        silently -- under direct publication the later upsert would likely
+        have failed on missing columns.
+        """
+        specs = {'p': tc.PipelineSpec(db_table='task_scaffold_meta')}
+        with self.assertRaises(DbPublishError) as caught:
+            DbPublisher.preflight(specs, schema='bsr',
+                                  source_state_target=('bsr', 'task_scaffold_meta'))
+        self.assertIn('source-state', str(caught.exception))
+
+        # A different table in the same schema is fine.
+        DbPublisher.preflight({'p': tc.PipelineSpec(db_table='hr_staff')}, schema='bsr',
+                              source_state_target=('bsr', 'task_scaffold_meta'))
+
+    def test_source_state_identifiers_are_length_checked(self):
+        # SourceStateStore validated the regex and nothing else, so a
+        # 64-byte lower-case source-state table name was accepted and would
+        # have been silently truncated -- the exact failure this mechanism
+        # exists to prevent, still reachable through the technical table.
+        with self.assertRaises(DbPublishError):
+            DbPublisher.preflight({}, schema='bsr', source_state_target=('bsr', 'a' * 64))
+
+    def test_preflight_still_runs_when_only_the_source_state_table_exists(self):
+        # A source-check-only run creates and writes a real table, so
+        # skipping preflight because no pipeline declares db_table left it
+        # unvalidated.
+        with self.assertRaises(DbPublishError):
+            DbPublisher.preflight({'p': tc.PipelineSpec(excel_name='out.xlsx')},
+                                  schema='bsr', source_state_target=('bsr', 'Отчет'))
+
+    def test_a_leading_null_run_does_not_force_a_text_column(self):
+        # If the whole sample is null, Text is a guess rather than an
+        # observation. Sparse columns routinely have long leading null runs
+        # after sorting or monthly expansion.
+        import datetime
+        for tail, expected in ((1, 'BigInteger'), (1.5, 'Numeric'),
+                               (datetime.date(2024, 1, 1), 'Date')):
+            with self.subTest(tail=tail):
+                rows = [{'v': None}] * 5000 + [{'v': tail}]
+                self.assertEqual(type(_infer_column_type(rows, 'v')).__name__, expected)
+
+    def test_a_genuinely_text_column_is_still_text(self):
+        # The all-null branch must not fire for a column that really is
+        # text -- 'saw nothing' and 'saw text' both resolve to Text and
+        # only one of them should trigger a rescan.
+        rows = [{'v': 'x'}] * 5000 + [{'v': 'y'}]
+        self.assertEqual(type(_infer_column_type(rows, 'v')).__name__, 'Text')
+
+    def test_a_non_postgres_backend_does_not_fail_on_the_missing_setting(self):
+        # SQLite has no max_identifier_length. The dialect branch means
+        # this is not an error, while a real PostgreSQL failure is no
+        # longer swallowed.
+        publisher = self._publisher(max_identifier_bytes=40)
+        self.assertEqual(publisher._effective_identifier_limit(), 40)
+
 
 
 if __name__ == '__main__':

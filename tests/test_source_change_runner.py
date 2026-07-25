@@ -48,6 +48,16 @@ class FakeSourceStateConn:
         self.committed_rows = {}  # durable state -- (task_name, source_key) -> source_signature
         self.pending_rows = None  # None = no writes this transaction; dict = staged, not yet committed
         self.table_created = False
+        # Real SQLAlchemy autobegins an implicit transaction on ANY execute(),
+        # read or write, and then rejects a later conn.begin() until it is
+        # committed or rolled back -- confirmed directly against genuine
+        # SQLAlchemy 2.0.43 on a real SQLite engine, not inferred from docs.
+        # Tracked here (not just in test_db_publish.py's own fake) because
+        # whether run_pipelines() clears it at the right point, between the
+        # source-state read and the first publish(), is an ORDERING property
+        # of the runner -- which is this file's scope -- and was previously
+        # invisible to every test here.
+        self.implicit_transaction_open = False
 
     def _current_view(self):
         if self.pending_rows is None:
@@ -61,6 +71,7 @@ class FakeSourceStateConn:
     def execute(self, query, params=None):
         sql = str(query).lower().strip()
         params = params or {}
+        self.implicit_transaction_open = True   # autobegin, on reads too
 
         if 'create table' in sql:
             self.table_created = True
@@ -92,9 +103,11 @@ class FakeSourceStateConn:
         if self.pending_rows is not None:
             self.committed_rows = self.pending_rows
         self.pending_rows = None
+        self.implicit_transaction_open = False
 
     def rollback(self):
         self.pending_rows = None
+        self.implicit_transaction_open = False
 
 
 class _FakeResult:
@@ -106,6 +119,16 @@ class _FakeResult:
 
 
 class FakeDbPublisher:
+    # Records preflight rather than stubbing it: WHEN the runner invokes the
+    # backend hook is an ordering property of the runner, which is this
+    # file's scope. A bare no-op would hide it the way discard_pending_read()
+    # was hidden.
+    preflight_calls = []
+
+    @classmethod
+    def preflight(cls, specs, *, schema, **kwargs):
+        cls.preflight_calls.append((sorted(specs), schema))
+
     """Same shape as db_publish.DbPublisher (ensure_connection/
     discard_pending_read/publish/commit/rollback/close/committed/
     committed_tables/written_tables/table_rows), plus call counters these
@@ -154,15 +177,34 @@ class FakeDbPublisher:
         self.commit_calls = 0
         self.rollback_calls = 0
         self.close_calls = 0
+        self.discard_calls = 0
         self.fail_commit = fail_commit
 
     def ensure_connection(self):
         return self.conn
 
     def discard_pending_read(self):
-        pass
+        # Mirrors the real DbPublisher.discard_pending_read(): with no
+        # explicit transaction of its own, it rolls the connection back to
+        # clear whatever the source-state read autobegan.
+        self.discard_calls += 1
+        self.conn.rollback()
 
     def publish(self, payload):
+        # The real DbPublisher.publish() calls _ensure_transaction() ->
+        # conn.begin(), which genuine SQLAlchemy REJECTS while an implicit
+        # transaction from the source-state read is still open. Modelled
+        # here at exactly that granularity -- not by replicating
+        # DbPublisher's internals, but so this file can see whether the
+        # RUNNER clears the pending read before publishing, which is an
+        # ordering question and therefore this file's own scope.
+        if self.conn.implicit_transaction_open:
+            raise RuntimeError(
+                'This connection has already initialized a SQLAlchemy '
+                'Transaction() object via begin() or autobegin; '
+                "can't call begin() here unless rollback() or commit() "
+                'is called first.'
+            )
         self._written_tables.append(payload)
         self._table_rows[payload.table_name] = len(payload.rows)
 
@@ -644,6 +686,91 @@ class Test3TransactionAtomicity(unittest.TestCase):
 
         self.assertIn('failed during pipeline execution', str(cm.exception))
         self.assertTrue(resource.closed, 'ctx.close() did not run despite publisher.close() also failing')
+
+
+class Test6RunnerClearsThePendingSourceStateReadBeforePublishing(unittest.TestCase):
+    """run_pipelines() must call publisher.discard_pending_read() between
+    the source-state read and the pipeline loop. Nothing tested that
+    ordering, in this file or any other -- confirmed directly by deleting
+    the call from runner.py and watching all 217 tests pass.
+
+    Why it matters: SourceStateStore's ensure_table()/read_state() go
+    through publisher.ensure_connection(), never through
+    _ensure_transaction(), so a source-check-enabled run arrives at the
+    pipeline loop with an implicit transaction already autobegun on the
+    connection. The first publish() then calls _ensure_transaction() ->
+    conn.begin(), which genuine SQLAlchemy 2.0.43 rejects outright
+    (InvalidRequestError, confirmed directly against a real SQLite
+    engine). Without the discard, every source-check-enabled run that also
+    publishes a table fails on its first publish, in production,
+    immediately -- while the test suite stayed green.
+
+    This lives here rather than in tests/test_db_publish.py deliberately.
+    That file now covers DbPublisher's own discard/begin mechanics
+    (Test9), and those passed even with the runner's call deleted, because
+    the mechanism working in isolation says nothing about whether the
+    runner invokes it at the right moment -- the same distinction already
+    recorded for stabilize() in the README, and the same mistake made
+    again here before being caught.
+    """
+
+    def test_a_publish_after_the_source_state_read_succeeds(self):
+        # The end-to-end property. Fails with InvalidRequestError-shaped
+        # RuntimeError if runner.py stops discarding the pending read.
+        publishers = []
+
+        def factory(**kwargs):
+            publisher = FakeDbPublisher(**kwargs)
+            publishers.append(publisher)
+            return publisher
+
+        result = tc.run_pipelines(
+            task_name='discard_ordering',
+            build_context=lambda: make_context()[0],
+            pipelines={'p': make_pipeline(db_table='out_tbl')},
+            run_sequence=['p'],
+            output_excel=False,
+            output_db=True,
+            creds={'user': 'x', 'host': 'x', 'dbname': 'x'},
+            source_change_check=tc.SourceChangeCheckConfig(enabled=True),
+            publisher_factory=factory,
+        )
+
+        self.assertFalse(result.skipped)
+        self.assertTrue(result.db_committed)
+        self.assertEqual(len(publishers), 1)
+        self.assertEqual(publishers[0].discard_calls, 1)
+        self.assertEqual([p.table_name for p in publishers[0].written_tables], ['out_tbl'])
+
+    def test_the_discard_happens_before_the_first_publish_not_after(self):
+        # Ordering specifically, not merely "was it called at some point":
+        # a discard issued after the loop would leave publish() broken and
+        # additionally throw away the staged source-state write.
+        order = []
+
+        class OrderRecordingPublisher(FakeDbPublisher):
+            def discard_pending_read(self):
+                order.append('discard')
+                super().discard_pending_read()
+
+            def publish(self, payload):
+                order.append('publish')
+                super().publish(payload)
+
+        tc.run_pipelines(
+            task_name='discard_ordering',
+            build_context=lambda: make_context()[0],
+            pipelines={'p': make_pipeline(db_table='out_tbl')},
+            run_sequence=['p'],
+            output_excel=False,
+            output_db=True,
+            creds={'user': 'x', 'host': 'x', 'dbname': 'x'},
+            source_change_check=tc.SourceChangeCheckConfig(enabled=True),
+            publisher_factory=OrderRecordingPublisher,
+        )
+
+        self.assertEqual(order, ['discard', 'publish'])
+
 
 
 if __name__ == '__main__':

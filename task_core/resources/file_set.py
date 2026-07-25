@@ -44,6 +44,7 @@ class file_set_resource:
         self._source_access = _resolve_source_access(source_access)
         self._buffered = buffered
         self._selection = selection
+        self._row_metadata_cache = {}
 
     def open_file(self, selected_file):
         if selected_file not in self.files:
@@ -57,11 +58,23 @@ class file_set_resource:
         # Same shape and same explicit-opt-in reasoning as
         # excel_resource.read_excel_row_metadata() -- this is the half of
         # phase 2 that actually serves a file-set pipeline (ssch), which
-        # never constructs an excel_resource at all. Same second-handle
-        # cost too: call once per file/sheet and cache the result if
-        # reused.
-        with self.open_file(selected_file) as src:
-            return _read_excel_row_metadata(src, sheet=sheet, mode=mode, column=column)
+        # never constructs an excel_resource at all.
+        #
+        # Cached by (selected_file, sheet, mode, column) -- selected_file
+        # confirmed directly to be hashable (a frozen dataclass) and safe
+        # as a dict key -- for the same reason excel_resource's own
+        # version is cached: every file in self.files is immutable for
+        # this resource's whole lifetime, so the same key always means
+        # the same answer, removing a real, easy-to-forget cost -- a
+        # second full network read on every call otherwise, not just
+        # the first.
+        key = (selected_file, sheet, mode, column)
+        if key not in self._row_metadata_cache:
+            with self.open_file(selected_file) as src:
+                self._row_metadata_cache[key] = _read_excel_row_metadata(src, sheet=sheet, mode=mode, column=column)
+        # A copy, not the internal cache dict directly -- same fix,
+        # same reason, as excel_resource's own version above.
+        return dict(self._row_metadata_cache[key])
 
     def source_fingerprint(self, source_key):
         if self._selection is None:

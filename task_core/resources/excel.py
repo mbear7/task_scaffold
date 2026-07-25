@@ -59,10 +59,8 @@ def tbl2dict(wb, table, cols=(0, 1)):
 
 
 class excel_resource:
-    def __init__(self, file_path, sheets, tables, *, source_access=None, excel_buffered=False, selection=None):
+    def __init__(self, file_path, sheets=None, tables=None, *, source_access=None, excel_buffered=False, selection=None):
         self.file_path = str(file_path)
-        self.sheets = sheets
-        self.tables = tables
         self._source_access = _resolve_source_access(source_access)
         self._excel_buffered = excel_buffered
         self._selection = selection
@@ -73,6 +71,45 @@ class excel_resource:
         self._range_cache = {}
         self._sheet_cache = {}
         self._raw_cache = {}
+        # None is a safe "not yet loaded" sentinel for both: a genuinely
+        # loaded .sheets is always a non-None sequence of sheet names,
+        # and .tables is always a dict (possibly empty, but never None).
+        # A caller may still provide both directly (the pre-existing,
+        # public constructor shape -- found by external review this is
+        # genuinely part of task_core's exported facade, not merely an
+        # internal detail, and preserving it costs almost nothing) --
+        # doing so short-circuits the lazy load entirely, the same as
+        # if it had already run once.
+        self._sheets_value = sheets
+        self._tables_value = tables
+        self._row_metadata_cache = {}
+
+    def _ensure_metadata(self):
+        # sheets and tables share one lazy load, populated together by
+        # one xlsx_info() call, deliberately not split into two
+        # independent lazy properties -- confirmed directly that real
+        # tasks access .sheets and .tables from the same source file in
+        # the same run, and splitting them would mean a second, separate
+        # workbook open the first time whichever is accessed second.
+        # Sharing one load keeps the existing guarantee (one open, both
+        # available) exactly as it was before this became lazy at all --
+        # the only thing deferred is *when* that one open happens, not
+        # whether it happens.
+        if self._sheets_value is None:
+            with suppress_openpyxl_data_validation_warning():
+                self._sheets_value, self._tables_value = self._source_access.xlsx_info(
+                    self.file_path, buffered=self._excel_buffered
+                )
+
+    @property
+    def sheets(self):
+        self._ensure_metadata()
+        return self._sheets_value
+
+    @property
+    def tables(self):
+        self._ensure_metadata()
+        return self._tables_value
 
     def source_fingerprint(self, source_key):
         if self._selection is None:
@@ -118,18 +155,46 @@ class excel_resource:
         # correspond to XLSX row numbers after any filtering it does of
         # its own.
         #
-        # Opens its own handle via open_binary(), independent of whatever
-        # handle this resource may already be holding open for its normal
-        # data reads (in SMB non-buffered mode, that handle stays open
-        # for the resource's whole lifetime). SMB read-sharing means this
-        # is safe, but it's a second full network read per call, not
-        # free -- call once per sheet and cache the result if the
-        # pipeline needs it more than once.
-        with self._source_access.open_binary(self.file_path, buffered=self._excel_buffered) as src:
-            return _read_excel_row_metadata(src, sheet=sheet, mode=mode, column=column)
+        # Cached by (sheet, mode, column), not left to the caller: this
+        # resource represents one immutable selected workbook, so the
+        # same key always means the same answer, and caching it here
+        # removes a real, if easy to forget, cost -- opening its own
+        # handle via open_binary(), independent of whatever handle this
+        # resource may already be holding open for its normal data reads
+        # (in SMB non-buffered mode, that handle stays open for the
+        # resource's whole lifetime), is a second full network read on
+        # every single call otherwise, not just the first.
+        key = (sheet, mode, column)
+        if key not in self._row_metadata_cache:
+            with self._source_access.open_binary(self.file_path, buffered=self._excel_buffered) as src:
+                self._row_metadata_cache[key] = _read_excel_row_metadata(src, sheet=sheet, mode=mode, column=column)
+        # A copy, not the internal cache dict directly -- found by a
+        # further review, confirmed directly: a caller mutating what
+        # this returned silently corrupted the cached answer for a
+        # later pipeline calling this with the same key. The same class
+        # of regression already fixed for get_sheet_raw_rows() (see its
+        # own docstring), applied here for the same reason.
+        return dict(self._row_metadata_cache[key])
 
     def _ensure_workbook(self):
         if self._wb is None:
+            # Metadata resolved -- opened, closed, GC'd -- before the
+            # retained workbook below, regardless of which method got
+            # here first. Found by a further review: the earlier fix
+            # (self.tables[name] evaluated before _ensure_workbook() in
+            # get_table()/get_map() specifically) only prevented THOSE
+            # two methods from triggering the overlap themselves -- it
+            # didn't protect against _ensure_workbook() already having
+            # been triggered by some OTHER, earlier call (get_sheet_rows(),
+            # get_range(), etc.) before get_table() ever runs. Confirmed
+            # directly with the same source_access that rejects
+            # xlsx_info() while a retained workbook is active: calling
+            # get_sheet_rows() then get_table() still overlapped, even
+            # with the earlier fix in place. This is the one, shared
+            # choke point every method that needs the retained workbook
+            # goes through, so resolving metadata here protects every
+            # call path, not just the two originally touched.
+            self._ensure_metadata()
             # We intentionally keep the workbook context open across the whole
             # excel_resource lifetime so repeated get_table/get_map/get_range/
             # get_sheet_rows calls reuse one workbook instance and one set of
@@ -152,6 +217,10 @@ class excel_resource:
     def get_table(self, name):
         if name not in self._table_cache:
             with suppress_openpyxl_data_validation_warning():
+                # _ensure_workbook() itself now guarantees metadata is
+                # resolved before the retained workbook opens (see its
+                # own comment), regardless of call order -- this method
+                # no longer needs to enforce that ordering itself.
                 wb = self._ensure_workbook()
                 self._table_cache[name] = load_table(wb, self.tables[name])
         return self._table_cache[name]
@@ -222,19 +291,35 @@ class excel_resource:
                 DeprecationWarning,
                 stacklevel=2,
             )
-        key = (sheet, header)
-        if key not in self._sheet_cache:
+        # Shares _raw_rows_for_sheet()'s own cache rather than reading
+        # the worksheet a second time -- both previously called the
+        # identical list(ws.values) independently, genuinely storing the
+        # same sheet's rows twice if both were ever used for it. Cache
+        # key is sheet alone now, not (sheet, header): header never
+        # affected the result (the confirmed no-op above), so the two
+        # were already producing identical values as two separate,
+        # non-identical cache entries -- now genuinely one. Built from
+        # the PRIVATE, internal materialization (never exposed directly
+        # to an external caller), not get_sheet_raw_rows()'s own public
+        # return value -- see that method's own docstring for why this
+        # distinction matters.
+        rows = self._raw_rows_for_sheet(sheet)
+        if sheet not in self._sheet_cache:
+            self._sheet_cache[sheet] = etl.empty() if not rows else etl.wrap(rows)
+        return self._sheet_cache[sheet]
+
+    def _raw_rows_for_sheet(self, sheet):
+        # The one, genuine list(ws.values) read for a given sheet,
+        # cached and shared internally between get_sheet_rows() and
+        # get_sheet_raw_rows() -- never returned directly to an external
+        # caller. See get_sheet_raw_rows()'s own docstring for why this
+        # needs to stay separate from what that method actually returns.
+        if sheet not in self._raw_cache:
             with suppress_openpyxl_data_validation_warning():
                 wb = self._ensure_workbook()
                 ws = wb[sheet]
-                rows = list(ws.values)
-                if not rows:
-                    self._sheet_cache[key] = etl.empty()
-                elif header:
-                    self._sheet_cache[key] = etl.wrap([rows[0], *rows[1:]])
-                else:
-                    self._sheet_cache[key] = etl.wrap(rows)
-        return self._sheet_cache[key]
+                self._raw_cache[sheet] = list(ws.values)
+        return self._raw_cache[sheet]
 
     def get_sheet_raw_rows(self, sheet):
         """Every row of the sheet, as a plain list of tuples -- no
@@ -245,30 +330,60 @@ class excel_resource:
         available as genuine data (e.g. scanning for a header row that
         could be anywhere in the sheet), instead of reconstructing it
         via etl.header()/etl.data() on a get_sheet_rows(header=False)
-        result."""
-        if sheet not in self._raw_cache:
-            with suppress_openpyxl_data_validation_warning():
-                wb = self._ensure_workbook()
-                ws = wb[sheet]
-                self._raw_cache[sheet] = list(ws.values)
-        return self._raw_cache[sheet]
+        result.
+
+        Returns a fresh copy every call, not the resource's own internal
+        cache directly -- found by a further review, confirmed directly:
+        after get_sheet_rows()/get_sheet_raw_rows() were made to share
+        one materialization, mutating what this method returned (e.g.
+        raw[1] = (9, 9)) silently changed get_sheet_rows()'s own,
+        already-cached petl table too, since both were built from the
+        exact same, single list object. The underlying list(ws.values)
+        read still only happens once per sheet, cached internally
+        (_raw_rows_for_sheet() above) -- only the copy on the way out is
+        new, a cheap, shallow list() copy, negligible next to the actual
+        costs (SMB reads, workbook opens) this project's caching has
+        been about."""
+        return list(self._raw_rows_for_sheet(sheet))
 
     def close(self):
+        # References dropped BEFORE __exit__(), not after. open_workbook()'s
+        # own finally: now runs gc.collect() from inside this __exit__() call
+        # -- and self._wb still pointing at the workbook at that moment would
+        # defeat it exactly the way a skipped `del wb` defeats xlsx_info()'s.
+        # Confirmed directly, before this change: at the instant __exit__()
+        # returned, gc.get_referrers() on the workbook still listed this
+        # resource's own __dict__, because _wb was only cleared afterwards in
+        # the finally: below.
+        #
+        # Swap-then-close, so both attributes are cleared even if __exit__()
+        # raises -- the same shape DbPublisher.close() already uses, and the
+        # reason a second close() after a failed one is a clean no-op rather
+        # than a retry of the same failing workbook.
+        workbook_cm, self._workbook_cm = self._workbook_cm, None
+        self._wb = None
+
         try:
-            if self._workbook_cm is not None:
+            if workbook_cm is not None:
                 # open_workbook()'s own context manager (file_access.py)
                 # already does `finally: wb.close()` -- this __exit__()
                 # call closes the workbook; no separate, explicit
                 # self._wb.close() is needed alongside it.
-                self._workbook_cm.__exit__(None, None, None)
+                workbook_cm.__exit__(None, None, None)
         finally:
-            self._workbook_cm = None
-            self._wb = None
+            # Confirmed directly that none of these caches transitively
+            # reference the workbook or any worksheet (they hold plain
+            # values, tuples and petl tables built from them), so clearing
+            # them after the collect above costs the collect nothing. They
+            # are cleared in a finally: regardless, so a failing __exit__()
+            # cannot leave this resource holding stale cached data for a
+            # workbook that is gone.
             self._table_cache.clear()
             self._map_cache.clear()
             self._range_cache.clear()
             self._sheet_cache.clear()
             self._raw_cache.clear()
+            self._row_metadata_cache.clear()
 
 
 
@@ -276,13 +391,8 @@ def build_excel_resource(file_path, *, source_access=None, excel_buffered=False,
     source_access = _resolve_source_access(source_access)
     file_path = source_access.select_fixed_file(file_path)
 
-    with suppress_openpyxl_data_validation_warning():
-        sheets, tables = source_access.xlsx_info(file_path, buffered=excel_buffered)
-
     return excel_resource(
         file_path=file_path,
-        sheets=sheets,
-        tables=tables,
         source_access=source_access,
         excel_buffered=excel_buffered,
         selection=selection,

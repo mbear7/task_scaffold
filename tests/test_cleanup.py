@@ -76,6 +76,10 @@ class RecordingResource:
 
 
 class FakePublisher:
+    @classmethod
+    def preflight(cls, specs, *, schema, **kwargs):
+        pass
+
     def __init__(self, *, creds, schema, logger=None, close_error=None, commit_error=None, rollback_error=None):
         self._close_error = close_error
         self._commit_error = commit_error

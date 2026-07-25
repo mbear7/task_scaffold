@@ -21,7 +21,7 @@ from __future__ import annotations
 import pandas as pd
 import petl as etl
 
-from task_core.db_publish import from_pandas, from_petl
+from task_core.db_publish import from_pandas, from_petl, is_missing
 
 from task_core.types import PipelineContractError, VALID_TABLE_ADAPTERS
 from task_core.openpyxl_compat import suppress_openpyxl_data_validation_warning
@@ -40,18 +40,18 @@ def normalize_for_excel(value):
     if getattr(value, 'tzinfo', None) is not None:
         return value.replace(tzinfo=None)
 
-    # NaN (np.nan, pd.NA, or any other value that fails value == value,
-    # the same check db_publish.py's _normalize_value already uses) is
-    # the second confirmed case, not a hypothetical one: writing it
-    # as-is produces structurally malformed XML -- a numeric-typed cell
-    # with an empty <v></v> (petl's toxlsx()) or an inlineStr-typed cell
-    # with no content at all (pandas's to_excel()) -- confirmed directly
-    # by inspecting the raw XML both adapters produce. Both happen to
-    # read back as None via openpyxl's own leniency, which is exactly
-    # why this went unnoticed: it isn't the same guarantee as the clean,
-    # standard XLSX a genuine None produces (the cell correctly omitted
-    # entirely), and isn't a reliable signal that real, desktop Excel
-    # would open the file cleanly, without a repair prompt.
+    # NaN (np.nan, pd.NA, pd.NaT, or any other value pd.isna() recognizes
+    # as missing) is the second confirmed case, not a hypothetical one:
+    # writing it as-is produces structurally malformed XML -- a
+    # numeric-typed cell with an empty <v></v> (petl's toxlsx()) or an
+    # inlineStr-typed cell with no content at all (pandas's to_excel())
+    # -- confirmed directly by inspecting the raw XML both adapters
+    # produce. Both happen to read back as None via openpyxl's own
+    # leniency, which is exactly why this went unnoticed: it isn't the
+    # same guarantee as the clean, standard XLSX a genuine None
+    # produces (the cell correctly omitted entirely), and isn't a
+    # reliable signal that real, desktop Excel would open the file
+    # cleanly, without a repair prompt.
     #
     # This exact fix silently regressed once already (v0.2.0 was rebuilt
     # from a point before it existed, with no persistent test catching
@@ -59,11 +59,14 @@ def normalize_for_excel(value):
     # against the raw, on-disk worksheet XML specifically, not just an
     # in-memory table/DataFrame value, precisely because that's what let
     # the regression through unnoticed the first time.
-    try:
-        if value != value:
-            return None
-    except Exception:
-        pass
+    #
+    # is_missing() (db_publish.py), not a bare value != value check: a
+    # further review found that check genuinely broken for pd.NA
+    # specifically -- see is_missing()'s own docstring for why -- which
+    # this function had too, independently of _normalize_value() having
+    # the identical bug.
+    if is_missing(value):
+        return None
 
     return value
 
@@ -79,6 +82,18 @@ class _PetlAdapter:
                 "expected a petl table, got a pandas DataFrame -- "
                 "set table_adapter='pandas' if this pipeline should use pandas"
             )
+
+    def stabilize(self, tbl, repeated):
+        # etl.cache() materializes rows into memory as they're first
+        # requested via iteration, then serves every later traversal from
+        # that cache instead of re-running whatever lazy chain produced
+        # them -- confirmed directly this is transparent to every caller
+        # here (nrows(), display(), to_excel(), to_db_payload() all just
+        # iterate tbl normally, with no idea whether it's cached).
+        # Skipped when repeated is False: wrapping a table that's only
+        # ever traversed once (by nrows() alone) would allocate a
+        # CacheView for zero benefit.
+        return tbl.cache() if repeated else tbl
 
     def nrows(self, tbl):
         with suppress_openpyxl_data_validation_warning():
@@ -104,6 +119,15 @@ class _PandasAdapter:
                 f"expected a pandas DataFrame, got {type(tbl).__name__} -- "
                 f"set table_adapter='petl' if this pipeline should use petl"
             )
+
+    def stabilize(self, tbl, repeated):
+        # A pandas DataFrame is already fully materialized in memory --
+        # never a lazy chain the way a petl transformation can be, so
+        # there's nothing here for repeated traversal to re-run.
+        # validate() above already enforces this is a genuine
+        # pd.DataFrame, not some lazier pandas-adjacent object, ruling
+        # out any case where this would need to do more.
+        return tbl
 
     def nrows(self, tbl):
         return len(tbl)

@@ -29,7 +29,7 @@ from pathlib import Path
 import pandas as pd
 import petl as etl
 
-from task_core.table_adapters import PETL_ADAPTER, PANDAS_ADAPTER
+from task_core.table_adapters import PETL_ADAPTER, PANDAS_ADAPTER, normalize_for_excel
 
 _NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 
@@ -202,6 +202,189 @@ class Test3MalformedCellDetectorItself(unittest.TestCase):
 
     def test_does_not_flag_a_genuinely_absent_cell(self):
         self.assertFalse(_cell_is_structurally_malformed(None))
+
+
+class Test4StabilizePreventsRepeatedTraversal(unittest.TestCase):
+    """Found during an optimization review: after pipeline.run() returns,
+    the runner traverses out_tbl separately for nrows() (always), then
+    potentially display()/to_excel()/to_db_payload()/a downstream
+    ctx.get_result() consumer. For a lazy petl transformation chain, each
+    traversal re-runs the entire chain from scratch -- confirmed
+    directly. For a db_resource-backed table specifically, this is worse
+    than a performance cost: each traversal re-issues the underlying SQL
+    query, confirmed directly against a fake DB-API connection tracking
+    execute() calls -- a correctness risk, not just a speed one, since a
+    changing source table could produce different data between the
+    nrows() count and whatever gets published afterward.
+
+    adapter.stabilize(tbl, repeated=True) wraps a petl table in
+    etl.cache() -- confirmed directly this must happen before the FIRST
+    traversal to have any effect at all; applying it after nrows() has
+    already run leaves every later traversal still fully re-running."""
+
+    def test_petl_stabilize_wraps_in_cache_when_repeated(self):
+        import petl as etl
+        tbl = etl.wrap([('a',), (1,), (2,)])
+        stabilized = PETL_ADAPTER.stabilize(tbl, repeated=True)
+        self.assertIsInstance(stabilized, etl.util.materialise.CacheView)
+
+    def test_petl_stabilize_returns_unchanged_when_not_repeated(self):
+        import petl as etl
+        tbl = etl.wrap([('a',), (1,), (2,)])
+        stabilized = PETL_ADAPTER.stabilize(tbl, repeated=False)
+        self.assertIs(stabilized, tbl)
+
+    def test_pandas_stabilize_always_returns_the_same_dataframe(self):
+        df = pd.DataFrame({'a': [1, 2, 3]})
+        self.assertIs(PANDAS_ADAPTER.stabilize(df, repeated=True), df)
+        self.assertIs(PANDAS_ADAPTER.stabilize(df, repeated=False), df)
+
+    def test_lazy_petl_transform_runs_once_not_per_traversal(self):
+        import petl as etl
+        call_count = [0]
+
+        def expensive(row):
+            call_count[0] += 1
+            return row
+
+        tbl = etl.wrap([('a',), (1,), (2,), (3,)])
+        transformed = etl.rowmap(tbl, lambda r: (expensive(r[0]),), header=('a',))
+
+        stabilized = PETL_ADAPTER.stabilize(transformed, repeated=True)
+        PETL_ADAPTER.nrows(stabilized)  # first traversal -- populates the cache
+        list(etl.data(stabilized))  # second traversal -- must read from cache
+
+        self.assertEqual(
+            call_count[0], 3,
+            'the transform re-ran on the second traversal instead of reading from cache',
+        )
+
+    def test_db_resource_query_executes_once_not_per_traversal(self):
+        # The most serious case this fix addresses: confirmed directly,
+        # via a fake DB-API connection tracking execute() calls, that an
+        # unstabilized db_resource table re-issues its SQL query on every
+        # traversal.
+        import petl as etl
+        from task_core.resources.db import db_resource
+
+        execute_count = [0]
+
+        class FakeCursor:
+            description = [('a',), ('b',)]
+            def execute(self, query, *args, **kwargs):
+                execute_count[0] += 1
+            def fetchall(self):
+                return [(1, 'x'), (2, 'y'), (3, 'z')]
+            def close(self):
+                pass
+
+        class FakeConn:
+            def cursor(self, *args, **kwargs):
+                return FakeCursor()
+            def close(self):
+                pass
+
+        resource = db_resource.__new__(db_resource)
+        resource.creds = {}
+        resource._conn = FakeConn()
+        resource._table_cache = {}
+
+        tbl = resource.get_table(table='some_table')
+        stabilized = PETL_ADAPTER.stabilize(tbl, repeated=True)
+
+        execute_count[0] = 0
+        PETL_ADAPTER.nrows(stabilized)
+        list(etl.data(stabilized))
+        list(etl.data(stabilized))  # a third traversal, for good measure
+
+        self.assertEqual(
+            execute_count[0], 1,
+            'the SQL query re-executed on a later traversal instead of reading from the cache',
+        )
+
+    def test_runner_calls_stabilize_before_nrows_not_after(self):
+        # Distinct from the tests above: those call adapter methods
+        # directly in the right order themselves, so they wouldn't catch
+        # a regression where runner.py's own sequencing calls
+        # stabilize() after nrows() instead of before -- confirmed
+        # directly earlier that doing so makes the fix a complete no-op.
+        # This one goes through the real run_pipelines() to exercise
+        # that actual sequencing.
+        import petl as etl
+        import task_core as tc
+
+        call_count = [0]
+
+        def expensive(row):
+            call_count[0] += 1
+            return row
+
+        class pipeline:
+            spec = tc.PipelineSpec(db_table='t', db_output=('a',))
+            @classmethod
+            def run(cls, ctx):
+                tbl = etl.wrap([('a',), (1,), (2,), (3,)])
+                return etl.rowmap(tbl, lambda r: (expensive(r[0]),), header=('a',))
+
+        class FakeDbPublisher:
+            @classmethod
+            def preflight(cls, specs, *, schema, **kwargs): pass
+            def __init__(self, *, creds, schema, logger=None):
+                self.published = []
+            def ensure_connection(self): return object()
+            def discard_pending_read(self): pass
+            def publish(self, payload): self.published.append(payload)
+            def commit(self): return []
+            def rollback(self): pass
+            def close(self): pass
+            committed = property(lambda self: True)
+            committed_tables = property(lambda self: [])
+            written_tables = property(lambda self: self.published)
+            table_rows = property(lambda self: {})
+        ctx = tc.task_context(task_name='t', loaders={})
+        tc.run_pipelines(
+            task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline},
+            run_sequence=['p'], output_excel=False, output_db=True,
+            creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, pg_schema='bsr',
+            publisher_factory=FakeDbPublisher,
+        )
+
+        self.assertEqual(
+            call_count[0], 3,
+            'the transform ran more than once per row -- nrows() and the DB publish '
+            're-traversed independently instead of sharing one stabilized table',
+        )
+
+
+class Test5NormalizeForExcelHandlesPdNaCorrectly(unittest.TestCase):
+    """Companion to Test6 in test_db_publish.py -- the same is_missing()
+    fix, found broken independently in this function too, from the same
+    underlying cause (a bare value != value check that genuinely raises
+    for pd.NA rather than returning True, silently swallowed by the
+    surrounding except Exception: pass)."""
+
+    def test_normalize_for_excel_converts_a_raw_pd_na_to_none(self):
+        result = normalize_for_excel(pd.NA)
+        self.assertIsNone(result)
+
+    def test_pd_na_in_a_real_petl_export_produces_clean_xml(self):
+        # Full, end-to-end: the raw, on-disk worksheet XML, not just the
+        # function's own return value -- the same discipline
+        # Test1PetlAdapterNanInExcel already uses, for the same reason:
+        # an in-memory check alone is exactly what let the original NaN
+        # issue go unnoticed.
+        with TempDir() as d:
+            tbl = etl.wrap([('a', 'grade'), ('x', 5.0), ('y', pd.NA), ('z', 3.0)])
+            path = d / 'petl_pdna.xlsx'
+            PETL_ADAPTER.to_excel(tbl, str(path))
+
+            sheet_xml = _read_sheet_xml(path)
+            cell = _cell_element(sheet_xml, 'B3')
+
+            self.assertIsNone(
+                cell, 'a pd.NA cell should be entirely absent from the XML, '
+                'the same as a genuine None or np.nan',
+            )
 
 
 if __name__ == '__main__':

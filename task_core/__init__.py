@@ -18,7 +18,7 @@ resolves; this one behavior intentionally does not. See README
 message for the rationale.
 """
 
-__version__ = '0.2.0'
+__version__ = '0.2.11'
 
 from task_core.types import (
     DbRunResult,

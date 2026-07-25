@@ -11,10 +11,13 @@ import re
 
 import sqlalchemy as sa
 
-from task_core.types import SourceCheckError
+from task_core.types import SourceCheckError, PORTABLE_IDENTIFIER_RE
 
 
-_SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+# Shared with db_publish.py's target validation via types.py rather than
+# duplicated here -- one convention, one definition. See its docstring for
+# why it is lower-case only.
+_SAFE_IDENTIFIER_RE = PORTABLE_IDENTIFIER_RE
 
 
 def _validate_identifier(name, *, kind):
@@ -22,7 +25,7 @@ def _validate_identifier(name, *, kind):
     # "unsafe schema/table identifier" is a source-tracking *configuration*
     # problem (schema/table come from SourceChangeCheckConfig, a task_core
     # concept), not a generic publish failure.
-    if not isinstance(name, str) or not _SAFE_IDENTIFIER_RE.match(name):
+    if not isinstance(name, str) or not _SAFE_IDENTIFIER_RE.fullmatch(name):
         raise SourceCheckError(f'Unsafe {kind} identifier: {name!r}')
     return name
 
