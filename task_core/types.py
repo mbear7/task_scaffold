@@ -83,6 +83,14 @@ VALID_TABLE_ADAPTERS = frozenset({None, 'petl', 'pandas'})
 # previous [A-Za-z_] form broke nothing.
 PORTABLE_IDENTIFIER_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
 
+# The identifier-mode vocabulary. Engine-neutral, like the pattern above
+# and unlike PostgreSQL's byte limit, which stays in db_publish.py. Kept
+# here so PipelineSpec.__post_init__ and db_publish's payload validation
+# share one definition instead of each carrying its own literal tuple --
+# two sources of truth for the same closed set is a drift point with no
+# upside.
+IDENTIFIER_MODES = ('portable', 'quoted')
+
 
 @dataclass(frozen=True)
 class PipelineSpec:
@@ -122,9 +130,10 @@ class PipelineSpec:
         if self.db_table is not None and not isinstance(self.db_table, str):
             raise TypeError('db_table must be str or None')
 
-        if self.db_identifier_mode not in ('portable', 'quoted'):
+        if self.db_identifier_mode not in IDENTIFIER_MODES:
             raise ValueError(
-                f"db_identifier_mode must be 'portable' or 'quoted', got {self.db_identifier_mode!r}"
+                f'db_identifier_mode must be one of {IDENTIFIER_MODES}, '
+                f'got {self.db_identifier_mode!r}'
             )
 
         if self.db_output is not None:

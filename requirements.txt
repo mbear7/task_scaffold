@@ -1,4 +1,4 @@
-# task_core itself
+# --- task_core ---
 pandas
 numpy
 openpyxl
@@ -8,8 +8,9 @@ petl
 lxml
 smbclient
 
-# Not a direct dependency of this project's own code (checked: no task
-# file imports babel directly) -- but petl_util (external, not shipped
-# here, see README) needs it, and tasks/hr_task.py, tasks/ops_task.py,
-# and tasks/hr_petl_task.py all depend on petl_util to actually run.
+# --- reference tasks in tasks/ only ---
+# Not imported by task_core (checked: no task_core module imports babel),
+# and not needed by examples/. Required transitively by the shared helper
+# module that every file in tasks/ imports, which is maintained outside
+# this project and not shipped with it.
 babel

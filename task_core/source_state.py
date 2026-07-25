@@ -11,6 +11,12 @@ import re
 
 import sqlalchemy as sa
 
+from task_core.db_publish import (
+    MAX_IDENTIFIER_BYTES,
+    DbPublishError,
+    server_identifier_limit,
+    validate_identifier,
+)
 from task_core.types import SourceCheckError, PORTABLE_IDENTIFIER_RE
 
 
@@ -30,6 +36,19 @@ def _validate_identifier(name, *, kind):
     return name
 
 
+def _validate_identifier_length(conn, schema, table):
+    try:
+        limit = server_identifier_limit(conn, MAX_IDENTIFIER_BYTES)
+    except DbPublishError as exc:
+        raise SourceCheckError(str(exc)) from exc
+
+    for value, kind in ((schema, 'schema'), (table, 'table')):
+        try:
+            validate_identifier(value, limit, kind=f'source-state {kind}')
+        except DbPublishError as exc:
+            raise SourceCheckError(str(exc)) from exc
+
+
 class SourceStateStore:
     """Reads/writes the technical `task_scaffold_meta`-style table that backs
     task-level source-change checking. Always used through the same
@@ -41,6 +60,15 @@ class SourceStateStore:
         self.conn = conn
         self.schema = _validate_identifier(schema, kind='schema')
         self.table = _validate_identifier(table, kind='table')
+        # Byte length against the SERVER's real limit, not just the regex.
+        # Preflight validated these against a configured default with no
+        # connection available; NAMEDATALEN is compile-time configurable,
+        # so on a server with a lower limit that default can accept a name
+        # PostgreSQL will silently truncate. This is the first point at
+        # which a connection exists and still nothing has been created --
+        # and a source-check-only run never calls publish(), so without
+        # this it never verifies the real limit at all.
+        _validate_identifier_length(self.conn, self.schema, self.table)
         self.log = logger or logging.getLogger(__name__)
         self._full_name = f'{self.schema}.{self.table}'
 
@@ -66,6 +94,50 @@ class SourceStateStore:
                 primary key (task_name, source_key)
             )
         '''))
+
+        self._verify_columns()
+
+    # The columns this store reads and writes. Compared against the real
+    # table after ensure_table(), because that statement is
+    # `create table if not exists` -- so a table left by an earlier
+    # version with a different shape is accepted silently and then fails
+    # at the first upsert_state(), mid-run, after every pipeline has
+    # already executed. A startup error naming the difference is a much
+    # cheaper failure.
+    _EXPECTED_COLUMNS = frozenset({
+        'task_name', 'source_key', 'source_kind', 'root_path', 'include_mask',
+        'recursive', 'file_count', 'total_size_bytes', 'max_modified_at_utc',
+        'source_signature', 'source_snapshot', 'processed_at_utc',
+    })
+
+    def _verify_columns(self):
+        try:
+            result = self.conn.execute(
+                sa.text(
+                    'select column_name from information_schema.columns '
+                    'where table_schema = :schema and table_name = :table'
+                ),
+                {'schema': self.schema, 'table': self.table},
+            )
+            actual = {row[0] for row in result}
+        except Exception:
+            # Not every backend exposes information_schema the same way,
+            # and this check must never be the reason a run fails. A
+            # genuinely incompatible table still fails loudly at the first
+            # upsert -- this only moves that failure earlier when it can.
+            return
+
+        if not actual:
+            return
+
+        missing = self._EXPECTED_COLUMNS - actual
+        if missing:
+            raise SourceCheckError(
+                f'source-state table {self._full_name} exists but is missing '
+                f'column(s) {sorted(missing)}. It was probably created by an '
+                f'older version. Migrate or drop it; create table if not '
+                f'exists will not repair an existing table.'
+            )
 
     def read_state(self, task_name):
         result = self.conn.execute(

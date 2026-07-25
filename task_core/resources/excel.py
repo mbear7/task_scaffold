@@ -26,9 +26,9 @@ from task_core.openpyxl_compat import suppress_openpyxl_data_validation_warning
 
 def load_table(wb, table):
     """Extract an Excel Table's data range as a petl table. Confirmed
-    correct against the real, original implementation (previously lived
-    in petl_util, which task_core no longer depends on at all -- this is
-    a verbatim port, not a reconstruction)."""
+    correct against the original implementation this was ported from --
+    a verbatim port, not a reconstruction. task_core owns it outright and
+    depends on no external utility module for it."""
     ws = wb[table['sheet']]
     min_col, min_row, max_col, max_row = range_boundaries(table['range_string'])
     rows = list(ws.iter_rows(

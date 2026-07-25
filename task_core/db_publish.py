@@ -18,7 +18,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
-from task_core.types import PORTABLE_IDENTIFIER_RE, find_duplicates
+from task_core.types import IDENTIFIER_MODES, PORTABLE_IDENTIFIER_RE, find_duplicates
 
 
 @dataclass(frozen=True)
@@ -273,8 +273,6 @@ class DbPublishInvariantError(DbPublishError):
 # server's own max_identifier_length read before the first DDL. The
 # configured value can only ever LOWER the effective limit, never raise it
 # past what the server will actually accept.
-IDENTIFIER_MODES = ('portable', 'quoted')
-
 MAX_IDENTIFIER_BYTES = 63
 
 # Staging is a named internal namespace constant, not a live parameter.
@@ -324,6 +322,43 @@ def validate_portable_identifier(name, *, kind, context=''):
             f"Rename it, or set db_identifier_mode='quoted' on the pipeline spec."
         )
     return name
+
+
+def server_identifier_limit(conn, configured):
+    """The identifier byte limit actually in force: the lower of what the
+    caller configured and what the server reports.
+
+    Configuration can only ever TIGHTEN. A configured value larger than the
+    server's would produce names the server silently truncates, which is
+    the failure this whole mechanism exists to prevent.
+
+    Branches on the dialect rather than catching every exception. A
+    catch-all exists to accommodate backends with no such setting, but it
+    also swallows real PostgreSQL failures -- which makes the authoritative
+    runtime check not authoritative, since any error silently restores the
+    assumed value. Worse, the statement may run inside an open transaction,
+    and a failed statement leaves a PostgreSQL transaction aborted, so the
+    next DDL fails with a secondary transaction-aborted error obscuring the
+    real cause.
+
+    Module-level rather than a DbPublisher method so source_state.py can
+    use it for the technical table without the publisher protocol growing
+    another member -- that protocol is an advertised extension seam and has
+    already been expanded once by accident.
+    """
+    if conn.dialect.name != 'postgresql':
+        return configured
+
+    try:
+        value = conn.execute(sa.text('show max_identifier_length')).scalar()
+    except Exception as exc:
+        raise DbPublishError(
+            'could not read max_identifier_length from PostgreSQL; refusing to '
+            'assume a limit that generated identifiers would then be silently '
+            'truncated against'
+        ) from exc
+
+    return min(configured, int(value))
 
 
 def _quote_identifier(name):
@@ -593,39 +628,12 @@ class DbPublisher:
         return targets
 
     def _effective_identifier_limit(self):
-        """The server's own max_identifier_length, read once before the
-        first DDL, and never allowed to be raised by configuration -- a
-        configured value larger than the server's would produce names the
-        server silently truncates, which is the failure this whole
-        mechanism exists to prevent. min(), so config can only tighten.
-        """
         if self._server_identifier_bytes is None:
-            conn = self.ensure_connection()
-
-            # Branch on the dialect rather than catching every exception.
-            # The original catch-all existed for non-PostgreSQL backends
-            # that have no such setting (the sandbox's SQLite), but it also
-            # swallowed real PostgreSQL failures -- which made the
-            # 'authoritative runtime check' not authoritative at all, since
-            # any error silently restored the assumed value. Worse, the
-            # SHOW runs inside the explicit transaction, and a failed
-            # statement leaves a PostgreSQL transaction aborted, so the
-            # next staging DDL would fail with a secondary
-            # transaction-aborted error obscuring the real cause.
-            if conn.dialect.name != 'postgresql':
-                self._server_identifier_bytes = self.max_identifier_bytes
-            else:
-                try:
-                    value = conn.execute(sa.text('show max_identifier_length')).scalar()
-                    self._server_identifier_bytes = int(value)
-                except Exception as exc:
-                    raise DbPublishError(
-                        'could not read max_identifier_length from PostgreSQL; '
-                        'refusing to assume a limit that generated identifiers '
-                        'would then be silently truncated against'
-                    ) from exc
-
+            self._server_identifier_bytes = server_identifier_limit(
+                self.ensure_connection(), self.max_identifier_bytes,
+            )
         return min(self.max_identifier_bytes, self._server_identifier_bytes)
+
 
     def _validate_payload_identifiers(self, payload, limit):
         """The runtime half: the actual column names, after db_contract has
@@ -644,6 +652,22 @@ class DbPublisher:
         if payload.schema:
             validate_identifier(payload.schema, limit, kind='schema')
 
+        # Portability on the table name and schema, not only on columns.
+        # The standard runner path catches a bad table through preflight,
+        # but a DbPayload built directly does not go through it -- and this
+        # function already validates the payload's own identifier_mode,
+        # which means direct construction is treated as part of the
+        # contract. Under that contract the strict default was permitting a
+        # non-portable table name, confirmed directly.
+        #
+        # The schema is checked regardless of the payload's mode, matching
+        # the rule preflight applies: schema is task-wide while the mode is
+        # per-payload, so a per-payload flag must not be able to relax it.
+        if payload.schema:
+            validate_portable_identifier(
+                payload.schema, kind='schema', context=f'{payload.table_name!r}: ',
+            )
+
         context = f'{payload.table_name!r}: '
 
         # Validated, not merely compared. PipelineSpec checks its own mode,
@@ -657,6 +681,9 @@ class DbPublisher:
                 f'got {payload.identifier_mode!r}'
             )
         portable = payload.identifier_mode == 'portable'
+        if portable:
+            validate_portable_identifier(payload.table_name, kind='table name', context=context)
+
         for column in payload.columns:
             validate_identifier(column, limit, kind='column name', context=context)
             if portable:

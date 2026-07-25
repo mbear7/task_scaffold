@@ -430,7 +430,15 @@ class Test8RollbackFailureHandling(unittest.TestCase):
         # runner.py's own comment on try_rollback()'s rollback_attempted
         # guard for the narrower, defense-in-depth case that specifically
         # protects against.
+        class _FakeDialect:
+            # SourceStateStore reads conn.dialect to decide whether to ask
+            # PostgreSQL for its real max_identifier_length. A non-postgres
+            # dialect takes the documented fallback.
+            name = 'sqlite'
+
         class FakeSourceStateConn:
+            dialect = _FakeDialect()
+
             def __init__(self):
                 self.rows = {('t', 'files'): 'sig-v1'}  # seeded as already-committed, unchanged
 

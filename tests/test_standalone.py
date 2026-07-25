@@ -88,11 +88,110 @@ class TestTaskCoreIsStandalone(unittest.TestCase):
 
 class TestTestSuiteIsStandalone(unittest.TestCase):
     def test_test_suite_imports_nothing_task_level(self):
-        violations = _find_disallowed_imports(_THIS_DIR, extra_allowed=('unittest', 'tests'))
+        # 'examples' is allowed alongside 'tests': tests/test_docs.py runs
+        # examples/local_task.py to prove the README's quick start actually
+        # works, which is the only guard against shipping a documented
+        # example nobody can execute -- the previous documentation's
+        # "minimal task" called an undefined function and pointed at an SMB
+        # path.
+        #
+        # This does not weaken the standalone guarantee. examples/ is held
+        # to the same rule below, and tests/test_docs.py separately asserts
+        # by AST that the example imports nothing the quick start
+        # disclaims. Allowing it here is transitive, not an exemption.
+        # tasks/ remains excluded -- see
+        # docs/decisions/0002-keep-core-tests-independent-of-tasks.md.
+        violations = _find_disallowed_imports(
+            _THIS_DIR, extra_allowed=('unittest', 'tests', 'examples'),
+        )
         self.assertEqual(
             violations, {},
             f"tests/ imports something outside task_core, the standard library, or "
             f"{sorted(_ALLOWED_THIRD_PARTY)}: {violations}"
+        )
+
+
+class TestExamplesAreStandalone(unittest.TestCase):
+    """The quick start promises examples/ needs no share, no database and
+    nothing this project does not ship. That promise is only as good as
+    what enforces it."""
+
+    def test_examples_import_nothing_task_level(self):
+        examples_dir = os.path.join(_PROJECT_ROOT, 'examples')
+        if not os.path.isdir(examples_dir):
+            self.skipTest('no examples/ directory')
+
+        violations = _find_disallowed_imports(examples_dir)
+        self.assertEqual(
+            violations, {},
+            f'examples/ imports something outside task_core, the standard library, '
+            f'or {sorted(_ALLOWED_THIRD_PARTY)}: {violations}'
+        )
+
+
+class TestShippedFilesDoNotNameExternalModules(unittest.TestCase):
+    """The scaffold does not document modules it neither ships nor depends
+    on.
+
+    Task files legitimately import shared in-house helpers; task_core, its
+    documentation, its tests and its examples must not name them. Doing so
+    couples the scaffold's documentation to something outside its control,
+    and makes it read as though the dependency were the scaffold's.
+
+    The names are read from .gitignore's ignored root-level modules rather
+    than written here, so this test does not itself become the last place
+    naming them.
+    """
+
+    def _externally_supplied_module_names(self):
+        gitignore = os.path.join(_PROJECT_ROOT, '.gitignore')
+        if not os.path.exists(gitignore):
+            return []
+        names = []
+        for line in open(gitignore, encoding='utf-8'):
+            entry = line.strip()
+            # Root-level ignored .py files: modules expected to exist at
+            # runtime but supplied from outside the repository.
+            if entry.startswith('/') and entry.endswith('.py'):
+                names.append(os.path.basename(entry)[:-3])
+        return names
+
+    def test_no_shipped_file_names_an_externally_supplied_module(self):
+        names = self._externally_supplied_module_names()
+        if not names:
+            self.skipTest('no externally supplied modules declared in .gitignore')
+
+        roots = ['task_core', 'docs', 'examples', 'tests', 'README.md', 'CHANGELOG.md']
+        offenders = {}
+
+        for root in roots:
+            path = os.path.join(_PROJECT_ROOT, root)
+            if os.path.isfile(path):
+                candidates = [path]
+            elif os.path.isdir(path):
+                candidates = [
+                    os.path.join(dirpath, filename)
+                    for dirpath, _dirs, filenames in os.walk(path)
+                    if '__pycache__' not in dirpath
+                    for filename in filenames
+                    if filename.endswith(('.py', '.md'))
+                ]
+            else:
+                continue
+
+            for candidate in candidates:
+                if os.path.abspath(candidate) == os.path.abspath(__file__):
+                    continue
+                text = open(candidate, encoding='utf-8').read()
+                for name in names:
+                    if name in text:
+                        offenders.setdefault(
+                            os.path.relpath(candidate, _PROJECT_ROOT), set()
+                        ).add(name)
+
+        self.assertEqual(
+            offenders, {},
+            f'shipped files name externally supplied module(s): {offenders}'
         )
 
 

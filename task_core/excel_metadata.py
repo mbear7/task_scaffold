@@ -6,9 +6,9 @@ openpyxl, since openpyxl doesn't expose outline levels/indent/style
 through its own object model at the fidelity this needs.
 
 Native to task_core -- not sourced from any external utility module.
-task_core depends on no external petl_util-style module for anything;
-task files (hr_task.py, ops_task.py, hr_petl_task.py) may have their own,
-separate needs (month-name parsing, calendar tables, petl-table
+task_core depends on nothing outside its own package, the standard
+library, and its declared third-party requirements. Task files may have
+their own, separate needs (month-name parsing, calendar tables, petl-table
 transformation helpers), but everything Excel-metadata-related, including
 aligning that metadata to a materialized table's rows, lives here.
 

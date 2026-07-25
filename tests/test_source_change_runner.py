@@ -23,6 +23,12 @@ import unittest
 import pandas as pd
 
 import task_core as tc
+from task_core.source_state import SourceStateStore
+from task_core.types import SourceCheckError
+
+
+class _FakeDialect:
+    name = 'sqlite'
 
 
 class FakeSourceStateConn:
@@ -58,6 +64,12 @@ class FakeSourceStateConn:
         # of the runner -- which is this file's scope -- and was previously
         # invisible to every test here.
         self.implicit_transaction_open = False
+        # Real SQLAlchemy connections carry a dialect, and SourceStateStore
+        # now asks for it to decide whether to read the server's real
+        # max_identifier_length. Modelled as a non-PostgreSQL dialect so
+        # that check takes its documented fallback rather than trying to
+        # execute SHOW against this fake.
+        self.dialect = _FakeDialect()
 
     def _current_view(self):
         if self.pending_rows is None:
@@ -104,10 +116,22 @@ class FakeSourceStateConn:
             self.committed_rows = self.pending_rows
         self.pending_rows = None
         self.implicit_transaction_open = False
+        # Real SQLAlchemy connections carry a dialect, and SourceStateStore
+        # now asks for it to decide whether to read the server's real
+        # max_identifier_length. Modelled as a non-PostgreSQL dialect so
+        # that check takes its documented fallback rather than trying to
+        # execute SHOW against this fake.
+        self.dialect = _FakeDialect()
 
     def rollback(self):
         self.pending_rows = None
         self.implicit_transaction_open = False
+        # Real SQLAlchemy connections carry a dialect, and SourceStateStore
+        # now asks for it to decide whether to read the server's real
+        # max_identifier_length. Modelled as a non-PostgreSQL dialect so
+        # that check takes its documented fallback rather than trying to
+        # execute SHOW against this fake.
+        self.dialect = _FakeDialect()
 
 
 class _FakeResult:
@@ -770,6 +794,111 @@ class Test6RunnerClearsThePendingSourceStateReadBeforePublishing(unittest.TestCa
         )
 
         self.assertEqual(order, ['discard', 'publish'])
+
+
+
+class Test7SourceStateTableIsValidatedBeforeItIsUsed(unittest.TestCase):
+    """The source-state table is a real PostgreSQL table this run creates
+    and writes, and it was outside both tiers of identifier validation at
+    runtime.
+
+    Preflight covers its declared names, but against a configured default
+    with no connection available. NAMEDATALEN is compile-time
+    configurable, so on a server with a lower limit that default can
+    accept a name PostgreSQL then silently truncates. And the resolution
+    of the server's real limit used to happen at the first publish() --
+    which a source-check-only run never reaches, so such a run never
+    verified the limit at all.
+
+    Checked in SourceStateStore rather than through a new publisher
+    method: publisher_factory is an advertised extension seam and has
+    already been expanded once by accident. The store already receives the
+    connection it needs.
+    """
+
+    class _Dialect:
+        name = 'postgresql'
+
+    class _Conn:
+        def __init__(self, limit=63, columns=None, fail_show=False):
+            self.dialect = Test7SourceStateTableIsValidatedBeforeItIsUsed._Dialect()
+            self._limit = limit
+            self._columns = columns
+            self._fail_show = fail_show
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            text = str(statement).lower()
+            self.statements.append(text.strip().split()[0] + (' ' + text.strip().split()[1] if len(text.strip().split()) > 1 else ''))
+
+            if 'max_identifier_length' in text:
+                if self._fail_show:
+                    raise RuntimeError('server went away')
+                return _Scalar(self._limit)
+            if 'information_schema.columns' in text:
+                return [(name,) for name in (self._columns or [])]
+            return None
+
+    def test_the_server_limit_is_read_before_any_source_state_ddl(self):
+        conn = self._Conn()
+        store = SourceStateStore(conn, schema='bsr', table='task_scaffold_meta')
+        # Construction alone must have asked, before ensure_table() runs.
+        self.assertTrue(any('show max_identifier_length' in s for s in conn.statements),
+                        f'server limit never read; statements were {conn.statements}')
+        self.assertFalse(any(s.startswith('create') for s in conn.statements),
+                         'DDL ran before the limit was verified')
+
+    def test_a_name_over_the_real_server_limit_is_rejected(self):
+        # Accepted by preflight's configured default of 63, rejected here
+        # against a server that reports 32.
+        conn = self._Conn(limit=32)
+        with self.assertRaises(SourceCheckError):
+            SourceStateStore(conn, schema='bsr', table='a' * 40)
+
+    def test_a_failure_reading_the_limit_is_not_swallowed(self):
+        conn = self._Conn(fail_show=True)
+        with self.assertRaises(SourceCheckError):
+            SourceStateStore(conn, schema='bsr', table='task_scaffold_meta')
+
+    def test_an_existing_table_missing_columns_fails_at_startup(self):
+        """ensure_table() uses `create table if not exists`, so a table
+        left by an older version with a different shape was accepted
+        silently and then failed at the first upsert_state() -- mid-run,
+        after every pipeline had already executed. A startup error naming
+        the missing columns is a far cheaper failure.
+        """
+        conn = self._Conn(columns=['task_name', 'source_key', 'source_signature'])
+        store = SourceStateStore(conn, schema='bsr', table='task_scaffold_meta')
+
+        with self.assertRaises(SourceCheckError) as caught:
+            store.ensure_table()
+
+        message = str(caught.exception)
+        self.assertIn('older version', message)
+        self.assertIn('source_kind', message)
+
+    def test_a_complete_existing_table_is_accepted(self):
+        complete = ['task_name', 'source_key', 'source_kind', 'root_path', 'include_mask',
+                    'recursive', 'file_count', 'total_size_bytes', 'max_modified_at_utc',
+                    'source_signature', 'source_snapshot', 'processed_at_utc']
+        conn = self._Conn(columns=complete)
+        store = SourceStateStore(conn, schema='bsr', table='task_scaffold_meta')
+        store.ensure_table()
+
+    def test_a_table_that_does_not_exist_yet_is_accepted(self):
+        # information_schema returns nothing for a table being created for
+        # the first time; that is not a drift signal.
+        conn = self._Conn(columns=[])
+        store = SourceStateStore(conn, schema='bsr', table='task_scaffold_meta')
+        store.ensure_table()
+
+
+class _Scalar:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
 
 
 

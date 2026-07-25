@@ -6,9 +6,9 @@ imports (run_pipelines() only ever duck-types ctx/source_change_check);
 db_publish.py, source_state.py, export.py, table_adapters.py, and
 types.py are real runtime imports.
 
-Deliberately engine-neutral: no petl_util or pandas import here, and no
-openpyxl_compat either -- both live entirely inside table_adapters.py
-now, reached only through the adapter's uniform five-method interface
+Deliberately engine-neutral: no petl or pandas import here, and no
+openpyxl_compat either -- all of them live entirely inside
+table_adapters.py, reached only through the adapter's uniform interface
 (validate/nrows/display/to_excel/to_db_payload). This module never
 branches on which engine a pipeline uses.
 """

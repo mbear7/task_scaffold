@@ -50,6 +50,7 @@ from task_core.db_publish import (
     staging_target_token,
     validate_identifier,
     validate_portable_identifier,
+    server_identifier_limit,
     DbPayload,
     from_pandas,
     is_missing,
@@ -1296,6 +1297,158 @@ class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
         # longer swallowed.
         publisher = self._publisher(max_identifier_bytes=40)
         self.assertEqual(publisher._effective_identifier_limit(), 40)
+
+
+
+class Test13IdentifierValidationGapsFromReview(unittest.TestCase):
+    """Three gaps between what the documentation claimed and what the code
+    enforced, each confirmed directly before fixing.
+    """
+
+    def _publisher(self, **kwargs):
+        import sqlalchemy as sa
+        publisher = DbPublisher(creds=_CREDS, schema=None, **kwargs)
+        publisher._engine = sa.create_engine('sqlite://')
+        self.addCleanup(publisher.close)
+        return publisher
+
+    def test_a_direct_payload_cannot_carry_a_non_portable_table_name(self):
+        """Runtime validation applied the portable pattern to columns but
+        only length and NUL checks to payload.table_name -- so a directly
+        constructed payload in the default strict mode published to a
+        Cyrillic table. The runner path caught it through PipelineSpec
+        preflight; direct payload construction does not go through that,
+        and this function already validates the payload's own
+        identifier_mode, which means direct use is part of the contract.
+        """
+        publisher = self._publisher()
+        payload = DbPayload(table_name='Отчет', schema=None, columns=['x'],
+                            rows=[{'x': 1}], identifier_mode='portable')
+        with self.assertRaises(DbPublishError):
+            publisher.publish(payload)
+
+    def test_quoted_mode_still_permits_a_non_portable_table_name(self):
+        publisher = self._publisher()
+        payload = DbPayload(table_name='Отчет', schema=None, columns=['x'],
+                            rows=[{'x': 1}], identifier_mode='quoted')
+        publisher.publish(payload)
+
+    def test_the_schema_is_portable_regardless_of_payload_mode(self):
+        # Matching the rule preflight applies: schema is task-wide while
+        # the mode is per-payload, so a per-payload flag must not relax it.
+        publisher = self._publisher()
+        payload = DbPayload(table_name='t', schema='Схема', columns=['x'],
+                            rows=[{'x': 1}], identifier_mode='quoted')
+        with self.assertRaises(DbPublishError):
+            publisher.publish(payload)
+
+    def test_identifier_modes_have_one_definition(self):
+        # PipelineSpec.__post_init__ carried its own literal tuple while
+        # db_publish defined the constant -- the same closed set in two
+        # places, with nothing keeping them equal.
+        from task_core.types import IDENTIFIER_MODES as from_types
+        from task_core.db_publish import IDENTIFIER_MODES as from_db_publish
+        self.assertIs(from_types, from_db_publish)
+        self.assertEqual(from_types, ('portable', 'quoted'))
+
+    def test_the_spec_accepts_exactly_the_shared_set_and_nothing_more(self):
+        # Derived from the constant rather than listing values: a hardcoded
+        # list of BAD values cannot catch the spec quietly ACCEPTING an
+        # extra one, which is precisely the drift having two definitions
+        # allowed. Confirmed by adding a third mode to the spec's own
+        # check and watching an earlier version of this test pass.
+        from task_core.types import IDENTIFIER_MODES
+
+        for mode in IDENTIFIER_MODES:
+            with self.subTest(accepted=mode):
+                self.assertEqual(tc.PipelineSpec(db_identifier_mode=mode).db_identifier_mode, mode)
+
+        for mode in ('portbale', '', None, 'PORTABLE', 'legacy', 'raw'):
+            with self.subTest(rejected=mode):
+                self.assertNotIn(mode, IDENTIFIER_MODES)
+                with self.assertRaises(ValueError):
+                    tc.PipelineSpec(db_identifier_mode=mode)
+
+    def test_the_payload_rejects_exactly_the_same_set(self):
+        # The other half: both validators must move together.
+        from task_core.types import IDENTIFIER_MODES
+
+        publisher = self._publisher()
+        for mode in ('portbale', 'legacy', 'raw'):
+            with self.subTest(mode=mode):
+                self.assertNotIn(mode, IDENTIFIER_MODES)
+                payload = DbPayload(table_name='t', schema=None, columns=['x'],
+                                    rows=[{'x': 1}], identifier_mode=mode)
+                with self.assertRaises(DbPublishError):
+                    publisher.publish(payload)
+
+
+class Test14ServerIdentifierLimitResolution(unittest.TestCase):
+    """server_identifier_limit() is the authoritative runtime check. Its
+    PostgreSQL failure branch was previously untested -- the only coverage
+    confirmed that SQLite does not issue the statement, which exercises the
+    fallback rather than the branch that matters.
+    """
+
+    class _Dialect:
+        def __init__(self, name):
+            self.name = name
+
+    class _Conn:
+        def __init__(self, dialect_name, result=None, error=None):
+            self.dialect = Test14ServerIdentifierLimitResolution._Dialect(dialect_name)
+            self._result = result
+            self._error = error
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append(str(statement))
+            if self._error is not None:
+                raise self._error
+
+            class _Result:
+                def __init__(self, value):
+                    self._value = value
+
+                def scalar(self):
+                    return self._value
+
+            return _Result(self._result)
+
+    def test_a_non_postgres_backend_is_not_asked(self):
+        conn = self._Conn('sqlite')
+        self.assertEqual(server_identifier_limit(conn, 63), 63)
+        self.assertEqual(conn.statements, [], 'SHOW issued against a backend that has no such setting')
+
+    def test_postgres_is_asked_and_the_answer_is_used(self):
+        conn = self._Conn('postgresql', result=63)
+        self.assertEqual(server_identifier_limit(conn, 63), 63)
+        self.assertEqual(len(conn.statements), 1)
+        self.assertIn('max_identifier_length', conn.statements[0])
+
+    def test_configuration_can_only_tighten_never_raise(self):
+        # A configured value larger than the server's would produce names
+        # the server silently truncates -- the failure this exists to
+        # prevent.
+        self.assertEqual(server_identifier_limit(self._Conn('postgresql', result=63), 200), 63)
+        self.assertEqual(server_identifier_limit(self._Conn('postgresql', result=63), 40), 40)
+
+    def test_a_postgres_failure_raises_rather_than_falling_back(self):
+        """The branch that had no coverage. A catch-all made the
+        authoritative check non-authoritative -- any error silently
+        restored the assumed value. And because the statement can run
+        inside an open transaction, a failure leaves the PostgreSQL
+        transaction aborted, so the next DDL fails with a secondary
+        transaction-aborted error obscuring the real cause.
+        """
+        original = RuntimeError('connection reset')
+        conn = self._Conn('postgresql', error=original)
+
+        with self.assertRaises(DbPublishError) as caught:
+            server_identifier_limit(conn, 63)
+
+        self.assertIs(caught.exception.__cause__, original)
+        self.assertIn('max_identifier_length', str(caught.exception))
 
 
 
