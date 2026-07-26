@@ -1,8 +1,12 @@
 # task_core
 
 A scaffold for scheduled reporting tasks that read Excel workbooks (locally
-or over SMB/DFS) and PostgreSQL, transform them with petl or pandas, and
-publish the results to Excel files and PostgreSQL tables.
+or over SMB/DFS) and PostgreSQL, and transform them with petl or pandas.
+
+Outputs are independent: a task can write Excel files, publish PostgreSQL
+tables, do both, or neither. A task with no declared outputs still runs its
+pipelines and returns their results, which is a reasonable way to use it
+for computation that another process consumes.
 
 It exists to remove the parts every such task repeats: opening remote
 workbooks and closing their handles reliably, deciding whether the sources
@@ -43,8 +47,7 @@ It creates a sample workbook in a temporary directory, runs two pipelines
 over it — one reading the workbook, one aggregating the first's result —
 and prints the workbooks it wrote. Read
 [examples/local_task.py](examples/local_task.py) alongside the output; it
-is about eighty lines and every one of them is part of the shape a real
-task takes.
+is short, and every part of it is part of the shape a real task takes.
 
 `tasks/hr_petl_task.py` is the realistic counterpart: SMB paths, database
 output, source-change checking. It cannot run outside the production
@@ -84,6 +87,26 @@ A task is a normal Python module with a `main()`:
 python -m examples.local_task      # self-contained
 python -m tasks.hr_task            # needs share access and DB credentials
 ```
+
+`run_pipelines()` returns a `RunResult`, which is what a scheduler or
+wrapper should inspect rather than relying on the exit code:
+
+```python
+result = main()
+
+result.skipped            # True when sources were unchanged
+result.skip_reason
+result.pipeline_rows      # {pipeline_name: row_count}
+result.excel_outputs      # workbooks written
+result.db.committed       # whether the publication transaction committed
+result.db.published_tables
+result.db.row_counts
+result.source_changed
+```
+
+A failed run raises rather than returning; a skipped run returns normally
+with `skipped=True`. Full field list is in
+[task-authoring.md](docs/task-authoring.md#run_pipelines).
 
 The test suite uses `unittest` and needs no runner or plugins:
 

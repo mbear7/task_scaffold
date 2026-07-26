@@ -104,6 +104,14 @@ class SourceStateStore:
     # at the first upsert_state(), mid-run, after every pipeline has
     # already executed. A startup error naming the difference is a much
     # cheaper failure.
+    #
+    # SCOPE, deliberately: required column NAMES only. Not types, not
+    # nullability, not the primary key, not column order. Names catch the
+    # failure that actually happens -- a table written by a different
+    # version of this schema -- and checking more would mean maintaining a
+    # PostgreSQL type-name mapping that drifts silently when it is not
+    # kept correct. Widening this scope should be a deliberate decision,
+    # not an accident.
     _EXPECTED_COLUMNS = frozenset({
         'task_name', 'source_key', 'source_kind', 'root_path', 'include_mask',
         'recursive', 'file_count', 'total_size_bytes', 'max_modified_at_utc',
@@ -111,6 +119,17 @@ class SourceStateStore:
     })
 
     def _verify_columns(self):
+        # Branch on the dialect, do not catch everything. The original
+        # catch-all was there for backends that do not expose
+        # information_schema the way PostgreSQL does, but it also
+        # swallowed permission failures, connection failures, and any
+        # future incompatibility in the query itself -- and in every one
+        # of those cases the fail-early guarantee silently disappeared
+        # while the run went on to fail later at the upsert anyway. Same
+        # reasoning, and the same shape, as server_identifier_limit().
+        if self.conn.dialect.name != 'postgresql':
+            return
+
         try:
             result = self.conn.execute(
                 sa.text(
@@ -120,14 +139,15 @@ class SourceStateStore:
                 {'schema': self.schema, 'table': self.table},
             )
             actual = {row[0] for row in result}
-        except Exception:
-            # Not every backend exposes information_schema the same way,
-            # and this check must never be the reason a run fails. A
-            # genuinely incompatible table still fails loudly at the first
-            # upsert -- this only moves that failure earlier when it can.
-            return
+        except Exception as exc:
+            raise SourceCheckError(
+                f'could not inspect the columns of source-state table '
+                f'{self._full_name}; refusing to continue without knowing '
+                f'whether it is compatible'
+            ) from exc
 
         if not actual:
+            # The table does not exist yet -- this run is creating it.
             return
 
         missing = self._EXPECTED_COLUMNS - actual
@@ -151,6 +171,28 @@ class SourceStateStore:
         return {row['source_key']: row['source_signature'] for row in result.mappings()}
 
     def sources_unchanged(self, task_name, fingerprints):
+        """Compare stored fingerprints against current ones, then END THE
+        READ PHASE by committing.
+
+        Without that commit the transaction SQLAlchemy autobegins on the
+        first source-state statement stays open through every pipeline --
+        confirmed directly, conn.in_transaction() was still True inside a
+        running pipeline. A source-check-only task held it for the whole
+        run; a task whose first DB output came late held it until then; an
+        hours-long first pipeline produced an hours-long transaction. That
+        is precisely the unbounded duration the staged model exists to
+        remove, surviving in the one path nobody was looking at.
+
+        Committed rather than rolled back, because ensure_table()'s DDL is
+        in this transaction and the table should exist afterwards. Nothing
+        else in the phase writes, so there is no state being published
+        early.
+
+        The store owns this because the store owns the phase -- putting it
+        in the runner would mean the runner managing a transaction it does
+        not otherwise touch, and adding a publisher method for it would
+        expand a protocol that has been expanded by accident twice.
+        """
         stored = self.read_state(task_name)
         current_keys = {fp.source_key for fp in fingerprints}
 
@@ -158,9 +200,35 @@ class SourceStateStore:
         # tracked source is itself a change, even if every remaining
         # signature still matches.
         if current_keys != set(stored):
+            self._end_read_phase()
             return False
 
-        return all(stored[fp.source_key] == fp.source_signature for fp in fingerprints)
+        unchanged = all(
+            stored[fp.source_key] == fp.source_signature for fp in fingerprints
+        )
+        self._end_read_phase()
+        return unchanged
+
+    def _end_read_phase(self):
+        """Close the read phase, and fail if it cannot be closed.
+
+        Swallowing the failure broke two guarantees at once: the phase was
+        not definitely closed before pipeline execution, and a database
+        failure was reported as a successful comparison -- confirmed
+        directly, sources_unchanged() returned True with the commit having
+        raised, so a run could report sources_unchanged and skip on the
+        strength of a failed database call.
+        """
+        try:
+            if self.conn.in_transaction():
+                self.conn.commit()
+        except Exception as exc:
+            raise SourceCheckError(
+                'could not close the source-state read transaction; refusing to '
+                'continue, because leaving it open would hold a transaction for '
+                'the whole run and reporting a comparison made across a failed '
+                'connection would be worse'
+            ) from exc
 
     def upsert_state(self, task_name, fingerprints, *, store_snapshot=True):
         current_keys = [fp.source_key for fp in fingerprints]

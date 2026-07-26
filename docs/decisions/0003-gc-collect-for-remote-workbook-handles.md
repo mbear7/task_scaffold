@@ -46,3 +46,8 @@ failing to be replaced on the share.
   assert only that `wb` is gone as a local.
 - `gc.collect()` is not free. It is called once per workbook open, not per
   sheet or per read.
+- A test run emits occasional `ResourceWarning: unclosed file` originating
+  at this `gc.collect()` call. That is the mechanism working, not a leak:
+  the cycle collector is releasing a handle that reference counting did
+  not, which is the entire reason the call exists. Suppressing the warning
+  would hide the only visible evidence of it.

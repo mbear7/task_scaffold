@@ -1,10 +1,33 @@
 # --- task_core ---
-pandas
+#
+# Lower bounds only, and only where a lower version DEMONSTRABLY breaks --
+# not the versions this happened to be verified on. An invented floor is
+# worse than none: it excludes environments that would have worked.
+#
+# Read the note at the bottom before assuming these bounds protect you
+# from an upgrade. They do not.
+
+# Connection.commit(), Connection.in_transaction() and the autobegin
+# semantics the publisher depends on are 2.0 API. SQLAlchemy 1.4 has no
+# Connection.commit() at all, so this floor is a hard requirement rather
+# than a preference. 10 call sites.
+sqlalchemy>=2.0
+
+# pd.NA and the nullable-dtype machinery that is_missing()/normalize
+# depend on. Present since 1.0; 2.0 is the floor where the behaviour these
+# rely on is stable.
+pandas>=2.0
+
+# Workbook.tables (Excel Table objects, not just named ranges) is used by
+# excel_resource.get_table(). Added in openpyxl 2.6; 3.1 is the floor for
+# the read_only + data_only combination used here.
+openpyxl>=3.1
+
+# etl.wrap(), etl.cache(), etl.fromdb() with a callable connection factory.
+petl>=1.7
+
 numpy
-openpyxl
-sqlalchemy
 psycopg2
-petl
 lxml
 smbclient
 
@@ -14,3 +37,19 @@ smbclient
 # module that every file in tasks/ imports, which is maintained outside
 # this project and not shipped with it.
 babel
+
+# --- on what these bounds do NOT do ---
+#
+# Lower bounds record what is required. They do nothing about the hazard
+# that actually threatens this codebase, which is an UPGRADE: pandas 3
+# changed object-column defaults to StringDtype, which converts None to
+# nan, and this project is sensitive to missing-value semantics
+# throughout. A future major could do something similar again and these
+# bounds would not notice.
+#
+# Bounding that needs upper bounds or a lockfile, deliberately not adopted
+# here. If a run starts producing nan where it used to produce NULL, check
+# the pandas version first.
+#
+# Verified against: python 3.12.3 and 3.13.5, pandas 3.0.2, petl 1.7.17,
+# openpyxl 3.1.5, sqlalchemy 2.0.43, numpy 2.4.4.

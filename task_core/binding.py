@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Level 2: resource binding. Depends on source_tracking.py
-(TrackedResourceSource) and types.py. Promoted from a sandboxed prototype
+Level 2: resource binding. Depends on context.py (task_context),
+source_tracking.py (TrackedResourceSource) and types.py.
+
+The context.py import was previously deferred inside
+build_resource_context() with no comment explaining why. Confirmed
+directly that hoisting it creates no cycle -- context.py imports cleanup,
+types and source_tracking, none of which reach back here -- and the
+function runs once per run, so there was no import-cost argument either.
+An unexplained deferred import invites the wrong guess about what it
+protects. Promoted from a sandboxed prototype
 after it was proven against every real resource shape in hr_task.py and
 ops_task.py: latest_xlsx (single file), xlsx_file_set (multi-file), and
 generic resource() (DB-shaped).
@@ -51,6 +59,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Callable, Mapping
 
+from task_core.context import task_context
 from task_core.source_tracking import TrackedResourceSource
 from task_core.types import PipelineContractError, find_duplicates
 
@@ -293,8 +302,6 @@ def build_resource_context(task_name, resources, pipelines, run_sequence, env):
     cached construction task_context.get_resource() already provides, so
     a resource fingerprinted during source-state evaluation is the same
     object later injected into its pipeline, not reconstructed."""
-    from task_core.context import task_context
-
     loaders, tracked_sources, key_by_spec_id = compute_resource_wiring(
         resources, pipelines, run_sequence, env,
     )

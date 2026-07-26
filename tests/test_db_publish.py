@@ -31,6 +31,7 @@ tell a correct commit() from a broken one, the same way the original
 FakeDbPublisher couldn't.
 """
 
+import sys
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
@@ -50,6 +51,7 @@ from task_core.db_publish import (
     staging_target_token,
     validate_identifier,
     validate_portable_identifier,
+    IdentifierPolicy,
     server_identifier_limit,
     DbPayload,
     from_pandas,
@@ -84,8 +86,22 @@ class FakeSqlaTransaction:
         self._closed = True
 
 
+class _FakeSqlaDialect:
+    # Real SQLAlchemy connections carry one, and the staged model asks for
+    # it to decide whether to issue PostgreSQL-only statements (advisory
+    # locks, comments, catalog reads). Non-postgres takes the fallbacks.
+    name = 'sqlite'
+
+
 class FakeSqlaConnection:
     """Models sqlalchemy.engine.Connection's real autobegin semantics."""
+
+    dialect = _FakeSqlaDialect()
+    # A real Connection carries this, and the publisher checks it before
+    # every reuse: SQLAlchemy transparently reconnects an invalidated
+    # Connection, which would continue on a session holding none of this
+    # run's advisory locks.
+    invalidated = False
 
     def __init__(self, engine):
         self._engine = engine
@@ -139,7 +155,12 @@ class FakeSqlaConnection:
         self._do_rollback()
 
     def _do_commit(self):
-        self._engine.committed_rows = dict(self._pending)
+        # MERGE, not replace. The original assigned committed_rows outright,
+        # so a second commit with nothing pending erased everything the
+        # first had committed -- which no real database does. Harmless
+        # while a run had exactly one commit; wrong the moment the staged
+        # model gave a run several.
+        self._engine.committed_rows.update(self._pending)
         self._pending = {}
         self._in_transaction = False
 
@@ -725,86 +746,6 @@ class Test8SampledTypeInferenceIsVerifiedAgainstUnsampledRows(unittest.TestCase)
 
 
 
-class Test9DiscardPendingReadEnablesTheFirstExplicitTransaction(unittest.TestCase):
-    """run_pipelines() calls publisher.discard_pending_read() between the
-    source-state read and the pipeline loop. Nothing tested it. Confirmed
-    directly by deleting that call from runner.py: all 217 tests still
-    passed, because FakeSqlaConnection.begin() used to accept a second
-    begin() on an already-transacted connection where real SQLAlchemy
-    rejects it.
-
-    The real behavior, confirmed against genuine SQLAlchemy 2.0.43 driving
-    a real SQLite engine (not reasoned about from documentation):
-
-        conn.execute(...)        -> autobegin, in_transaction() is True
-        conn.begin()             -> InvalidRequestError
-
-    That matters because SourceStateStore's reads and DDL go through
-    publisher.ensure_connection(), never through _ensure_transaction(), so
-    a source-check-enabled run reaches the pipeline loop with an implicit
-    transaction already open on the connection. The first publish() then
-    calls _ensure_transaction() -> conn.begin() and, without the discard,
-    raises -- on every such run, in production, immediately.
-
-    These tests drive the real DbPublisher against the corrected fake, so
-    the mechanism is covered here regardless of whether the sandbox has a
-    real SQLAlchemy available.
-    """
-
-    def _publisher_on_open_connection(self):
-        """A DbPublisher whose connection has an autobegun transaction --
-        exactly the state a source-state read leaves behind."""
-        publisher = DbPublisher(creds=_CREDS, schema='bsr')
-        publisher._engine = FakeSqlaEngine()
-        conn = publisher.ensure_connection()
-        conn.execute('select 1 from task_scaffold_meta', {'task_name': 't'})
-        return publisher, conn
-
-    def test_a_source_state_read_leaves_an_implicit_transaction_open(self):
-        # The precondition the discard exists for. If this ever stops being
-        # true, the rest of this class is testing nothing.
-        publisher, conn = self._publisher_on_open_connection()
-        self.assertIsNone(publisher._tx)
-        self.assertTrue(conn.in_transaction())
-
-    def test_begin_without_discarding_the_pending_read_is_rejected(self):
-        publisher, _ = self._publisher_on_open_connection()
-        with self.assertRaises(sa_exc.InvalidRequestError):
-            publisher._ensure_transaction()
-
-    def test_discard_pending_read_lets_the_first_publish_open_its_transaction(self):
-        publisher, conn = self._publisher_on_open_connection()
-        publisher.discard_pending_read()
-        self.assertFalse(conn.in_transaction())
-        publisher._ensure_transaction()
-        self.assertIsNotNone(publisher._tx)
-        self.assertTrue(conn.in_transaction())
-
-    def test_discard_pending_read_does_not_touch_an_explicit_transaction(self):
-        # Once _tx exists, the pipeline loop owns the transaction and the
-        # discard must be a no-op -- rolling back here would silently throw
-        # away an already-published table mid-run.
-        publisher = DbPublisher(creds=_CREDS, schema='bsr')
-        publisher._engine = FakeSqlaEngine()
-        publisher._ensure_transaction()
-        tx_before = publisher._tx
-        conn = publisher._conn
-
-        publisher.discard_pending_read()
-
-        self.assertIs(publisher._tx, tx_before)
-        self.assertTrue(conn.in_transaction())
-
-    def test_discard_pending_read_is_safe_before_any_connection_exists(self):
-        # run_pipelines() can reach the discard with a publisher that has
-        # never connected (create_if_missing=False, nothing executed yet).
-        publisher = DbPublisher(creds=_CREDS, schema='bsr')
-        self.assertIsNone(publisher._conn)
-        publisher.discard_pending_read()   # must not raise, must not connect
-        self.assertIsNone(publisher._conn)
-
-
-
 class Test10ZeroDimensionalArraysAreScalarsNotContainers(unittest.TestCase):
     """The scalar guard added for one-element containers
     (Test7 above) drew its line at pd.api.types.is_scalar(), which says
@@ -912,7 +853,7 @@ class Test11IdentifierValidationPreflightAndRuntime(unittest.TestCase):
         # max_identifier_length, so _effective_identifier_limit() takes its
         # documented fallback to the configured value.
         import sqlalchemy as sa
-        publisher = DbPublisher(creds=_CREDS, schema=None, **kwargs)
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='t', **kwargs)
         publisher._engine = sa.create_engine('sqlite://')
         self.addCleanup(publisher.close)
         return publisher
@@ -1048,7 +989,7 @@ class Test11IdentifierValidationPreflightAndRuntime(unittest.TestCase):
         publisher.publish(payload)
 
     def test_an_injected_limit_tightens_validation(self):
-        publisher = self._publisher(max_identifier_bytes=20)
+        publisher = self._publisher(identifier_policy=IdentifierPolicy(max_identifier_bytes=20))
         with self.assertRaises(DbPublishError):
             publisher.publish(self._payload(table_name='a_fairly_long_table_name'))
 
@@ -1089,7 +1030,7 @@ class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
 
     def _publisher(self, **kwargs):
         import sqlalchemy as sa
-        publisher = DbPublisher(creds=_CREDS, schema=None, **kwargs)
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='t', **kwargs)
         publisher._engine = sa.create_engine('sqlite://')
         self.addCleanup(publisher.close)
         return publisher
@@ -1100,7 +1041,6 @@ class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
         conn.execute(sa.text(ddl))
         conn.execute(sa.text(insert))
         publisher.commit()
-        publisher.discard_pending_read()
         return conn
 
     def _payload(self, table_name, tbl):
@@ -1181,7 +1121,6 @@ class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
         conn.execute(sa.text('create table b (v int)'))
         conn.execute(sa.text('insert into b values (2)'))
         publisher.commit()
-        publisher.discard_pending_read()
 
         publisher.publish(self._payload('a', etl.wrap([['v'], [10]])))
         publisher.publish(self._payload('b', etl.wrap([['v'], [20]])))
@@ -1295,7 +1234,7 @@ class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
         # SQLite has no max_identifier_length. The dialect branch means
         # this is not an error, while a real PostgreSQL failure is no
         # longer swallowed.
-        publisher = self._publisher(max_identifier_bytes=40)
+        publisher = self._publisher(identifier_policy=IdentifierPolicy(max_identifier_bytes=40))
         self.assertEqual(publisher._effective_identifier_limit(), 40)
 
 
@@ -1307,7 +1246,7 @@ class Test13IdentifierValidationGapsFromReview(unittest.TestCase):
 
     def _publisher(self, **kwargs):
         import sqlalchemy as sa
-        publisher = DbPublisher(creds=_CREDS, schema=None, **kwargs)
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='t', **kwargs)
         publisher._engine = sa.create_engine('sqlite://')
         self.addCleanup(publisher.close)
         return publisher
@@ -1449,6 +1388,1163 @@ class Test14ServerIdentifierLimitResolution(unittest.TestCase):
 
         self.assertIs(caught.exception.__cause__, original)
         self.assertIn('max_identifier_length', str(caught.exception))
+
+
+
+class Test15StagedPublicationModel(unittest.TestCase):
+    """Preparation transactions commit per target; one short publication
+    transaction swaps everything.
+
+    The single run-long transaction it replaces was atomic but unbounded:
+    it stayed open across remote file reads, transformations and Excel
+    exports, holding catalog locks, delaying vacuum, accumulating WAL and
+    making a late rollback expensive. Committing each preparation bounds
+    all of that to one table's load.
+
+    What it costs is that rollback is no longer the cleanup mechanism --
+    see rollback() and Test16.
+    """
+
+    def _publisher(self, **kwargs):
+        import sqlalchemy as sa
+        kwargs.setdefault('task_name', 'demo_task')
+        publisher = DbPublisher(creds=_CREDS, schema=None, **kwargs)
+        publisher._engine = sa.create_engine('sqlite://')
+        self.addCleanup(publisher.close)
+        return publisher
+
+    def _seed(self, publisher, ddl, insert=None):
+        import sqlalchemy as sa
+        conn = publisher.ensure_connection()
+        conn.execute(sa.text(ddl))
+        if insert:
+            conn.execute(sa.text(insert))
+        publisher._commit_transaction()
+        return conn
+
+    def _payload(self, table_name, tbl):
+        from task_core.db_publish import from_petl
+        return from_petl(tbl, table_name=table_name, schema=None)
+
+    def _staging_tables(self, conn):
+        import sqlalchemy as sa
+        return conn.execute(sa.text(
+            "select name from sqlite_master where type='table' and name like '%__stg_%'"
+        )).scalars().all()
+
+    def test_preparation_commits_and_leaves_the_live_table_untouched(self):
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table t (v int)', 'insert into t values (1)')
+
+        publisher.publish(self._payload('t', etl.wrap([['v'], [99]])))
+
+        # Checked FIRST: any query below autobegins a transaction of its
+        # own, so asking afterwards would measure the test, not publish().
+        self.assertFalse(conn.in_transaction(), 'preparation left a transaction open')
+
+        # The distinguishing property of the staged model: the staging
+        # table is COMMITTED while the live table is untouched.
+        self.assertEqual(len(self._staging_tables(conn)), 1)
+        self.assertEqual(conn.execute(sa.text('select v from t')).scalars().all(), [1])
+
+    def test_the_publication_phase_swaps_and_removes_staging(self):
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table t (v int)', 'insert into t values (1)')
+
+        publisher.publish(self._payload('t', etl.wrap([['v'], [99]])))
+        publisher.commit()
+
+        self.assertEqual(conn.execute(sa.text('select v from t')).scalars().all(), [99])
+        self.assertEqual(self._staging_tables(conn), [])
+
+    def test_schema_evolution_still_works(self):
+        # The property that made replacement worth keeping over TRUNCATE,
+        # and which the staged model must not quietly cost.
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table t (v bigint)', 'insert into t values (1)')
+
+        publisher.publish(self._payload('t', etl.wrap([['v', 'extra'], [1.5, 'a']])))
+        publisher.commit()
+
+        columns = conn.execute(sa.text('select name from pragma_table_info("t")')).scalars().all()
+        self.assertEqual(columns, ['v', 'extra'])
+
+    def test_several_targets_prepare_independently_and_swap_together(self):
+        import petl as etl
+        import sqlalchemy as sa
+        publisher = self._publisher()
+        conn = self._seed(publisher, 'create table a (v int)', 'insert into a values (1)')
+        conn.execute(sa.text('create table b (v int)'))
+        conn.execute(sa.text('insert into b values (2)'))
+        publisher._commit_transaction()
+
+        publisher.publish(self._payload('a', etl.wrap([['v'], [10]])))
+        # After the FIRST preparation commits, the second live table is
+        # still its old self -- the swap has not happened for either.
+        self.assertEqual(conn.execute(sa.text('select v from a')).scalar(), 1)
+        publisher.publish(self._payload('b', etl.wrap([['v'], [20]])))
+
+        publisher.commit()
+        self.assertEqual(conn.execute(sa.text('select v from a')).scalar(), 10)
+        self.assertEqual(conn.execute(sa.text('select v from b')).scalar(), 20)
+
+    def test_the_publication_plan_runs_inside_the_publication_transaction(self):
+        """The source-state write is queued rather than executed by the
+        runner, so it lands in the same transaction as the swaps. A failed
+        publication must not advance the stored fingerprints.
+        """
+        import petl as etl
+        from task_core.db_publish import PublicationPlan
+
+        plan = PublicationPlan()
+        performed = []
+        plan.add('source state', lambda: performed.append('source-state'))
+
+        publisher = self._publisher(publication_plan=plan)
+        self._seed(publisher, 'create table t (v int)')
+        publisher.publish(self._payload('t', etl.wrap([['v'], [5]])))
+
+        self.assertEqual(performed, [], 'queued work ran before the publication phase')
+        publisher.commit()
+        self.assertEqual(performed, ['source-state'])
+        self.assertEqual(len(plan), 0, 'the plan was not cleared after running')
+
+    def test_a_run_with_no_prepared_targets_still_runs_the_plan(self):
+        # The source-check-only shape: no db_table anywhere, but the
+        # fingerprints still have to be written and committed.
+        from task_core.db_publish import PublicationPlan
+
+        plan = PublicationPlan()
+        performed = []
+        plan.add('source state', lambda: performed.append('source-state'))
+
+        publisher = self._publisher(publication_plan=plan)
+        self._seed(publisher, 'create table t (v int)')
+        publisher.commit()
+
+        self.assertEqual(performed, ['source-state'])
+        self.assertTrue(publisher.committed)
+
+
+class Test16RollbackIsCleanupNotRollback(unittest.TestCase):
+    """rollback()'s meaning changed with the staged model.
+
+    Preparation transactions are already committed, so it cannot undo them
+    transactionally -- it must DROP this run's staging tables. That makes
+    it capable of failing for new reasons, notably a lost connection, so it
+    never raises: the exception that caused the abort matters more than a
+    cleanup failure, and losing it would be the worse outcome.
+    """
+
+    def _publisher(self, **kwargs):
+        import sqlalchemy as sa
+        kwargs.setdefault('task_name', 'demo_task')
+        publisher = DbPublisher(creds=_CREDS, schema=None, **kwargs)
+        publisher._engine = sa.create_engine('sqlite://')
+        self.addCleanup(publisher.close)
+        return publisher
+
+    def _prepared(self):
+        import petl as etl
+        import sqlalchemy as sa
+        from task_core.db_publish import from_petl
+
+        publisher = self._publisher()
+        conn = publisher.ensure_connection()
+        conn.execute(sa.text('create table t (v int)'))
+        conn.execute(sa.text('insert into t values (1)'))
+        publisher._commit_transaction()
+        publisher.publish(from_petl(etl.wrap([['v'], [99]]), table_name='t', schema=None))
+        return publisher, conn
+
+    def _staging_count(self, conn):
+        import sqlalchemy as sa
+        return conn.execute(sa.text(
+            "select count(*) from sqlite_master where type='table' and name like '%__stg_%'"
+        )).scalar()
+
+    def test_rollback_drops_committed_staging_tables(self):
+        import sqlalchemy as sa
+        publisher, conn = self._prepared()
+        self.assertEqual(self._staging_count(conn), 1)
+
+        publisher.rollback()
+
+        self.assertEqual(self._staging_count(conn), 0)
+        self.assertEqual(conn.execute(sa.text('select v from t')).scalars().all(), [1])
+
+    def test_rollback_never_raises_even_when_dropping_fails(self):
+        publisher, conn = self._prepared()
+
+        class _Exploding:
+            dialect = conn.dialect
+            invalidated = False
+
+            def execute(self, *args, **kwargs):
+                raise RuntimeError('connection reset mid-cleanup')
+
+            def commit(self):
+                raise RuntimeError('connection reset mid-cleanup')
+
+            def in_transaction(self):
+                return False
+
+            def close(self):
+                pass
+
+        publisher._conn = _Exploding()
+        publisher.rollback()   # must not raise
+
+    def test_rollback_with_a_lost_connection_does_nothing_and_does_not_raise(self):
+        publisher, _conn = self._prepared()
+        publisher.mark_connection_lost()
+        publisher.rollback()
+
+    def test_rollback_clears_the_publication_plan(self):
+        from task_core.db_publish import PublicationPlan
+        plan = PublicationPlan()
+        plan.add('source state', lambda: None)
+        publisher = self._publisher(publication_plan=plan)
+        publisher.rollback()
+        self.assertEqual(len(plan), 0, 'a queued source-state write survived the abort')
+
+
+
+class Test17PreparationValidationAndOwnership(unittest.TestCase):
+    """The PostgreSQL-only half of preparation: exact ordered column
+    verification, row-count verification, and the ownership comment that
+    makes cleanup possible without a registry table.
+
+    Driven through a connection fake reporting a postgresql dialect,
+    because these paths deliberately no-op elsewhere and SQLite therefore
+    exercises none of them -- confirmed by deleting the whole block and
+    watching the suite stay green.
+    """
+
+    class _Conn:
+        """A REAL SQLAlchemy SQLite connection that reports itself as
+        postgresql, with the four PostgreSQL-only statements intercepted.
+
+        A wholly synthetic connection cannot bind real DDL --
+        sa.Table.drop() reaches for _run_ddl_visitor -- so the parts under
+        test would end up exercising the fake rather than the code. This
+        way CREATE/INSERT/DROP/RENAME are genuinely executed and only the
+        catalog interactions are stood in for.
+        """
+
+        def __init__(self, columns=None):
+            import sqlalchemy as sa
+            self._engine = sa.create_engine('sqlite://')
+            self._real = self._engine.connect()
+            self.columns = columns
+            self.comments = {}
+            self.statements = []
+
+        invalidated = False
+
+        @property
+        def dialect(self):
+            return type('D', (), {'name': 'postgresql'})()
+
+        def execute(self, statement, params=None):
+            import sqlalchemy as sa
+            text = str(statement)
+            self.statements.append(text)
+            lowered = text.lower()
+
+            if 'max_identifier_length' in lowered:
+                return _Scalar(63)
+            if 'pg_try_advisory_lock' in lowered:
+                return _Scalar(True)
+            if 'pg_class' in lowered and 'relname like' in lowered:
+                return _Rows([])            # predecessor scan: nothing left behind
+            if 'pg_class' in lowered and 'relname = ' in lowered:
+                target = (params or {}).get('table', '')
+                return _Scalar(self.comments.get(target))
+            if 'information_schema.columns' in lowered:
+                return [(name,) for name in (self.columns or [])]
+            if lowered.startswith('comment on table'):
+                # Split on the FIRST ' is ', and take the identifier from
+                # the left of it. Parsing from the right lands inside the
+                # JSON body, which is full of double quotes -- an earlier
+                # version of this fake did exactly that and silently
+                # recorded a timestamp as the table name.
+                head, body = text.split(' is ', 1)
+                name = head[len('comment on table '):].strip().strip('"')
+                self.comments[name] = body.strip()[1:-1].replace("''", "'")
+                return None
+            if 'obj_description' in lowered:
+                target = (params or {}).get('name', '')
+                return _Scalar(self.comments.get(target.split('.')[-1]))
+            if ' rename to ' in lowered:
+                # PostgreSQL keeps comments on the OID, so a rename CARRIES
+                # the comment to the new name. Modelled because that is
+                # precisely why the published-table comment has to be
+                # replaced: without it every published table would still
+                # wear its staging ownership metadata and look to cleanup
+                # like an abandoned artifact.
+                head, new_name = text.split(' rename to ', 1)
+                old_name = head[len('alter table '):].strip().strip('"')
+                new_name = new_name.strip().strip('"')
+                if old_name in self.comments:
+                    self.comments[new_name] = self.comments.pop(old_name)
+
+            # Everything else runs for real, against SQLite -- but with the
+            # schema stripped, since SQLite has none.
+            text = text.replace('"bsr".', '').replace('bsr.', '')
+            return self._real.execute(sa.text(text), params or {})
+
+        def _run_ddl_visitor(self, visitorcallable, element, **kwargs):
+            return self._real._run_ddl_visitor(visitorcallable, element, **kwargs)
+
+        def begin(self):
+            return _NoopTx(self)
+
+        def in_transaction(self):
+            return self._real.in_transaction()
+
+        def commit(self):
+            self._real.commit()
+
+        def rollback(self):
+            self._real.rollback()
+
+        def close(self):
+            self._real.close()
+
+    def _publisher(self, conn):
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
+        publisher._conn = conn
+        publisher._engine = object()
+        # publish() now enforces the unconditional-lock contract itself
+        # rather than trusting the caller, so the fixture must claim the
+        # task the way a real run does.
+        publisher.begin_run()
+        return publisher
+
+    def _payload(self, columns=('a', 'b')):
+        from task_core.db_publish import DbPayload
+        return DbPayload(
+            table_name='target', schema=None, columns=list(columns),
+            rows=[{name: 1 for name in columns}],
+        )
+
+    def test_a_prepared_table_carries_this_run_s_ownership_metadata(self):
+        from task_core.db_publish import parse_staging_comment
+        conn = self._Conn(columns=['a', 'b'])
+        publisher = self._publisher(conn)
+
+        publisher.publish(self._payload())
+
+        self.assertEqual(len(conn.comments), 1, 'no ownership comment was attached')
+        owner = parse_staging_comment(next(iter(conn.comments.values())))
+        self.assertIsNotNone(owner, 'the comment is not parseable as ownership metadata')
+        self.assertEqual(owner['task'], 'demo_task')
+        self.assertEqual(owner['target_table'], 'target')
+        self.assertIsNone(owner['target_schema'])
+        self.assertIn('created_at', owner)
+
+    def test_column_names_out_of_order_are_rejected(self):
+        # Exact ORDERED equality. Ordinal position is trustworthy here
+        # precisely because the staging table was just created.
+        conn = self._Conn(columns=['b', 'a'])
+        publisher = self._publisher(conn)
+        with self.assertRaises(DbPublishInvariantError):
+            publisher.publish(self._payload(('a', 'b')))
+
+    def test_a_missing_column_is_rejected(self):
+        conn = self._Conn(columns=['a'])
+        publisher = self._publisher(conn)
+        with self.assertRaises(DbPublishInvariantError):
+            publisher.publish(self._payload(('a', 'b')))
+
+    def test_a_short_load_is_rejected(self):
+        """Row count is authoritative because the payload is fully
+        materialized: len(payload.rows) is the exact set of dicts handed to
+        the driver. Counted in the chunking loop, not taken from the
+        driver, because SQLAlchemy reports supports_sane_multi_rowcount as
+        False for psycopg2 -- so a driver count would measure the rewritten
+        statement rather than the logical rows. This guards our chunking.
+        """
+        conn = self._Conn(columns=['a'])
+        publisher = self._publisher(conn)
+        publisher.chunk_size = 1
+
+        from task_core.db_publish import DbPayload
+        payload = DbPayload(table_name='target', schema=None, columns=['a'],
+                            rows=[{'a': 1}, {'a': 2}, {'a': 3}])
+
+        real_chunked = sys.modules['task_core.db_publish']._chunked
+        try:
+            sys.modules['task_core.db_publish']._chunked = (
+                lambda rows, size: real_chunked(rows[:-1], size)   # silently drops one
+            )
+            with self.assertRaises(DbPublishInvariantError) as caught:
+                publisher.publish(payload)
+            self.assertIn('loaded 2 rows', str(caught.exception))
+        finally:
+            sys.modules['task_core.db_publish']._chunked = real_chunked
+
+    def test_publication_refuses_a_staging_table_that_lost_its_metadata(self):
+        conn = self._Conn(columns=['a'])
+        publisher = self._publisher(conn)
+        publisher.publish(self._payload(('a',)))
+
+        conn.comments.clear()   # someone dropped or replaced it
+        with self.assertRaises(DbPublishError):
+            publisher.commit()
+
+    def test_a_published_table_no_longer_carries_staging_ownership(self):
+        # ALTER TABLE ... RENAME preserves comments, so without replacement
+        # every published table would look to cleanup like an abandoned
+        # staging artifact.
+        from task_core.db_publish import parse_staging_comment
+        conn = self._Conn(columns=['a'])
+        publisher = self._publisher(conn)
+        publisher.publish(self._payload(('a',)))
+        publisher.commit()
+
+        self.assertIsNone(
+            parse_staging_comment(conn.comments.get('target')),
+            'the published table still carries staging ownership metadata',
+        )
+
+
+class Test18ConnectionLossIsFatal(unittest.TestCase):
+    """One of three interlocking rules that close the stale-publisher trap:
+    a session-scoped advisory lock, cleanup performed under it, and a
+    refusal to reconnect after the session is gone.
+
+    Reconnecting would silently continue without the lock, and the lock is
+    what guarantees no other run of this task is live -- which is what
+    makes predecessor cleanup safe. A reconnect looks harmless, which is
+    exactly why refusing has to be explicit.
+    """
+
+    def _publisher(self):
+        import sqlalchemy as sa
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
+        publisher._engine = sa.create_engine('sqlite://')
+        self.addCleanup(publisher.close)
+        return publisher
+
+    def test_ensure_connection_refuses_after_the_connection_is_lost(self):
+        publisher = self._publisher()
+        publisher.ensure_connection()
+        publisher.mark_connection_lost()
+
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.ensure_connection()
+        self.assertIn('advisory lock', str(caught.exception))
+
+    def test_a_lost_connection_drops_the_lock_flag(self):
+        publisher = self._publisher()
+        publisher.try_acquire_task_lock('demo_task')
+        self.assertTrue(publisher.lock_held)
+
+        publisher.mark_connection_lost()
+        self.assertFalse(publisher.lock_held, 'the run still believes it holds the lock')
+
+    def test_publish_after_a_lost_connection_raises_rather_than_reconnecting(self):
+        import petl as etl
+        from task_core.db_publish import from_petl
+        publisher = self._publisher()
+        publisher.ensure_connection()
+        publisher.mark_connection_lost()
+
+        with self.assertRaises(DbPublishError):
+            publisher.publish(from_petl(etl.wrap([['v'], [1]]), table_name='t', schema=None))
+
+
+class _Rows:
+    """Result stand-in where only .all() is reached."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+class _Scalar:
+    """Minimal stand-in for a SQLAlchemy Result where only .scalar() is
+    reached."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+class _NoopTx:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+
+
+class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
+    """Three rules interlock to close the stale-publisher trap, and
+    removing any one of them reopens it:
+
+      1. the task lock is SESSION-scoped, so it survives the staged
+         model's many committed transactions;
+      2. connection loss is FATAL, so a run whose session was reaped
+         cannot wake up and publish;
+      3. predecessor cleanup runs UNDER the lock, so anything this task
+         left behind belongs to a run that is definitively gone.
+
+    Traced: a stalled process with a live session still holds the lock, so
+    nothing newer can start. If the server reaps the session instead, the
+    lock releases and the connection dies with it -- and rule 2 stops that
+    process from executing anything on waking. A newer run then acquires
+    the lock and drops the predecessor's artifacts, so even a resumed run
+    finds them gone at its publication check.
+
+    That is why predecessor cleanup doubles as the generation guard and no
+    separate generation column is needed. A future maintainer would
+    reasonably 'simplify' any one of the three; this class is what should
+    stop them.
+    """
+
+    class _Conn:
+        """Postgres-dialect fake recording lock calls and catalog reads."""
+
+        def __init__(self, tables=None, lock_granted=True):
+            self.tables = tables or {}          # relname -> comment
+            self.lock_granted = lock_granted
+            self.lock_calls = []
+            self.dropped = []
+
+        invalidated = False
+
+        @property
+        def dialect(self):
+            return type('D', (), {'name': 'postgresql'})()
+
+        def execute(self, statement, params=None):
+            text = str(statement)
+            lowered = text.lower()
+
+            if 'max_identifier_length' in lowered:
+                return _Scalar(63)
+            if 'pg_try_advisory_lock' in lowered:
+                self.lock_calls.append(('acquire', params))
+                return _Scalar(self.lock_granted)
+            if 'pg_advisory_unlock' in lowered:
+                self.lock_calls.append(('release', params))
+                return _Scalar(True)
+            if 'pg_class' in lowered and 'obj_description' in lowered:
+                return _Rows([(name, comment) for name, comment in self.tables.items()])
+            if lowered.startswith('drop table'):
+                name = text.split('"')[-2]
+                self.dropped.append(name)
+                self.tables.pop(name, None)
+                return None
+            return None
+
+        def in_transaction(self):
+            return False
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    def _publisher(self, conn, task_name='demo_task'):
+        publisher = DbPublisher(creds=_CREDS, schema='bsr', task_name=task_name)
+        publisher._conn = conn
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        return publisher
+
+    def _owned_by(self, task, run='deadbeef', target='hr_staff'):
+        from task_core.db_publish import build_staging_comment
+        return build_staging_comment(
+            task_name=task, run_token=run, schema='bsr', table_name=target,
+        )
+
+    def _conforming_name(self, target='hr_staff', run='deadbeef'):
+        """A name with the exact staging shape the strict rule requires:
+        __stg_<8 hex>_<8 hex>, with the target token actually derived from
+        the logical target."""
+        from task_core.db_publish import staging_target_token
+        return f'{target}__stg_{staging_target_token("bsr", target)}_{run}'
+
+    def test_begin_run_acquires_the_lock_and_reports_success(self):
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+
+        self.assertTrue(publisher.begin_run())
+        self.assertTrue(publisher.lock_held)
+        self.assertEqual([kind for kind, _ in conn.lock_calls], ['acquire'])
+
+    def test_begin_run_reports_failure_without_cleaning_anything(self):
+        # A run that did not win the lock must not touch another run's
+        # artifacts -- that is the whole safety argument for cleanup.
+        conn = self._Conn(
+            tables={self._conforming_name(): self._owned_by('demo_task')},
+            lock_granted=False,
+        )
+        publisher = self._publisher(conn)
+
+        self.assertFalse(publisher.begin_run())
+        self.assertFalse(publisher.lock_held)
+        self.assertEqual(conn.dropped, [], 'cleanup ran without holding the lock')
+
+    def test_the_lock_key_is_namespaced_and_stable(self):
+        from task_core.db_publish import advisory_lock_key
+        first = advisory_lock_key('hr_task')
+        self.assertEqual(first, advisory_lock_key('hr_task'))
+        self.assertNotEqual(first, advisory_lock_key('ops_task'))
+        # Two-int form: advisory locks are database-wide and shared with
+        # anything else using them, so a bare hash could collide with an
+        # unrelated application and present as this task mysteriously
+        # refusing to run.
+        namespace, key = first
+        self.assertEqual(namespace, advisory_lock_key('ops_task')[0])
+        self.assertTrue(-2**31 <= key < 2**31, 'key does not fit PostgreSQL int4')
+
+    def test_cleanup_drops_only_this_task_s_positively_identified_artifacts(self):
+        mine = self._conforming_name()
+        conn = self._Conn(tables={
+            mine: self._owned_by('demo_task'),
+            self._conforming_name('other'): self._owned_by('a_different_task', target='other'),
+            self._conforming_name('mystery'): 'not json at all',
+            self._conforming_name('plain'): None,
+        })
+        publisher = self._publisher(conn)
+        publisher.begin_run()
+
+        self.assertEqual(conn.dropped, [mine])
+
+    def test_a_name_without_the_exact_staging_shape_is_never_dropped(self):
+        """The catalog scan uses a broad LIKE because SQL cannot express
+        the token shapes. Without a strict check here, any table whose name
+        merely CONTAINED the infix could be dropped on the strength of a
+        syntactically valid comment -- confirmed directly with
+        'not_really__stg_whatever'.
+        """
+        for relname in ('not_really__stg_whatever',
+                        'x__stg_short_deadbeef',
+                        'x__stg_DEADBEEF_deadbeef',
+                        'x__stg_deadbeef_deadbeef_extra'):
+            with self.subTest(relname=relname):
+                conn = self._Conn(tables={relname: self._owned_by('demo_task')})
+                self._publisher(conn).begin_run()
+                self.assertEqual(conn.dropped, [], f'{relname} was dropped')
+
+    def test_the_name_and_the_comment_must_agree(self):
+        # Each being well-formed on its own is not positive identification.
+        from task_core.db_publish import build_staging_comment
+        mine = self._conforming_name('hr_staff')
+
+        wrong_run = build_staging_comment(
+            task_name='demo_task', run_token='cafebabe', schema='bsr', table_name='hr_staff',
+        )
+        wrong_schema = build_staging_comment(
+            task_name='demo_task', run_token='deadbeef', schema='other', table_name='hr_staff',
+        )
+        wrong_target = build_staging_comment(
+            task_name='demo_task', run_token='deadbeef', schema='bsr', table_name='something_else',
+        )
+        for label, comment in (('run', wrong_run), ('schema', wrong_schema),
+                               ('target', wrong_target)):
+            with self.subTest(disagreement=label):
+                conn = self._Conn(tables={mine: comment})
+                self._publisher(conn).begin_run()
+                self.assertEqual(conn.dropped, [])
+
+    def test_an_unparseable_comment_is_never_dropped(self):
+        # Unknown ownership is not permission. This is the rule that keeps
+        # cleanup from becoming an outage.
+        for comment in ('not json', '{}', '{"marker":"something_else"}',
+                        '{"marker":"task_core","v":999}', ''):
+            with self.subTest(comment=comment):
+                conn = self._Conn(tables={self._conforming_name('x'): comment})
+                publisher = self._publisher(conn)
+                publisher.begin_run()
+                self.assertEqual(conn.dropped, [])
+
+    def test_cleanup_never_drops_this_run_s_own_artifacts(self):
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+        conn.tables[self._conforming_name('mine', run=publisher._run_token)] = (
+            self._owned_by('demo_task', run=publisher._run_token, target='mine')
+        )
+
+        publisher.begin_run()
+        self.assertEqual(conn.dropped, [])
+
+    def test_close_releases_the_lock_explicitly(self):
+        # Not left to session end. make_engine() uses NullPool so the two
+        # are equivalent today, but the dedicated-connection contract rests
+        # on NullPool and an explicit unlock keeps it honest.
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+        publisher.begin_run()
+
+        publisher.close()
+
+        self.assertIn('release', [kind for kind, _ in conn.lock_calls])
+        self.assertFalse(publisher.lock_held)
+
+    def test_a_lost_connection_does_not_attempt_an_unlock(self):
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+        publisher.begin_run()
+        publisher.mark_connection_lost()
+
+        publisher.release_task_lock('demo_task')
+        self.assertEqual([kind for kind, _ in conn.lock_calls], ['acquire'])
+
+
+
+class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
+    """Six findings against 0.3.1, each confirmed directly before fixing.
+    Two of them undermined the correctness argument of the staged model
+    itself rather than merely tightening it.
+    """
+
+    class _Conn:
+        """Postgres-dialect fake covering the catalog surface the publisher
+        touches, over a real SQLite connection so DDL executes."""
+
+        invalidated = False
+
+        def __init__(self, existing_comments=None, catalog=None):
+            import sqlalchemy as sa
+            self._engine = sa.create_engine('sqlite://')
+            self._real = self._engine.connect()
+            self.comments = dict(existing_comments or {})
+            self.catalog = list(catalog or [])
+            self.columns = None
+            self.statements = []
+
+        @property
+        def dialect(self):
+            return type('D', (), {'name': 'postgresql'})()
+
+        def execute(self, statement, params=None):
+            import sqlalchemy as sa
+            text = str(statement)
+            self.statements.append(text)
+            lowered = text.lower()
+
+            if 'max_identifier_length' in lowered:
+                return _Scalar(63)
+            if 'pg_try_advisory_lock' in lowered or 'pg_advisory_unlock' in lowered:
+                return _Scalar(True)
+            if 'relname like' in lowered:
+                return _Rows(self.catalog)
+            if 'relname = ' in lowered:
+                return _Scalar(self.comments.get((params or {}).get('table')))
+            if 'information_schema.columns' in lowered:
+                if self.columns is not None:
+                    return [(name,) for name in self.columns]
+                rows = self._real.execute(sa.text(
+                    'select name from pragma_table_info(:t) order by cid'
+                ), {'t': (params or {}).get('table')})
+                return [(row[0],) for row in rows]
+            if lowered.startswith('comment on table'):
+                head, body = text.split(' is ', 1)
+                name = head[len('comment on table '):].strip().strip('"')
+                self.comments[name] = body.strip()[1:-1].replace("''", "'")
+                return None
+            if ' rename to ' in lowered:
+                head, new_name = text.split(' rename to ', 1)
+                old = head[len('alter table '):].strip().strip('"')
+                new_name = new_name.strip().strip('"')
+                if old in self.comments:
+                    self.comments[new_name] = self.comments.pop(old)
+
+            return self._real.execute(sa.text(text), params or {})
+
+        def _run_ddl_visitor(self, visitorcallable, element, **kwargs):
+            return self._real._run_ddl_visitor(visitorcallable, element, **kwargs)
+
+        def begin(self):
+            return _NoopTx(self)
+
+        def in_transaction(self):
+            return self._real.in_transaction()
+
+        def commit(self):
+            self._real.commit()
+
+        def rollback(self):
+            self._real.rollback()
+
+        def close(self):
+            self._real.close()
+
+    def _publisher(self, conn, *, claim=True):
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
+        publisher._conn = conn
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        if claim:
+            publisher.begin_run()
+        return publisher
+
+    def _payload(self, table_name='target', schema=None):
+        from task_core.db_publish import DbPayload
+        return DbPayload(table_name=table_name, schema=schema,
+                         columns=['a'], rows=[{'a': 1}])
+
+    # --- 1: the source-state read phase must not span the run -----------
+
+    def test_the_source_state_read_transaction_is_closed_before_pipelines_run(self):
+        """The staged model's whole claim is that no transaction spans the
+        run. It did not hold with source tracking on: SQLAlchemy autobegins
+        on the first source-state statement and nothing committed it until
+        the first publish() -- confirmed directly, in_transaction() was
+        still True inside a running pipeline. A source-check-only task held
+        it for the entire run.
+        """
+        import sqlalchemy as sa
+        from task_core.source_state import SourceStateStore
+
+        engine = sa.create_engine('sqlite://')
+        conn = engine.connect()
+        self.addCleanup(conn.close)
+        conn.execute(sa.text(
+            'create table meta (task_name text, source_key text, source_signature text)'
+        ))
+        conn.commit()
+
+        store = SourceStateStore(conn, schema='main', table='meta')
+        store.sources_unchanged('t', [])
+
+        self.assertFalse(
+            conn.in_transaction(),
+            'the source-state read transaction is still open going into the pipeline loop',
+        )
+
+    # --- 2: a lost session must be terminal -----------------------------
+
+    def test_an_invalidated_connection_cannot_be_reused(self):
+        """mark_connection_lost() existed but production never called it,
+        so the terminal state was unreachable. SQLAlchemy transparently
+        reconnects an invalidated Connection on the next statement, which
+        continues on a session holding none of this run's advisory locks --
+        exactly the stale-publisher case decisions/0006 eliminates.
+        """
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+        conn.invalidated = True
+
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.ensure_connection()
+        self.assertIn('advisory lock', str(caught.exception))
+        self.assertFalse(publisher.lock_held, 'the run still believes it holds the lock')
+
+    def test_publish_refuses_without_the_task_lock_on_postgres(self):
+        # The runner always claims first, but publisher_factory is an
+        # extension seam and DbPublisher is usable directly.
+        conn = self._Conn()
+        publisher = self._publisher(conn, claim=False)
+
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.publish(self._payload())
+        self.assertIn('advisory lock', str(caught.exception))
+
+    # --- 3: quoted identifiers must survive verification ----------------
+
+    def test_a_non_portable_staging_name_is_found_at_verification(self):
+        """Verification used to_regclass() on an assembled string, which
+        parses its argument as an identifier expression and down-cases
+        anything unquoted. A mixed-case or Cyrillic staging name produced
+        under db_identifier_mode='quoted' therefore prepared correctly and
+        was then reported missing at commit().
+        """
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+
+        from task_core.db_publish import DbPayload
+        publisher.publish(DbPayload(
+            table_name='Sales', schema=None, columns=['a'], rows=[{'a': 1}],
+            identifier_mode='quoted',
+        ))
+        publisher.commit()   # must not raise
+
+        lookups = [s for s in conn.statements if 'obj_description' in s.lower()]
+        self.assertTrue(lookups)
+        self.assertFalse(
+            any('to_regclass' in s.lower() for s in lookups),
+            'verification still parses an assembled relation name',
+        )
+
+    # --- 4: unknown ownership is never authority ------------------------
+
+    def test_an_incomplete_ownership_comment_does_not_authorize_cleanup(self):
+        from task_core.db_publish import parse_staging_comment
+
+        incomplete = (
+            '{"marker":"task_core","v":1,"task":"demo_task","run":"deadbeef"}',
+            # Python considers True == 1 and 1.0 == 1, so a straight
+            # equality check on the version field accepted both --
+            # confirmed directly. A version that is not an integer is not a
+            # version this code wrote.
+            '{"marker":"task_core","v":true,"task":"d","run":"r",'
+            '"target_table":"t","target_schema":null,"created_at":"n"}',
+            '{"marker":"task_core","v":1.0,"task":"d","run":"r",'
+            '"target_table":"t","target_schema":null,"created_at":"n"}',
+            '{"marker":"task_core","v":1,"task":"demo_task","run":"x","target_table":"t"}',
+            '{"marker":"task_core","v":1,"task":"","run":"x","target_table":"t",'
+            '"target_schema":null,"created_at":"now"}',
+            '{"marker":"task_core","v":1,"task":"demo_task","run":123,'
+            '"target_table":"t","target_schema":null,"created_at":"now"}',
+        )
+        for comment in incomplete:
+            with self.subTest(comment=comment[:48]):
+                self.assertIsNone(parse_staging_comment(comment))
+
+        conn = self._Conn(
+            existing_comments={'x__stg_a_b': incomplete[0]},
+            catalog=[('x__stg_a_b', incomplete[0])],
+        )
+        publisher = self._publisher(conn)
+        self.assertNotIn('drop table', ' '.join(conn.statements).lower())
+
+    def test_a_complete_ownership_comment_is_still_accepted(self):
+        from task_core.db_publish import build_staging_comment, parse_staging_comment
+        comment = build_staging_comment(
+            task_name='demo_task', run_token='abc', schema=None, table_name='t',
+        )
+        parsed = parse_staging_comment(comment)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed['task'], 'demo_task')
+
+    def test_an_object_already_at_the_staging_name_is_never_erased(self):
+        """Preparation used drop(checkfirst=True), bypassing the cleanup
+        safety rule entirely -- an object at the generated name with no
+        comment, an invalid one, or another owner was erased anyway.
+        Reproduced: a table holding unrelated data was silently replaced.
+
+        After predecessor cleanup and a fresh run token, an existing exact
+        name is a collision, not something to tidy away.
+        """
+        import sqlalchemy as sa
+        from task_core.db_publish import staging_table_name
+
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+        name = staging_table_name(None, 'target', publisher._run_token)
+        conn.execute(sa.text(f'create table "{name}" (someone_elses_data text)'))
+        conn.execute(sa.text(f"insert into \"{name}\" values ('precious')"))
+        conn.commit()
+
+        with self.assertRaises(Exception):
+            publisher.publish(self._payload())
+
+        survived = conn._real.execute(sa.text(f'select * from "{name}"')).all()
+        self.assertEqual(survived, [('precious',)], 'unrelated data was destroyed')
+
+    # --- 5: staging stays in the publisher's schema ---------------------
+
+    def test_a_payload_for_another_schema_is_rejected(self):
+        # Cleanup scans exactly one schema. A payload prepared elsewhere
+        # would leave an orphan no later run ever scans.
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.publish(self._payload(schema='somewhere_else'))
+        self.assertIn('cleaned up', str(caught.exception))
+
+    # --- 6: the limit is verified before any DDL ------------------------
+
+    def test_the_server_limit_is_read_before_cleanup_ddl(self):
+        conn = self._Conn()
+        self._publisher(conn)
+
+        lowered = [s.lower() for s in conn.statements]
+        limit_at = next(i for i, s in enumerate(lowered) if 'max_identifier_length' in s)
+        lock_at = next(i for i, s in enumerate(lowered) if 'pg_try_advisory_lock' in s)
+        self.assertLess(limit_at, lock_at, 'the server limit was read after the task was claimed')
+
+
+
+class Test21CleanupNeverReconnectsAfterSessionLoss(unittest.TestCase):
+    """rollback() and release_task_lock() use self._conn directly, so they
+    bypassed ensure_connection()'s invalidation check.
+
+    Confirmed directly: rollback() executed DROP TABLE and COMMIT on a
+    connection marked invalidated while _connection_lost stayed False.
+    SQLAlchemy reconnects for those statements, running cleanup on a
+    session holding none of this run's advisory locks -- which is the
+    stale-publisher scenario decisions/0006 exists to eliminate, arriving
+    through the one path that must never reconnect.
+    """
+
+    class _Invalidated:
+        invalidated = True
+
+        def __init__(self):
+            self.statements = []
+            self.dialect = type('D', (), {'name': 'postgresql'})()
+
+        def execute(self, statement, params=None):
+            self.statements.append(str(statement))
+            return None
+
+        def commit(self):
+            self.statements.append('COMMIT')
+
+        def in_transaction(self):
+            return False
+
+        def close(self):
+            pass
+
+    def _prepared_publisher(self):
+        import petl as etl
+        import sqlalchemy as sa
+        from task_core.db_publish import from_petl
+
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
+        publisher._engine = sa.create_engine('sqlite://')
+        self.addCleanup(publisher.close)
+        conn = publisher.ensure_connection()
+        conn.execute(sa.text('create table t (v int)'))
+        publisher._commit_transaction()
+        publisher._lock_held = True
+        publisher.publish(from_petl(etl.wrap([['v'], [1]]), table_name='t', schema=None))
+        return publisher
+
+    def test_rollback_runs_no_sql_on_an_invalidated_connection(self):
+        publisher = self._prepared_publisher()
+        lost = self._Invalidated()
+        publisher._conn = lost
+
+        publisher.rollback()
+
+        self.assertEqual(lost.statements, [], 'cleanup ran on a lost session')
+        self.assertTrue(publisher._connection_lost)
+        self.assertFalse(publisher.lock_held)
+
+    def test_releasing_the_lock_is_skipped_on_an_invalidated_connection(self):
+        # PostgreSQL releases a session-scoped lock when the session dies;
+        # attempting an explicit unlock would only force a reconnect.
+        publisher = self._prepared_publisher()
+        lost = self._Invalidated()
+        publisher._conn = lost
+
+        publisher.release_task_lock('demo_task')
+
+        self.assertEqual(lost.statements, [])
+        self.assertFalse(publisher.lock_held)
+
+    def test_close_does_not_reconnect_to_unlock(self):
+        publisher = self._prepared_publisher()
+        lost = self._Invalidated()
+        publisher._conn = lost
+
+        publisher.close()
+
+        self.assertEqual(lost.statements, [])
+
+
+class Test22ReadPhaseFailuresAreNotSwallowed(unittest.TestCase):
+    """A failed read-phase commit reported a successful comparison.
+
+    Confirmed directly: sources_unchanged() returned True with the commit
+    having raised, so a run could report sources_unchanged and skip on the
+    strength of a database call that failed. It also meant the phase was
+    not definitely closed before pipeline execution -- the guarantee the
+    commit exists to provide.
+    """
+
+    class _Conn:
+        invalidated = False
+        dialect = type('D', (), {'name': 'sqlite'})()
+
+        def __init__(self, commit_error=None):
+            self._commit_error = commit_error
+
+        def execute(self, statement, params=None):
+            class _Result:
+                def mappings(self_inner):
+                    return []
+            return _Result()
+
+        def in_transaction(self):
+            return True
+
+        def commit(self):
+            if self._commit_error is not None:
+                raise self._commit_error
+
+        def close(self):
+            pass
+
+    def test_a_failed_read_phase_commit_raises(self):
+        from task_core.source_state import SourceStateStore
+        from task_core.types import SourceCheckError
+
+        original = RuntimeError('server closed the connection')
+        store = SourceStateStore(self._Conn(commit_error=original),
+                                 schema='main', table='meta')
+
+        with self.assertRaises(SourceCheckError) as caught:
+            store.sources_unchanged('t', [])
+        self.assertIs(caught.exception.__cause__, original)
+
+    def test_a_clean_read_phase_still_returns_the_comparison(self):
+        from task_core.source_state import SourceStateStore
+        store = SourceStateStore(self._Conn(), schema='main', table='meta')
+        self.assertTrue(store.sources_unchanged('t', []))
+
+
+class Test23ProtocolAndTransactionRefinements(unittest.TestCase):
+
+    def test_commit_requires_the_lock_for_a_plan_only_publication(self):
+        """The lock check was gated on _pending_swaps, so a publication
+        plan carrying only the source-state update could be committed by a
+        direct caller without ever claiming the task. Queued work writes to
+        the database exactly as a swap does.
+        """
+        from task_core.db_publish import PublicationPlan
+
+        plan = PublicationPlan()
+        plan.add('source state', lambda: None)
+
+        publisher = DbPublisher(creds=_CREDS, schema='bsr', task_name='demo_task',
+                                publication_plan=plan)
+        publisher._conn = Test20GapsFoundReviewingTheStagedModel._Conn()
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.commit()
+        self.assertIn('advisory lock', str(caught.exception))
+
+    def test_type_inference_happens_before_the_transaction_opens(self):
+        """_build_table() runs type inference, which scans the payload and
+        may be O(rows). That needs no transaction, and holding one across
+        it works against the point of bounding preparation to database
+        work.
+        """
+        import inspect
+        source = inspect.getsource(DbPublisher.publish)
+        self.assertLess(
+            source.index('_build_table('),
+            source.index('self._ensure_transaction()'),
+            'the preparation transaction opens before type inference runs',
+        )
 
 
 

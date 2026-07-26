@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.2.11. This describes the present system, not
+How `task_core` works as of 0.3.3. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -72,9 +72,14 @@ build_context()
 
   ── from here, everything is inside try/finally ──
 
+publisher.begin_run() (if the run touches PostgreSQL)
+    claim the task's advisory lock; drop staging artifacts left by a
+    dead previous run
+    → lock not acquired: return RunResult(skipped=True)
+
 source-change check (if enabled and output_db)
-    ensure the source-state table, read stored fingerprints,
-    compare against the current ones
+    collect fingerprints, ensure the source-state table, read stored
+    fingerprints, compare
     → unchanged and not force_run: return RunResult(skipped=True)
 
 for each pipeline in run_sequence:
@@ -85,10 +90,13 @@ for each pipeline in run_sequence:
     count rows
     publish_result → store in the context for later pipelines
     export Excel if enabled
-    build and publish the DB payload if enabled
+    prepare the DB payload if enabled (its own committed transaction)
 
-update_source_state()      writes new fingerprints
-publisher.commit()         swaps staging tables, then commits
+queue the source-state write
+publisher.commit()         publication transaction: verify, write source
+                           state, swap every staging table, commit
+
+publisher.close()          release the advisory lock, close
 
   ── finally ──
 
@@ -163,7 +171,7 @@ class ssch2:
     spec = PipelineSpec(excel_name='ssch2.xlsx', db_table='hr_ssch2')
 
     @classmethod
-    def run(cls, ctx, source):
+    def run(cls, ctx, *, source):
         ...
         return table
 ```
@@ -251,10 +259,15 @@ downstream consumers.
 
 ### Staging and swap
 
-`publish()` does not touch the live table. It creates a staging table with
-the freshly inferred schema, loads it, and records a pending swap.
-`commit()` drops each live table and renames its staging table into place,
-sorted by final name, then commits.
+`publish()` prepares one output in its own committed transaction: it
+creates a staging table with the freshly inferred schema, loads it,
+verifies it, attaches ownership metadata, and commits. The live table is
+untouched.
+
+`commit()` is the publication phase — verify, run queued work, drop each
+live table and rename its staging table into place, replace comments,
+commit. Sorted by final name, so two tasks publishing an overlapping set
+in different orders cannot deadlock on the swap locks.
 
 Staging names are
 `<shortened readable prefix>__stg_<target_token>_<run_token>`. Only the
@@ -296,50 +309,69 @@ Names must match `^[a-z_][a-z0-9_]*$` unless a pipeline sets
 
 ## Transactions
 
-> This section describes 0.2.11 and is the part of the architecture most
-> likely to change. A staged model — per-target preparation transactions
-> and one short publication transaction — is designed but not implemented.
-
-One connection, and one *publication* transaction — not one transaction
-for everything.
+Many committed preparation transactions, then one short publication
+transaction. See
+[decisions/0005](decisions/0005-prepare-staging-outside-the-publication-transaction.md)
+for why, and what it costs.
 
 ```
-source-state ensure/read      implicit transaction, autobegun by the
-                              first statement
-discard_pending_read()        rolls that transaction back
-first publisher.publish()     BEGIN the explicit publication transaction
-remaining pipeline work       inside it
-update_source_state()         inside it
-staging swap                  inside it
-commit()                      COMMIT
+begin_run()                claim the task, clean predecessor artifacts
+                           (its own committed transaction)
+
+source-state ensure/read   implicit transaction, autobegun
+
+for each pipeline with a DB target:
+    BEGIN
+      create staging table with the freshly inferred schema
+      load rows
+      verify exact ordered column names and the row count
+      attach ownership metadata
+    COMMIT                 <- the live table is still untouched
+
+BEGIN                      <- the short publication transaction
+  verify every prepared artifact still exists and is still ours
+  run queued work (the source-state write)
+  drop each live table, rename its staging table into place
+  replace staging comments with provenance
+COMMIT
+
+release the task lock, close
 ```
 
-The source-state *read* runs in its own implicit transaction, which is
-deliberately discarded. `DbPublisher` distinguishes that implicit
-transaction from the explicit one it opens for publishing, and
-`discard_pending_read()` clears it — otherwise the first `publish()` calls
-`conn.begin()` on an already-transacted connection, which SQLAlchemy
-rejects.
+The source-state read phase commits itself, in `sources_unchanged()`.
+Leaving it to `_ensure_transaction()` meant the autobegun transaction
+survived until the first `publish()` — which, for a source-check-only task
+or one whose first DB output came late, was the whole run. `no transaction
+spans the run` only holds because the store closes its own phase.
 
-The source-state *write* is inside the publication transaction, so
-everything the run publishes lands together or not at all: a failed run
-does not advance the stored fingerprints.
+**Atomicity.** Publication is all-or-nothing: every swap and the
+source-state write land in one transaction, so a failed publication does
+not advance the stored fingerprints and a retry sees the same sources as
+changed. Preparation is deliberately *not* part of that guarantee — a
+prepared staging table is committed and visible, and is cleaned up rather
+than rolled back.
 
-When source-change checking is enabled but no pipeline declares a
-`db_table`, `publish()` is never called and no explicit transaction is
-opened; the source-state write runs in an implicit one and `commit()`
-commits the connection directly.
+**Duration.** No transaction now spans the run. Each preparation
+transaction is bounded by one table's load; the publication transaction is
+bounded by the number of tables, not their size. Live tables are locked
+only for the swap.
 
-**Cost.** The publication transaction stays open across pipeline execution — remote
-file reads, transformations, Excel exports. The staging swap keeps live
-tables unlocked until the end, but the transaction itself is as long as
-the run: it holds catalog and staging locks, delays vacuum, accumulates
-WAL, and makes a late rollback expensive.
+**Concurrency.** A session-scoped advisory lock, claimed before
+fingerprinting, means two runs of the same task cannot overlap — the
+second exits immediately with `skipped=True` and a distinct
+`skip_reason`. See
+[decisions/0006](decisions/0006-three-rules-that-keep-cleanup-safe.md).
 
-**Concurrency.** Nothing prevents two runs of the same task from
-overlapping. They stage against different physical tables and only
-contend at the final swap.
+**The lock is enforced by the publisher**, not just by the runner:
+`publish()` and `commit()` refuse on PostgreSQL without it, and an
+invalidated connection is detected before every reuse — SQLAlchemy would
+otherwise reconnect transparently onto a session holding none of this
+run's locks.
 
+**Cleanup.** Because preparation commits, `rollback()` drops this run's
+staging tables rather than undoing a transaction, and never raises. A run
+that dies without cleaning up leaves artifacts that the next run of the
+same task removes under the lock.
 
 ## Failure and cleanup
 
@@ -378,13 +410,14 @@ anything, so a failure part-way through does not leave it half-open.
 ## Extension points
 
 - **`publisher_factory`** — anything with `publish`, `commit`, `rollback`,
-  `close`, `discard_pending_read`, `ensure_connection`, and the four
-  result properties. May optionally provide a `preflight` classmethod; if
+  `close`, `begin_run`, `ensure_connection`, and the four result
+  properties. Constructed with `creds`, `schema`, `logger`,
+  `identifier_policy`, `publication_plan` and `task_name`. May optionally provide a `preflight` classmethod; if
   it does not, the real `DbPublisher.preflight` is used, so validation
   always runs.
 - **`build_context`** — the task supplies its own, or uses
   `build_resource_context()` for the standard `RESOURCES`/`bind()` model.
 - **`table_adapter`** — registered in `table_adapters.py`. Adding one means
-  implementing the five methods; nothing in `runner.py` changes.
+  implementing the six methods; nothing in `runner.py` changes.
 - **`source_access`** — `build_source_access()` selects local or SMB file
   access; a resource takes whichever it is given.

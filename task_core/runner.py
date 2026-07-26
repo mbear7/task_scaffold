@@ -16,11 +16,17 @@ branches on which engine a pipeline uses.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import functools
 import logging
 import os
 from typing import TYPE_CHECKING
 
-from task_core.db_publish import MAX_IDENTIFIER_BYTES, DbPublisher
+from task_core.db_publish import (
+    MAX_IDENTIFIER_BYTES,
+    DbPublisher,
+    IdentifierPolicy,
+    PublicationPlan,
+)
 
 from task_core.types import (
     DbRunResult,
@@ -209,6 +215,33 @@ def _reject_duplicate_output_targets(specs):
     )
 
 
+def _skipped_result(ctx, output_db, *, reason, source_check_enabled,
+                    source_changed=None, fingerprints=None):
+    """A run that did no pipeline work. Both skip paths -- sources
+    unchanged, and another run holding the advisory lock -- return this
+    shape, so a caller distinguishes them by skip_reason rather than by
+    which fields happen to be populated.
+    """
+    return RunResult(
+        task_name=ctx.task_name,
+        pipeline_rows={},
+        excel_outputs=[],
+        db=DbRunResult(
+            requested=bool(output_db),
+            had_outputs=False,
+            committed=False,
+            committed_tables=[],
+            published_tables=[],
+            row_counts={},
+        ),
+        skipped=True,
+        skip_reason=reason,
+        source_check_enabled=source_check_enabled,
+        source_changed=source_changed,
+        source_fingerprints=fingerprints or [],
+    )
+
+
 def validate_pipeline_classes(pipelines, run_sequence):
     missing = [name for name in run_sequence if name not in pipelines]
     if missing:
@@ -269,6 +302,9 @@ def run_pipelines(
     DbPublisher was at the time this function was defined (module import
     time), not re-read from the module namespace on every call."""
     log = logging.getLogger(task_name)
+    identifier_policy = IdentifierPolicy(max_identifier_bytes=db_max_identifier_bytes)
+    publication_plan = PublicationPlan()
+
     specs = validate_pipeline_classes(pipelines, run_sequence)
 
     # Backend-specific preflight, invoked by an engine-neutral runner. The
@@ -288,7 +324,7 @@ def run_pipelines(
     # (lambda **kw: FakePublisher(**kw, close_error=...) is a useful test
     # idiom), so a callable with no classmethod to ask must still get
     # validated rather than quietly skipped. Skipping on absence is exactly
-    # how discard_pending_read() ended up with zero coverage.
+    # how an optional hook ends up with zero coverage for years.
     preflight = getattr(publisher_factory, 'preflight', DbPublisher.preflight)
     # The source-state table is passed in as a reserved target: a
     # source-check-enabled run creates and writes it, so its identifiers
@@ -305,7 +341,7 @@ def run_pipelines(
         specs,
         schema=pg_schema,
         source_state_target=source_state_target,
-        max_identifier_bytes=db_max_identifier_bytes,
+        identifier_policy=identifier_policy,
     )
 
     ctx = build_context()
@@ -377,7 +413,36 @@ def run_pipelines(
         # read/write the technical source-state table -- source-change
         # checking must not open a second, independent DB connection.
         if has_db_outputs or source_check_enabled:
-            publisher = publisher_factory(creds=creds, schema=pg_schema, logger=log)
+            publisher = publisher_factory(
+                creds=creds,
+                schema=pg_schema,
+                logger=log,
+                identifier_policy=identifier_policy,
+                publication_plan=publication_plan,
+                task_name=ctx.task_name,
+            )
+
+            # The task advisory lock, before anything else touches the
+            # database. Acquired ahead of the source-state read because
+            # fingerprinting is the expensive part on a remote share and
+            # there is no point paying for it only to lose the race at the
+            # first publish -- and because update_source_state() WRITES, so
+            # two runs past the read are both intending to write the same
+            # rows.
+            #
+            # try, not the blocking form: a schedule that fires faster than
+            # the task runs would otherwise build an unbounded queue, which
+            # is worse than the collision.
+            if not publisher.begin_run():
+                log.warning(
+                    'another run of %s is already in progress; skipping this one',
+                    ctx.task_name,
+                )
+                return _skipped_result(
+                    ctx, output_db,
+                    reason='another run of this task holds the advisory lock',
+                    source_check_enabled=source_check_enabled,
+                )
 
         current_fingerprints = []
         source_changed = None
@@ -399,33 +464,17 @@ def run_pipelines(
                 store.ensure_table()
 
             unchanged = store.sources_unchanged(ctx.task_name, current_fingerprints)
-            # This read may have auto-begun an implicit transaction on the
-            # connection (see DbPublisher.discard_pending_read()); reset it
-            # before anything below tries to start an explicit transaction.
-            publisher.discard_pending_read()
-
             source_changed = not unchanged
 
             if unchanged and not force_run:
                 log.info('sources unchanged, skipping pipeline execution')
                 try_rollback()
-                return RunResult(
-                    task_name=ctx.task_name,
-                    pipeline_rows={},
-                    excel_outputs=[],
-                    db=DbRunResult(
-                        requested=bool(output_db),
-                        had_outputs=False,
-                        committed=False,
-                        committed_tables=[],
-                        published_tables=[],
-                        row_counts={},
-                    ),
-                    skipped=True,
-                    skip_reason='sources_unchanged',
+                return _skipped_result(
+                    ctx, output_db,
+                    reason='sources_unchanged',
                     source_check_enabled=True,
                     source_changed=False,
-                    source_fingerprints=current_fingerprints,
+                    fingerprints=current_fingerprints,
                 )
 
             if unchanged and force_run:
@@ -513,18 +562,26 @@ def run_pipelines(
 
         if publisher is not None:
             if source_check_enabled:
-                update_source_state(
-                    publisher,
-                    task_name=ctx.task_name,
-                    fingerprints=current_fingerprints,
-                    config=source_change_check,
+                # QUEUED, not executed. The source-state write must land in
+                # the same transaction as the swaps or a failed publication
+                # could still advance the stored fingerprints. Queuing it
+                # keeps commit()'s signature and the publisher protocol
+                # unchanged -- both were expanded by accident once already.
+                publication_plan.add(
+                    f'update source state ({len(current_fingerprints)} sources)',
+                    functools.partial(
+                        update_source_state,
+                        publisher,
+                        task_name=ctx.task_name,
+                        fingerprints=current_fingerprints,
+                        config=source_change_check,
+                    ),
                 )
-                log.info('source state updated, source_count=%s', len(current_fingerprints))
-            # commit() performs the staging swap itself, immediately
-            # before committing -- deliberately not a separate call here.
-            # Doing it from the runner made publish()+commit() silently
-            # incorrect for any direct caller, and expanded the
-            # publisher_factory protocol that exists as an extension seam.
+            # The publication phase: verify prepared artifacts, run queued
+            # steps, swap every staging table, commit. One short
+            # transaction, deliberately not a separate call here -- doing
+            # the swap from the runner made publish()+commit() silently
+            # incorrect for any direct caller.
             publisher.commit()
 
         db_result = _build_db_run_result(

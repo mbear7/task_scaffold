@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import hashlib
+import json
 import logging
+import re
 from itertools import islice
 from uuid import uuid4
 from typing import Any, Iterator
@@ -361,6 +363,204 @@ def server_identifier_limit(conn, configured):
     return min(configured, int(value))
 
 
+class PublicationPlan:
+    """Work the runner needs performed inside the publication transaction.
+
+    Source-state writing belongs to the runner and source_state.py, but it
+    must land in the same transaction as the table swaps or a failed run
+    could still advance the stored fingerprints. Queuing it here keeps
+    commit()'s signature and the publisher protocol unchanged -- both of
+    which were expanded by accident once already.
+    """
+
+    def __init__(self):
+        self._steps = []
+
+    def add(self, description, action):
+        self._steps.append((description, action))
+
+    def run(self, log):
+        for description, action in self._steps:
+            log.info('publication step: %s', description)
+            action()
+
+    def clear(self):
+        self._steps = []
+
+    def __len__(self):
+        return len(self._steps)
+
+
+@dataclass(frozen=True)
+class IdentifierPolicy:
+    """The single source of truth for identifier rules, shared by
+    class-level preflight and the publisher that will do the work.
+
+    Previously the limit reached preflight through run_pipelines() and the
+    publisher through its own constructor default, so
+    db_max_identifier_bytes=40 validated declared names against 40 and
+    everything discovered at runtime against 63. Two independently
+    configured integers for one rule.
+
+    Frozen, and deliberately does NOT hold the server-verified limit: that
+    is resolved per connection and can only tighten this value. The policy
+    is authoritative for static validation; the effective limit at DDL time
+    is min(policy, server) and the publisher owns that derivation. Two
+    policy objects in flight would be worse than one policy plus a
+    documented derivation.
+    """
+
+    max_identifier_bytes: int = MAX_IDENTIFIER_BYTES
+
+    def __post_init__(self):
+        if not isinstance(self.max_identifier_bytes, int) or self.max_identifier_bytes < 1:
+            raise DbPublishError(
+                f'max_identifier_bytes must be a positive integer, '
+                f'got {self.max_identifier_bytes!r}'
+            )
+
+
+DEFAULT_IDENTIFIER_POLICY = IdentifierPolicy()
+
+# Advisory lock namespace. The two-int form gives a 32-bit namespace in the
+# high half; advisory locks are database-wide and shared with anything else
+# using them, so a bare hashtext(task_name) could collide with an unrelated
+# application's lock and present as this task mysteriously refusing to run.
+_ADVISORY_LOCK_NAMESPACE = 0x7A5C  # 'task_core', arbitrary but fixed
+
+# Ownership metadata attached to every staging table via COMMENT ON TABLE.
+# Compact JSON so cleanup can parse it, versioned so a future change can be
+# recognised rather than guessed at.
+STAGING_COMMENT_VERSION = 1
+_COMMENT_MARKER = 'task_core'
+
+
+def advisory_lock_key(task_name):
+    """(namespace, key) for pg_try_advisory_lock's two-int form."""
+    digest = hashlib.blake2b(task_name.encode('utf-8'), digest_size=4).digest()
+    # Signed 32-bit, which is what PostgreSQL's int4 accepts.
+    key = int.from_bytes(digest, 'big', signed=True)
+    return _ADVISORY_LOCK_NAMESPACE, key
+
+
+def build_staging_comment(*, task_name, run_token, schema, table_name):
+    return json.dumps(
+        {
+            'marker': _COMMENT_MARKER,
+            'v': STAGING_COMMENT_VERSION,
+            'task': task_name,
+            'run': run_token,
+            'target_schema': schema,
+            'target_table': table_name,
+            'created_at': datetime.now(timezone.utc).isoformat(),
+        },
+        separators=(',', ':'),
+        ensure_ascii=False,
+    )
+
+
+def build_published_comment(*, task_name, run_token, rows):
+    """Replaces the staging comment on the live table after the swap.
+
+    Two purposes. It stops a published table from carrying staging
+    ownership metadata that cleanup would later read -- ALTER TABLE ...
+    RENAME preserves comments, so without this every published table looks
+    like an abandoned staging artifact. And it is genuinely useful
+    provenance: 'which run produced this data' answered from the catalog is
+    the question actually asked when a number looks wrong.
+    """
+    return json.dumps(
+        {
+            'marker': _COMMENT_MARKER,
+            'v': STAGING_COMMENT_VERSION,
+            'published_by': task_name,
+            'run': run_token,
+            'rows': rows,
+            'published_at': datetime.now(timezone.utc).isoformat(),
+        },
+        separators=(',', ':'),
+        ensure_ascii=False,
+    )
+
+
+_STAGING_NAME_SUFFIX_RE = re.compile(
+    rf'__{STAGING_NAME_KIND}_([0-9a-f]{{{_STAGING_TOKEN_HEX}}})_([0-9a-f]{{{_RUN_TOKEN_HEX}}})$'
+)
+
+
+def owned_staging_tokens(relname):
+    """(target_token, run_token) if this name has the exact staging shape,
+    else None.
+
+    The catalog scan uses a broad LIKE because SQL cannot express the
+    token shapes; this is what turns that into the strict rule. Without
+    it, any table whose name merely contained the infix could be dropped
+    on the strength of a syntactically valid comment -- confirmed directly
+    with `not_really__stg_whatever`.
+
+    The readable prefix is deliberately NOT recomputed. It may have been
+    truncated under a different configured identifier limit, so a prefix
+    comparison would refuse to clean up artifacts this project genuinely
+    created.
+    """
+    match = _STAGING_NAME_SUFFIX_RE.search(relname)
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
+def parse_staging_comment(comment):
+    """Ownership metadata, or None when this is not ours.
+
+    Defensive by design: an unparseable or unrecognised comment means
+    ownership is UNKNOWN, and the cleanup rule is to drop only what can be
+    positively identified. A parse failure must never fall through to a
+    drop -- that is the failure mode that turns cleanup from hygiene into
+    an outage.
+    """
+    if not comment:
+        return None
+    try:
+        parsed = json.loads(comment)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    # `type(...) is int`, not equality: Python considers True == 1 and
+    # 1.0 == 1, so a comment carrying "v": true or "v": 1.0 passed a
+    # straight comparison -- confirmed directly. A version field that is
+    # not an integer is not a version this code wrote.
+    if parsed.get('marker') != _COMMENT_MARKER:
+        return None
+    if type(parsed.get('v')) is not int or parsed['v'] != STAGING_COMMENT_VERSION:
+        return None
+
+    # EVERY documented field, with its type checked. Requiring only the
+    # marker, the version and the presence of task/run meant a comment
+    # missing target_schema, target_table and created_at still authorized
+    # a drop -- metadata that does not satisfy the documented format was
+    # being treated as positive identification, which is precisely what
+    # 'unknown ownership is never dropped' is supposed to prevent.
+    #
+    # Extra fields are tolerated on purpose, so a later version can add
+    # one without older code refusing to recognise its own artifacts.
+    required_strings = ('task', 'run', 'target_table', 'created_at')
+    for field in required_strings:
+        value = parsed.get(field)
+        if not isinstance(value, str) or not value:
+            return None
+
+    # target_schema may legitimately be None (an unqualified target), but
+    # the key must be present and, when set, a non-empty string.
+    if 'target_schema' not in parsed:
+        return None
+    schema = parsed['target_schema']
+    if schema is not None and (not isinstance(schema, str) or not schema):
+        return None
+
+    return parsed
+
+
 def _quote_identifier(name):
     """Double-quote for interpolation into DDL that cannot be parameterised.
     DROP TABLE and ALTER TABLE ... RENAME take identifiers, not bind
@@ -442,7 +642,9 @@ class DbPublisher:
         logger=None,
         chunk_size=5000,
         type_infer_sample_size=5000,
-        max_identifier_bytes=MAX_IDENTIFIER_BYTES,
+        identifier_policy=None,
+        publication_plan=None,
+        task_name=None,
     ):
         self.creds = validate_pg_creds(
             creds,
@@ -459,11 +661,21 @@ class DbPublisher:
             self.type_infer_sample_size = int(type_infer_sample_size)
             if self.type_infer_sample_size < 1:
                 raise DbPublishError('type_infer_sample_size must be a positive integer or None')
+        self.identifier_policy = identifier_policy or DEFAULT_IDENTIFIER_POLICY
+        self.max_identifier_bytes = self.identifier_policy.max_identifier_bytes
+        # Work queued by the runner and executed inside the publication
+        # transaction, so the source-state write is atomic with the swaps
+        # without commit() growing a parameter or the protocol growing a
+        # member. Mutable and populated after construction because the
+        # fingerprints do not exist until collection has run.
+        self.publication_plan = publication_plan if publication_plan is not None else PublicationPlan()
+        self.task_name = task_name
         self._engine = None
         self._conn = None
         self._tx = None
+        self._connection_lost = False
+        self._lock_held = False
         self._written_tables = []
-        self.max_identifier_bytes = max_identifier_bytes
         self._pending_swaps = []
         self._run_token = new_run_token()
         # Final invariant enforcement. The naming rule already makes a
@@ -476,6 +688,35 @@ class DbPublisher:
         self._committed = False
 
     def ensure_connection(self):
+        # Three states, not two: never connected, connected, and LOST.
+        # Reconnecting after a lost session would silently continue without
+        # the advisory lock this run holds on it -- and the lock is what
+        # guarantees no other run of this task is live, which in turn is
+        # what makes predecessor cleanup safe. A reconnect looks harmless,
+        # which is exactly why it has to be refused explicitly.
+        if self._connection_lost:
+            raise DbPublishError(
+                'the publisher connection was lost. Reconnecting would silently '
+                'continue without the task advisory lock held on that session, '
+                'so this run cannot proceed.'
+            )
+
+        # Detected, not merely representable. mark_connection_lost() existed
+        # but nothing called it, so the terminal state was unreachable in
+        # practice -- and SQLAlchemy will transparently reconnect an
+        # invalidated Connection on the next statement, which silently
+        # continues on a NEW session that holds none of this run's advisory
+        # locks. That is exactly the stale-publisher scenario decisions/0006
+        # exists to eliminate, so the check has to run before every reuse.
+        if self._conn is not None and self._conn.invalidated:
+            self.mark_connection_lost()
+            raise DbPublishError(
+                'the publisher connection was invalidated. SQLAlchemy would '
+                'reconnect transparently on the next statement, continuing on a '
+                'session that does not hold this task\'s advisory lock, so this '
+                'run cannot proceed.'
+            )
+
         if self._engine is None:
             self._engine = make_engine(self.creds)
 
@@ -484,28 +725,174 @@ class DbPublisher:
 
         return self._conn
 
+    def mark_connection_lost(self):
+        self._connection_lost = True
+        self._lock_held = False
+
+    def _note_connection_loss(self):
+        """Transition to the terminal state if the session is already gone.
+
+        Called at the top of every NON-RAISING cleanup path. ensure_connection()
+        rejects an invalidated connection, but rollback() and
+        release_task_lock() use self._conn directly and so bypassed it --
+        confirmed directly, rollback() executed DROP TABLE and COMMIT on a
+        connection marked invalidated while _connection_lost stayed False.
+        SQLAlchemy would reconnect for those statements, running cleanup on
+        a session that holds none of this run's advisory locks. Cleanup must
+        never reconnect after losing the lock-owning session; the staging
+        artifacts are the next run's problem, and it will find them under
+        its own lock.
+        """
+        if self._connection_lost:
+            return True
+        if self._conn is not None and self._conn.invalidated:
+            self.mark_connection_lost()
+            self.log.warning(
+                'the publisher session was lost; skipping cleanup rather than '
+                'reconnecting without the task advisory lock. Staging artifacts '
+                'will be removed by the next run of this task.'
+            )
+            return True
+        return False
+
+    # -- task advisory lock -------------------------------------------
+
+    def try_acquire_task_lock(self, task_name):
+        """Session-level pg_try_advisory_lock. True if this run may proceed.
+
+        try, not the blocking form: a five-minute schedule on a
+        twenty-minute task would otherwise build an unbounded queue, which
+        is worse than the collision it is meant to prevent. Failing fast is
+        the wanted behaviour -- concurrent runs of one scheduled task are a
+        misfire, not a feature.
+
+        Session-level, not transaction-level: the staged model splits a run
+        into many committed transactions, and pg_advisory_xact_lock would
+        release at the first of them. Session scope also gives the right
+        failure mode for free -- a killed process drops the connection and
+        PostgreSQL releases the lock, with no lock table needing cleanup of
+        its own.
+        """
+        conn = self.ensure_connection()
+        if conn.dialect.name != 'postgresql':
+            # No advisory locks outside PostgreSQL. Treated as acquired so
+            # non-PostgreSQL test backends exercise the rest of the flow;
+            # production is PostgreSQL by construction.
+            self._lock_held = True
+            return True
+
+        namespace, key = advisory_lock_key(task_name)
+        acquired = bool(
+            conn.execute(
+                sa.text('select pg_try_advisory_lock(:ns, :key)'),
+                {'ns': namespace, 'key': key},
+            ).scalar()
+        )
+        self._lock_held = acquired
+        return acquired
+
+    def release_task_lock(self, task_name):
+        """Explicit unlock before closing, rather than relying on session
+        end. Today make_engine() uses NullPool so the two are equivalent --
+        but the whole dedicated-connection contract rests on NullPool, and
+        an explicit unlock keeps this honest if that ever changes.
+        """
+        if not self._lock_held or self._conn is None or self._note_connection_loss():
+            self._lock_held = False
+            return
+
+        if self._conn.dialect.name != 'postgresql':
+            self._lock_held = False
+            return
+
+        namespace, key = advisory_lock_key(task_name)
+        try:
+            self._conn.execute(
+                sa.text('select pg_advisory_unlock(:ns, :key)'),
+                {'ns': namespace, 'key': key},
+            )
+            self._conn.commit()
+        finally:
+            self._lock_held = False
+
+    @property
+    def lock_held(self):
+        return self._lock_held
+
     def _ensure_transaction(self):
         conn = self.ensure_connection()
 
         if self._tx is None:
+            # Close out any transaction SQLAlchemy autobegan on our behalf
+            # before opening an explicit one -- conn.begin() rejects being
+            # called on an already-transacted connection. The only thing
+            # that autobegins here is the source-state read phase, which
+            # under the staged model is a bounded phase that SHOULD commit
+            # rather than be discarded, so committing is correct and not
+            # merely convenient.
+            #
+            # This absorbs what used to be an explicit runner-invoked reset
+            # of that pending read. Doing it here removes both a lifecycle
+            # state the new architecture makes impossible and a protocol
+            # member with it.
+            if conn.in_transaction():
+                conn.commit()
             self._tx = conn.begin()
-            self.log.info('db publish transaction started')
+            self.log.info('transaction started')
 
         return conn
 
-    def discard_pending_read(self):
-        # source_state.build_source_state_store() reads/DDL run via
-        # ensure_connection() only, without going through
-        # _ensure_transaction(). On SQLAlchemy's autobegin behavior that
-        # can still leave an implicit transaction open on the connection.
-        # If publish() is called afterwards it calls conn.begin() expecting
-        # no transaction in progress, so reset here.
-        if self._conn is not None and self._tx is None:
-            self._conn.rollback()
+    def begin_run(self):
+        """Claim this task for this run. False means another run holds it.
+
+        The ONE member the staged model adds to the publisher protocol.
+        Lock acquisition and predecessor cleanup are folded together
+        deliberately: they are a single precondition -- "this run owns the
+        task, and nothing a dead predecessor left is still lying around" --
+        and splitting them would put two more members on a seam that has
+        already been expanded by accident twice.
+
+        Cleanup is safe here precisely because the lock was just acquired:
+        no other run of this task is live, so any staging artifact
+        positively identified as this task's belongs to a predecessor that
+        is gone. No age threshold, no race with a running peer.
+        """
+        # The server's real identifier limit BEFORE any DDL, including
+        # cleanup's. Cleanup works from catalog-returned names so it is
+        # unlikely to truncate anything, but 'verified before the first
+        # DDL' is the stated contract and this is where it is cheapest to
+        # honour.
+        self._effective_identifier_limit()
+
+        if not self.try_acquire_task_lock(self.task_name or ''):
+            return False
+
+        self.cleanup_predecessor_artifacts(self.task_name or '')
+        return True
+
+    def _require_task_lock(self, action):
+        """The unconditional-lock contract, enforced by the publisher
+        rather than trusted to the caller.
+
+        The runner always calls begin_run() first, but publisher_factory is
+        an advertised extension seam and DbPublisher is usable directly --
+        so a caller could previously publish without ever claiming the
+        task, which makes predecessor cleanup unsafe for everyone else.
+        """
+        conn = self.ensure_connection()
+        if conn.dialect.name != 'postgresql':
+            return
+        if not self._lock_held:
+            raise DbPublishError(
+                f'cannot {action}: this publisher does not hold the task '
+                f'advisory lock. Call begin_run() first -- without it, another '
+                f'run of the same task may be preparing or publishing '
+                f'concurrently, and predecessor cleanup is not safe.'
+            )
 
     @classmethod
     def preflight(cls, specs, *, schema, source_state_target=None,
-                  max_identifier_bytes=MAX_IDENTIFIER_BYTES):
+                  identifier_policy=None, max_identifier_bytes=None):
         """Backend-specific validation of DECLARED targets, invoked by the
         engine-neutral runner before build_context().
 
@@ -524,6 +911,15 @@ class DbPublisher:
         Skipped entirely when no spec declares db_table: a DB-free task
         should not have backend policy applied to it.
         """
+        # One policy object shared with the publisher that will do the
+        # work, rather than a second independently-defaulted integer. The
+        # explicit max_identifier_bytes argument stays for direct callers
+        # and tests; the policy wins when both are given.
+        if identifier_policy is not None:
+            max_identifier_bytes = identifier_policy.max_identifier_bytes
+        elif max_identifier_bytes is None:
+            max_identifier_bytes = MAX_IDENTIFIER_BYTES
+
         declaring = {name: spec for name, spec in specs.items() if spec.db_table}
         if not declaring and not source_state_target:
             return
@@ -690,31 +1086,44 @@ class DbPublisher:
                 validate_portable_identifier(column, kind='column name', context=context)
 
     def publish(self, payload: DbPayload):
-        """Stage only. The live table is not touched here -- see
-        finalize_published_tables() for the swap.
+        """Prepare one output for publication, in its own committed
+        transaction. The live table is not touched.
 
-        Previously this did DROP + CREATE + INSERT on the live table
-        directly, inside the pipeline loop, while the run's single commit
-        came only at the very end. That took an ACCESS EXCLUSIVE lock on
-        the published table at its first publish and held it for the whole
-        remainder of the run. Confirmed directly by instrumenting a
-        three-pipeline run: the first table was locked for 3.08s of a
-        4.62s run, and the work filling that window was other pipelines
-        opening remote files and writing Excel -- nothing to do with the
-        locked table. On a task publishing eight tables from SMB-hosted
-        workbooks, the first table is unavailable for very nearly the
-        entire run.
+        This is the preparation half of the staged model. Rows go into a
+        run-owned staging table with the freshly inferred schema; the
+        staging table is validated, marked with ownership metadata, and
+        committed. The live table stays readable and unlocked until
+        commit() swaps everything at once.
 
-        Rows now go into a per-run staging table with the freshly inferred
-        schema, and the live table stays readable until the publication
-        phase swaps it. Schema evolution is completely unaffected: the
-        staging table's columns are whatever _infer_column_type() decided
-        this run, exactly as before. This is deliberately NOT a
-        TRUNCATE + INSERT into the existing table, which would require the
-        old schema to stay compatible and push column migration back onto
-        every task.
+        Preparation can afford O(n) work -- it is already O(n) inserting --
+        which is why validation lives here rather than in the publication
+        phase, where anything O(rows) would defeat the point of a short
+        transaction.
+
+        Committing here rather than holding one transaction for the whole
+        run is what bounds transaction duration: WAL accumulation, vacuum
+        delay, catalog lock retention and late-rollback cost all scale with
+        how long a transaction stays open, and a run that reads workbooks
+        over SMB between publishes can stay open for a very long time.
+
+        The cost is that rollback is no longer the cleanup mechanism -- see
+        rollback() and docs/decisions/0005.
         """
-        self._ensure_transaction()
+        self._require_task_lock('publish')
+
+        # Startup cleanup scans exactly one schema -- the publisher's. A
+        # payload prepared into a different one would leave an orphan that
+        # no future run ever scans, which quietly breaks the cleanup
+        # guarantee for that schema. The runner always passes pg_schema, so
+        # this only binds direct and custom callers; the invariant belongs
+        # to the publisher regardless.
+        if payload.schema != self.schema:
+            raise DbPublishError(
+                f'payload targets schema {payload.schema!r} but this publisher is '
+                f'configured for {self.schema!r}. Staging artifacts are cleaned up '
+                f'per-schema, so a target outside the publisher\'s schema would '
+                f'leave orphans no later run scans.'
+            )
 
         limit = self._effective_identifier_limit()
         self._validate_payload_identifiers(payload, limit)
@@ -736,26 +1145,50 @@ class DbPublisher:
                 f'internal invariant violated -- generated staging-table collision: '
                 f'{payload.schema}.{staging_name} (target {payload.table_name!r})'
             )
-        self._generated_names.add(key)
 
+        # Built BEFORE the transaction opens. _build_table() runs type
+        # inference, which scans the payload and may be O(rows) -- work
+        # that needs no database transaction and would otherwise sit inside
+        # one, against the whole point of bounding preparation to actual
+        # database work.
         staging_table = self._build_table(payload, table_name=staging_name)
 
+        conn = self.ensure_connection()
+        self._ensure_transaction()
+
         self.log.info(
-            'staging db table %s.%s as %s rows=%s',
+            'preparing %s.%s as %s rows=%s',
             payload.schema, payload.table_name, staging_name, len(payload.rows),
         )
 
-        # checkfirst on the STAGING name: within one transaction this
-        # cannot already exist (duplicate db_table targets are rejected by
-        # validate_pipeline_classes() before any of this runs), but a
-        # retry after a rolled-back run costs nothing to tolerate.
-        staging_table.drop(self._conn, checkfirst=True)
-        staging_table.create(self._conn)
+        # NO drop-first. `drop(checkfirst=True)` bypassed the cleanup safety
+        # rule completely: an object already at this name -- with no
+        # comment, an invalid one, or another owner -- was erased anyway.
+        # Reproduced directly: a table holding unrelated data was silently
+        # replaced.
+        #
+        # After predecessor cleanup and a fresh run token, an existing exact
+        # name is a collision or an invariant violation, not something to
+        # tidy away. Let PostgreSQL raise 'relation already exists'.
+        staging_table.create(conn)
 
+        loaded = 0
         if payload.rows:
             insert_stmt = staging_table.insert()
             for chunk in _chunked(payload.rows, self.chunk_size):
-                self._conn.execute(insert_stmt, chunk)
+                conn.execute(insert_stmt, chunk)
+                loaded += len(chunk)
+
+        self._verify_prepared_table(payload, staging_name, loaded)
+        self._attach_staging_comment(payload, staging_name)
+
+        # Committed here. A staging table is created, loaded, validated,
+        # commented and committed in ONE transaction, so committed + owned
+        # means publishable -- there is no window in which a committed
+        # staging table is incomplete, and therefore no 'ready' flag to
+        # track. A validation failure rolls this transaction back and
+        # leaves nothing behind.
+        self._commit_transaction()
 
         full_name = f'{payload.schema}.{payload.table_name}'
         table_result = DbTableResult(
@@ -768,112 +1201,347 @@ class DbPublisher:
         # Reported under the FINAL name, never the staging one -- the
         # RunResult is what tasks log, and a staging identifier appearing
         # there would be noise at best and misleading at worst.
+        self._generated_names.add(key)
         self._written_tables.append(table_result)
         self._table_rows[full_name] = table_result.rows
-        self._pending_swaps.append((payload.schema, payload.table_name, staging_name))
+        self._pending_swaps.append((payload.schema, payload.table_name, staging_name, len(payload.rows)))
 
-    def _finalize_published_tables(self):
-        """The publication phase: drop each live table and rename its
-        staging table into place. Called by run_pipelines() after the
-        pipeline loop and after update_source_state(), immediately before
-        commit() -- which is what holds the ACCESS EXCLUSIVE window to its
-        floor rather than spanning the run.
+    def _verify_prepared_table(self, payload, staging_name, loaded):
+        """Mechanical integrity of what was just written, inside the same
+        transaction that wrote it.
 
-        PRIVATE, and called by commit() rather than by the runner. The
-        first version exposed this publicly and relied on run_pipelines()
-        to call it, which was wrong twice over. Confirmed directly against
-        a real engine: publish() followed by commit(), without the runner
-        in between, reported committed=True and committed_tables=['None.t']
-        while the live table still held its old rows and the staging table
-        was committed permanently -- a publisher that reports success
-        having published nothing. And it expanded the publisher_factory
-        protocol, which is explicitly a testing and extension seam: an
-        otherwise-valid publisher written against the previous contract
-        died with AttributeError at the end of a successful run.
+        Deliberately mechanical only. Business checks -- non-emptiness, key
+        uniqueness, value ranges -- belong to tasks, not to the scaffold,
+        and putting them here would make every task pay for one task's
+        rule.
 
-        Folding it into commit() fixes both: publish() + commit() is
-        correct standalone, finalization still happens immediately before
-        the real commit, and the staging protocol stays inside the
-        publisher instead of leaking into every fake.
-
-        Sorted by final name, deliberately. Two tasks publishing an
-        overlapping set of tables in different orders would otherwise be
-        able to deadlock against each other on these locks; a deterministic
-        global order removes that class of problem for free.
-
-        Still one transaction, so atomicity is exactly as before: either
-        every table swaps and the source state advances, or nothing does.
+        Row count is authoritative BECAUSE the payload is fully
+        materialized before any insert begins: len(payload.rows) is the
+        exact set of dicts handed to the driver, not an expectation carried
+        from the source. Counted in the chunking loop rather than taken
+        from the driver, because SQLAlchemy reports
+        supports_sane_multi_rowcount=False for psycopg2 -- confirmed
+        directly -- so a driver rowcount after executemany would be
+        measuring the rewritten statement, not the logical rows. This
+        guards our chunking, and says so rather than claiming to guard the
+        database.
         """
-        if not self._pending_swaps:
-            return []
+        if loaded != len(payload.rows):
+            raise DbPublishInvariantError(
+                f'internal invariant violated -- {payload.table_name!r}: loaded '
+                f'{loaded} rows into {staging_name} but the payload held '
+                f'{len(payload.rows)}'
+            )
 
-        self._ensure_transaction()
-        swapped = []
+        actual = self._reflect_column_names(payload.schema, staging_name)
+        if actual is None:
+            return
 
-        for schema, table_name, staging_name in sorted(self._pending_swaps, key=lambda item: (item[0] or '', item[1])):
-            qualified = _quoted_name(schema, table_name)
-            staging_qualified = _quoted_name(schema, staging_name)
+        # Exact ORDERED name equality, not SQL type equality. Ordinal
+        # position is trustworthy here precisely because the table was just
+        # created -- attnum develops gaps after DROP COLUMN, so this check
+        # would need care on a reused table and needs none on a fresh one.
+        # Type comparison is deliberately out of scope: it would require a
+        # SQLAlchemy-to-information_schema type map that drifts silently
+        # when it is not maintained.
+        if actual != list(payload.columns):
+            raise DbPublishInvariantError(
+                f'internal invariant violated -- {payload.table_name!r}: staging '
+                f'table {staging_name} has columns {actual}, payload declared '
+                f'{list(payload.columns)}'
+            )
 
-            self.log.info('publishing %s from %s', qualified, staging_qualified)
-            self._conn.execute(sa.text(f'drop table if exists {qualified}'))
-            # RENAME takes the new name UNQUALIFIED -- the table keeps the
-            # schema it was created in, and PostgreSQL rejects a qualified
-            # target here rather than silently moving it.
-            self._conn.execute(sa.text(
-                f'alter table {staging_qualified} rename to {_quote_identifier(table_name)}'
-            ))
-            swapped.append(f'{schema}.{table_name}' if schema else table_name)
+    def _reflect_column_names(self, schema, table_name):
+        conn = self.ensure_connection()
+        if conn.dialect.name != 'postgresql':
+            return None
+        result = conn.execute(
+            sa.text(
+                'select column_name from information_schema.columns '
+                'where table_schema = :schema and table_name = :table '
+                'order by ordinal_position'
+            ),
+            {'schema': schema, 'table': table_name},
+        )
+        return [row[0] for row in result]
 
-        self._pending_swaps = []
-        return swapped
+    def _attach_staging_comment(self, payload, staging_name):
+        """Ownership metadata, committed atomically with the table itself.
 
-    def commit(self):
-        # Finalization is part of committing, not a separate step callers
-        # must remember -- see _finalize_published_tables() for what went
-        # wrong when it was separate.
-        self._finalize_published_tables()
+        This is what makes cleanup possible without a registry table: the
+        catalog carries who owns each staging artifact, readable with one
+        obj_description() query and with no second source of truth to fall
+        out of sync.
+        """
+        comment = build_staging_comment(
+            task_name=self.task_name or '',
+            run_token=self._run_token,
+            schema=payload.schema,
+            table_name=payload.table_name,
+        )
+        self._set_comment(payload.schema, staging_name, comment)
 
+    def _set_comment(self, schema, table_name, comment):
+        conn = self.ensure_connection()
+        if conn.dialect.name != 'postgresql':
+            return
+        # Comments take a literal, not a bind parameter, so the value is
+        # quoted here. json.dumps output contains no NUL and doubling
+        # single quotes is sufficient.
+        literal = "'" + comment.replace("'", "''") + "'"
+        conn.execute(sa.text(f'comment on table {_quoted_name(schema, table_name)} is {literal}'))
+
+    def _commit_transaction(self):
         if self._tx is not None:
             self._tx.commit()
             self._tx = None
         elif self._conn is not None and self._conn.in_transaction():
-            # No explicit _tx -- but source-state writes (ensure_table/
-            # upsert_state, via SourceStateStore) go straight through
-            # ensure_connection(), never through _ensure_transaction(),
-            # so a source-check-only run (no db_table pipeline at all)
-            # never opens an explicit _tx. SQLAlchemy's own autobegin still
-            # opens an implicit one the moment anything executes, and that
-            # implicit transaction is what actually needs committing here.
             self._conn.commit()
-        else:
-            return []
+
+    def _verify_prepared_artifacts(self):
+        """Cheap identity checks only, inside the publication transaction.
+
+        Every check here is O(number of tables), never O(rows). Recounting
+        a large staging table or re-running validation would put the run's
+        expensive work back inside the short transaction, which is the one
+        thing this phase exists to avoid. The row count recorded at
+        preparation is carried into the RunResult as metadata, not compared
+        against anything -- comparing a recorded number to itself proves
+        nothing, and comparing it to a live count is the recount just
+        excluded.
+        """
+        conn = self.ensure_connection()
+        if conn.dialect.name != 'postgresql':
+            return
+
+        for schema, table_name, staging_name, _rows in self._pending_swaps:
+            # Exact catalog values, NOT to_regclass() on an assembled
+            # string. to_regclass parses its argument as an identifier
+            # expression, so it down-cases anything unquoted -- which means
+            # a mixed-case, Cyrillic or spaced staging name produced under
+            # db_identifier_mode='quoted' would prepare correctly and then
+            # be reported as missing here. Matching on nspname/relname
+            # works identically for both identifier modes.
+            comment = conn.execute(
+                sa.text(
+                    'select obj_description(c.oid, \'pg_class\') '
+                    'from pg_class c join pg_namespace n on n.oid = c.relnamespace '
+                    'where n.nspname = :schema and c.relname = :table'
+                ),
+                {'schema': schema, 'table': staging_name},
+            ).scalar()
+
+            owner = parse_staging_comment(comment)
+            if owner is None:
+                raise DbPublishError(
+                    f'staging table {staging_name} is missing or no longer carries '
+                    f'this run\'s ownership metadata; refusing to publish it over '
+                    f'{table_name!r}'
+                )
+            if owner.get('run') != self._run_token or owner.get('task') != (self.task_name or ''):
+                raise DbPublishError(
+                    f'staging table {staging_name} belongs to task '
+                    f'{owner.get("task")!r} run {owner.get("run")!r}, not to this run'
+                )
+            if owner.get('target_table') != table_name or owner.get('target_schema') != schema:
+                raise DbPublishError(
+                    f'staging table {staging_name} was prepared for '
+                    f'{owner.get("target_schema")}.{owner.get("target_table")}, '
+                    f'not {schema}.{table_name}'
+                )
+
+    def commit(self):
+        """The publication phase: one short transaction that verifies the
+        prepared artifacts, performs the queued source-state write, swaps
+        every staging table into place, and commits.
+
+        The source-state write goes BEFORE the swaps deliberately. It
+        touches a different table entirely, and the swaps are what take
+        ACCESS EXCLUSIVE -- so doing it first keeps it out of the exclusive
+        window without changing atomicity at all, since both are in the
+        same transaction either way. Comments must follow the swaps,
+        because they are set on the renamed relations.
+        """
+        conn = self.ensure_connection()
+        # Queued work counts. A publication plan holding only the
+        # source-state update writes to the database just as a swap does,
+        # and could previously be committed by a direct caller without ever
+        # claiming the task.
+        if self._pending_swaps or len(self.publication_plan):
+            self._require_task_lock('commit')
+        self._ensure_transaction()
+
+        self._verify_prepared_artifacts()
+
+        if len(self.publication_plan):
+            self.publication_plan.run(self.log)
+
+        swapped = []
+        # Sorted by final name. Two tasks publishing an overlapping set of
+        # tables in different orders could otherwise deadlock against each
+        # other on these locks; a deterministic global order removes that
+        # class of problem for free.
+        for schema, table_name, staging_name, rows in sorted(
+            self._pending_swaps, key=lambda item: (item[0] or '', item[1])
+        ):
+            qualified = _quoted_name(schema, table_name)
+            staging_qualified = _quoted_name(schema, staging_name)
+
+            self.log.info('publishing %s from %s', qualified, staging_qualified)
+            conn.execute(sa.text(f'drop table if exists {qualified}'))
+            # RENAME takes the new name UNQUALIFIED -- the table keeps the
+            # schema it was created in, and PostgreSQL rejects a qualified
+            # target here rather than silently moving it.
+            conn.execute(sa.text(
+                f'alter table {staging_qualified} rename to {_quote_identifier(table_name)}'
+            ))
+            # ALTER TABLE ... RENAME preserves the comment, so without this
+            # every published table would carry staging ownership metadata
+            # and look to cleanup like an abandoned artifact. Replacing it
+            # is both the safeguard and useful provenance.
+            self._set_comment(schema, table_name, build_published_comment(
+                task_name=self.task_name or '', run_token=self._run_token, rows=rows,
+            ))
+            swapped.append(f'{schema}.{table_name}' if schema else table_name)
+
+        self._commit_transaction()
+        self._pending_swaps = []
+        self.publication_plan.clear()
 
         self._committed = True
         self._committed_tables = list(self._written_tables)
         table_names = [item.full_name for item in self._committed_tables]
-        self.log.info('db publish transaction committed, tables=%s', ', '.join(table_names) or 'none')
+        self.log.info('publication committed, tables=%s', ', '.join(table_names) or 'none')
         return list(self._committed_tables)
 
     def rollback(self):
-        if self._tx is not None:
-            self._tx.rollback()
-            self._tx = None
-        elif self._conn is not None and self._conn.in_transaction():
-            self._conn.rollback()
-        else:
-            return
+        """Abort the unpublished run.
 
+        Its meaning changed with the staged model. Preparation transactions
+        are already committed, so this cannot roll them back -- it must
+        DROP this run's staging tables instead. That makes rollback capable
+        of failing for new reasons, notably a lost connection, so it never
+        raises: the original exception that caused the abort matters more
+        than a cleanup failure, and losing it would be the worse outcome.
+
+        Must run while the task advisory lock is still held. Releasing
+        first would let a waiting run start while this one is still
+        dropping tables it believes it owns.
+        """
+        self._pending_swaps = []
+        self.publication_plan.clear()
         self._committed = False
         self._committed_tables = []
         self._written_tables = []
         self._table_rows = {}
-        # Staged tables are undone by the rollback itself -- PostgreSQL's
-        # DDL is transactional, so the CREATEs vanish with everything else
-        # and there is no orphaned staging table to clean up afterwards.
-        # This list is cleared because it describes swaps that will now
-        # never happen, not because anything needs dropping.
-        self._pending_swaps = []
-        self.log.info('db publish transaction rolled back')
+
+        if self._note_connection_loss() or self._conn is None:
+            # Nothing to do and nothing possible. PostgreSQL releases the
+            # session lock on its own, and the next run cleans the orphans
+            # under its own lock.
+            self._drop_open_transaction()
+            return
+
+        self._drop_open_transaction()
+
+        for schema, staging_name in sorted(self._generated_names):
+            try:
+                self._conn.execute(
+                    sa.text(f'drop table if exists {_quoted_name(schema, staging_name)}')
+                )
+                self._conn.commit()
+            except Exception:
+                self.log.warning(
+                    'could not drop staging table %s during rollback; it will be '
+                    'cleaned by the next run of this task',
+                    staging_name, exc_info=True,
+                )
+                break
+
+        self._generated_names = set()
+        self.log.info('run aborted; staging artifacts dropped best-effort')
+
+    def _drop_open_transaction(self):
+        if self._tx is not None:
+            try:
+                self._tx.rollback()
+            except Exception:
+                self.log.warning('rolling back the open transaction failed', exc_info=True)
+            self._tx = None
+        elif self._conn is not None:
+            try:
+                if self._conn.in_transaction():
+                    self._conn.rollback()
+            except Exception:
+                self.log.warning('rolling back the open transaction failed', exc_info=True)
+
+    def cleanup_predecessor_artifacts(self, task_name):
+        """Drop staging tables left by a dead previous run of this task.
+
+        Safe without any age threshold, and that is the point. This runs
+        while holding the task's advisory lock, which means no other run of
+        this task is live -- so any staging artifact positively identified
+        as belonging to this task belongs to a predecessor that is gone.
+        No timestamp to compare, no window to tune, no race with a running
+        peer.
+
+        Positively identified is the operative phrase. A table whose
+        comment is missing, unparseable, or of an unrecognised version has
+        UNKNOWN ownership, and unknown is never dropped. That rule is what
+        keeps cleanup from becoming an outage.
+        """
+        conn = self.ensure_connection()
+        if conn.dialect.name != 'postgresql':
+            return []
+
+        rows = conn.execute(
+            sa.text(
+                'select c.relname, obj_description(c.oid, \'pg_class\') '
+                'from pg_class c join pg_namespace n on n.oid = c.relnamespace '
+                'where n.nspname = :schema and c.relkind = \'r\' '
+                'and c.relname like :pattern'
+            ),
+            {'schema': self.schema, 'pattern': f'%__{STAGING_NAME_KIND}\\_%'},
+        ).all()
+
+        dropped = []
+        for relname, comment in rows:
+            # Strict physical name AND valid ownership metadata AND a
+            # matching task -- all three, not any one. The SQL LIKE cannot
+            # express the token shapes, so the pattern check happens here.
+            tokens = owned_staging_tokens(relname)
+            if tokens is None:
+                continue
+            target_token, run_token = tokens
+
+            owner = parse_staging_comment(comment)
+            if owner is None or owner.get('task') != task_name:
+                continue
+            if run_token == self._run_token:
+                continue
+
+            # The name and the comment must agree with each other, not
+            # merely each be well-formed on its own. A comment naming a
+            # different schema, a different run, or a logical target that
+            # does not hash to this name's target token is not positive
+            # identification of this artifact.
+            if owner.get('target_schema') != self.schema:
+                continue
+            if owner.get('run') != run_token:
+                continue
+            if staging_target_token(owner.get('target_schema'), owner.get('target_table')) != target_token:
+                continue
+
+            conn.execute(sa.text(f'drop table if exists {_quoted_name(self.schema, relname)}'))
+            dropped.append(relname)
+
+        if dropped:
+            self.log.warning(
+                'dropped %s staging table(s) left by a previous run of %s: %s',
+                len(dropped), task_name, ', '.join(dropped),
+            )
+        conn.commit()
+        return dropped
 
     @property
     def committed(self):
@@ -892,6 +1560,19 @@ class DbPublisher:
         return dict(self._table_rows)
 
     def close(self):
+        # Explicit unlock before closing rather than relying on session
+        # end. Today make_engine() uses NullPool so the two are
+        # equivalent -- but the dedicated-connection contract rests on
+        # NullPool, and an explicit unlock keeps this honest if that ever
+        # changes. Failures here must not mask whatever is already
+        # unwinding.
+        if self._lock_held and self.task_name:
+            try:
+                self.release_task_lock(self.task_name)
+            except Exception:
+                self.log.warning('releasing the task advisory lock failed', exc_info=True)
+                self._lock_held = False
+
         conn, self._conn = self._conn, None
         engine, self._engine = self._engine, None
 

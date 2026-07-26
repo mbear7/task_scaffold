@@ -513,12 +513,13 @@ class Test10DynamicDbContractOnBoundPipeline(unittest.TestCase):
             @classmethod
             def preflight(cls, specs, *, schema, **kwargs):
                 pass
-            def __init__(self, *, creds, schema, logger=None):
+            def __init__(self, *, creds, schema, logger=None, **kwargs):
                 self.published = []
                 published.append(self)
             def ensure_connection(self):
                 return object()
-            def discard_pending_read(self):
+            def begin_run(self):
+                return True
                 pass
             def publish(self, payload):
                 self.published.append(payload)

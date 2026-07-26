@@ -160,7 +160,7 @@ class mdm:
     spec = PipelineSpec(db_table='ops_mdm', db_output=['id', 'name', 'status'])
 
     @classmethod
-    def run(cls, ctx, source):
+    def run(cls, ctx, *, source):
         return build_table(source).cut(*cls.spec.db_output)
 ```
 
@@ -319,10 +319,9 @@ scalars, and are left alone.
 this package. Use absolute imports (`import types` at top level resolves
 to the stdlib; a relative import inside `task_core` would not).
 
-Similarly, `task_core.file_access` as an *attribute* resolves to the
-class, not the module, because the facade re-exports a class with its
-module's name. Use `sys.modules['task_core.file_access']` if you need the
-module object.
+(`task_core.file_access` had the same problem until 0.3.1, when the class
+was renamed to `source_access`. The attribute now resolves to the module,
+as it should.)
 
 ### Remote workbook handles
 

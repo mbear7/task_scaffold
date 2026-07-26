@@ -80,7 +80,7 @@ class FakePublisher:
     def preflight(cls, specs, *, schema, **kwargs):
         pass
 
-    def __init__(self, *, creds, schema, logger=None, close_error=None, commit_error=None, rollback_error=None):
+    def __init__(self, *, creds, schema, logger=None, close_error=None, commit_error=None, rollback_error=None, **kwargs):
         self._close_error = close_error
         self._commit_error = commit_error
         self._rollback_error = rollback_error
@@ -91,7 +91,9 @@ class FakePublisher:
     def ensure_connection(self):
         return object()
 
-    def discard_pending_read(self):
+    def begin_run(self):
+
+        return True
         pass
 
     def publish(self, payload):
@@ -438,6 +440,10 @@ class Test8RollbackFailureHandling(unittest.TestCase):
 
         class FakeSourceStateConn:
             dialect = _FakeDialect()
+            invalidated = False
+
+            def in_transaction(self):
+                return False
 
             def __init__(self):
                 self.rows = {('t', 'files'): 'sig-v1'}  # seeded as already-committed, unchanged

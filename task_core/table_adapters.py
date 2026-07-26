@@ -186,9 +186,18 @@ _ADAPTERS = {
     'petl': PETL_ADAPTER,
     'pandas': PANDAS_ADAPTER,
 }
-assert set(_ADAPTERS) == VALID_TABLE_ADAPTERS  # fails at import time, not
-                                                 # at some later call, if
-                                                 # these ever drift apart
+# `if ... raise`, not `assert`. python -O strips assert statements, so the
+# stated guarantee -- that drift between the registry and the declared set
+# fails at import time rather than at some later call -- silently
+# disappeared in exactly the mode a production runner is most likely to
+# use. Confirmed directly: under -O the registry could be mutated with
+# nothing noticing.
+if set(_ADAPTERS) != VALID_TABLE_ADAPTERS:
+    raise RuntimeError(
+        f'table adapter registry has drifted from VALID_TABLE_ADAPTERS: '
+        f'registry={sorted(_ADAPTERS, key=str)}, '
+        f'declared={sorted(VALID_TABLE_ADAPTERS, key=str)}'
+    )
 
 
 def get_table_adapter(table_adapter):

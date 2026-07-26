@@ -24,6 +24,7 @@ this test caught it before reverting.
 
 import ast
 import os
+from pathlib import Path
 import sys
 import unittest
 
@@ -148,7 +149,7 @@ class TestShippedFilesDoNotNameExternalModules(unittest.TestCase):
         if not os.path.exists(gitignore):
             return []
         names = []
-        for line in open(gitignore, encoding='utf-8'):
+        for line in Path(gitignore).read_text(encoding='utf-8').splitlines():
             entry = line.strip()
             # Root-level ignored .py files: modules expected to exist at
             # runtime but supplied from outside the repository.
@@ -182,7 +183,7 @@ class TestShippedFilesDoNotNameExternalModules(unittest.TestCase):
             for candidate in candidates:
                 if os.path.abspath(candidate) == os.path.abspath(__file__):
                     continue
-                text = open(candidate, encoding='utf-8').read()
+                text = Path(candidate).read_text(encoding='utf-8')
                 for name in names:
                     if name in text:
                         offenders.setdefault(

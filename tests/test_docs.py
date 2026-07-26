@@ -18,10 +18,13 @@ assertion belongs in the text with its uncertainty stated, not here.
 """
 
 import ast
+import contextlib
+import io
 import dataclasses
 import importlib
 import inspect
 import os
+from pathlib import Path
 import re
 import unittest
 
@@ -88,9 +91,14 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
         # protocol was a deliberate correction; it must not creep back.
         self.assertLessEqual(
             {'publish', 'commit', 'rollback', 'close',
-             'discard_pending_read', 'ensure_connection'},
+             'begin_run', 'ensure_connection'},
             set(dir(DbPublisher)),
         )
+        # discard_pending_read() managed a lifecycle state the staged model
+        # makes impossible: the source-state read is a bounded phase that
+        # commits, so there is no pending read to discard. Removed rather
+        # than left as unreachable code.
+        self.assertFalse(hasattr(DbPublisher, 'discard_pending_read'))
         self.assertLessEqual(
             {'committed', 'committed_tables', 'written_tables', 'table_rows'},
             set(dir(DbPublisher)),
@@ -124,24 +132,24 @@ class Test2DocumentedLayeringHolds(unittest.TestCase):
             if name in ('runner.py', '__init__.py'):
                 continue
             with self.subTest(module=name):
-                self.assertNotIn('task_core.runner', open(path).read())
+                self.assertNotIn('task_core.runner', Path(path).read_text(encoding='utf-8'))
 
     def test_the_runner_imports_no_table_engine(self):
         # The engine-neutrality claim: every engine difference is reached
         # through the adapter interface.
-        source = open('task_core/runner.py').read()
+        source = Path('task_core/runner.py').read_text(encoding='utf-8')
         self.assertIsNone(re.search(r'^(import|from) (petl|pandas)', source, re.M))
 
     def test_only_the_documented_modules_import_an_engine(self):
         # architecture.md names these four and says why each needs one.
         allowed = {'table_adapters.py', 'db_publish.py', 'excel.py', 'db.py'}
         for name, path in self._modules():
-            if re.search(r'^(import|from) (petl|pandas)', open(path).read(), re.M):
+            if re.search(r'^(import|from) (petl|pandas)', Path(path).read_text(encoding='utf-8'), re.M):
                 with self.subTest(module=name):
                     self.assertIn(name, allowed)
 
     def test_the_runner_reaches_context_only_under_type_checking(self):
-        source = open('task_core/runner.py').read()
+        source = Path('task_core/runner.py').read_text(encoding='utf-8')
         self.assertIn('TYPE_CHECKING', source)
         module_level = [
             node for node in ast.parse(source).body
@@ -190,6 +198,60 @@ class Test3DocumentedBehaviourOfDeclaredSpecFields(unittest.TestCase):
 class Test4DocumentationFilesExistWhereLinkedFrom(unittest.TestCase):
     """A broken link in the front door is worse than no front door."""
 
+    def test_no_exported_name_shadows_its_own_submodule(self):
+        """A facade export named after its own module makes the module
+        unreachable by attribute -- `task_core.file_access` resolved to the
+        class, not the module, until 0.3.1.
+
+        Checks the whole facade rather than that one name, because the
+        trap is structural: any future `from task_core.foo import foo`
+        recreates it. types.py shadowing the stdlib is the same class of
+        problem one level up.
+        """
+        import task_core
+        package_dir = os.path.dirname(task_core.__file__)
+        submodules = {
+            name[:-3] for name in os.listdir(package_dir)
+            if name.endswith('.py') and name != '__init__.py'
+        }
+
+        shadowed = sorted(
+            name for name in submodules
+            if not isinstance(getattr(task_core, name, None), type(task_core))
+            and hasattr(task_core, name)
+        )
+        self.assertEqual(
+            shadowed, [],
+            f'facade export(s) shadow their own submodule: {shadowed}',
+        )
+
+    def test_the_architecture_document_states_the_current_version(self):
+        # It says "as of X" in two places, and both silently went stale
+        # one release after being written.
+        import task_core
+        text = Path('docs/architecture.md').read_text(encoding='utf-8')
+        claimed = set(re.findall(r'as of (\d+\.\d+\.\d+)', text))
+        claimed |= set(re.findall(r'describes (\d+\.\d+\.\d+)', text))
+        self.assertTrue(claimed, 'no version claim found to check')
+        self.assertEqual(
+            claimed, {task_core.__version__},
+            f'architecture.md claims {sorted(claimed)}, package is {task_core.__version__}',
+        )
+
+    def test_documented_pipeline_examples_use_keyword_only_resources(self):
+        # Bound resources are keyword-only. Two documented examples showed
+        # the positional form, which fails at validation -- one of them
+        # survived a correction pass because only the other was flagged.
+        for path in ('docs/architecture.md', 'docs/task-authoring.md'):
+            text = Path(path).read_text(encoding='utf-8')
+            for match in re.findall(r'def run\(cls, ctx([^)]*)\)', text):
+                with self.subTest(document=path, signature=match):
+                    if match.strip():
+                        self.assertTrue(
+                            match.lstrip().startswith(', *'),
+                            f'{path}: bound resources must be keyword-only, got "def run(cls, ctx{match})"',
+                        )
+
     def test_every_documented_path_exists(self):
         for path in ('docs/architecture.md', 'docs/task-authoring.md',
                      'docs/decisions/README.md', 'CHANGELOG.md',
@@ -207,12 +269,12 @@ class Test4DocumentationFilesExistWhereLinkedFrom(unittest.TestCase):
                 if not name.endswith('.md'):
                     continue
                 source_path = os.path.join(root, name)
-                for target in pattern.findall(open(source_path).read()):
+                for target in pattern.findall(Path(source_path).read_text(encoding='utf-8')):
                     resolved = os.path.normpath(os.path.join(root, target))
                     with self.subTest(source=source_path, target=target):
                         self.assertTrue(os.path.exists(resolved), f'{source_path} -> {target}')
 
-        for target in pattern.findall(open('README.md').read()):
+        for target in pattern.findall(Path('README.md').read_text(encoding='utf-8')):
             with self.subTest(source='README.md', target=target):
                 self.assertTrue(os.path.exists(os.path.normpath(target)))
 
@@ -233,7 +295,7 @@ class Test5TheDocumentedLevelMapMatchesRealImports(unittest.TestCase):
 
     def _documented_levels(self):
         """{module filename: level} as the architecture diagram states it."""
-        text = open('docs/architecture.md').read()
+        text = Path('docs/architecture.md').read_text(encoding='utf-8')
         start = text.index('```\nlevel 0')
         block = text[start:text.index('```', start + 3)]
 
@@ -275,7 +337,7 @@ class Test5TheDocumentedLevelMapMatchesRealImports(unittest.TestCase):
             path = self._module_path(entry)
             if path is None:
                 continue
-            for node in ast.walk(ast.parse(open(path).read())):
+            for node in ast.walk(ast.parse(Path(path).read_text(encoding='utf-8'))):
                 if not isinstance(node, ast.ImportFrom) or not node.module:
                     continue
                 if not node.module.startswith('task_core.'):
@@ -305,7 +367,14 @@ class Test6TheQuickStartActuallyRuns(unittest.TestCase):
     def test_the_example_task_runs_and_produces_both_workbooks(self):
         from examples import local_task
 
-        result = local_task.main()
+        # The example prints its results, which is the point of it as an
+        # example and noise inside a test run. Captured rather than
+        # silenced, so a failure still has the output to look at.
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            result = local_task.main()
+
+        self.assertIn('by_region.xlsx', captured.getvalue())
 
         self.assertFalse(result.skipped)
         self.assertEqual(sorted(result.excel_outputs), ['by_region.xlsx', 'deals.xlsx'])
@@ -315,7 +384,7 @@ class Test6TheQuickStartActuallyRuns(unittest.TestCase):
     def test_the_example_imports_nothing_the_quick_start_disclaims(self):
         # Actual imports, via AST -- not a text search, which would match
         # the module docstring's own promise that it needs none of these.
-        tree = ast.parse(open('examples/local_task.py').read())
+        tree = ast.parse(Path('examples/local_task.py').read_text(encoding='utf-8'))
         imported = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

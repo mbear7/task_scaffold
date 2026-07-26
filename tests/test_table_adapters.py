@@ -329,10 +329,11 @@ class Test4StabilizePreventsRepeatedTraversal(unittest.TestCase):
         class FakeDbPublisher:
             @classmethod
             def preflight(cls, specs, *, schema, **kwargs): pass
-            def __init__(self, *, creds, schema, logger=None):
+            def __init__(self, *, creds, schema, logger=None, **kwargs):
                 self.published = []
             def ensure_connection(self): return object()
-            def discard_pending_read(self): pass
+            def begin_run(self):
+                return True
             def publish(self, payload): self.published.append(payload)
             def commit(self): return []
             def rollback(self): pass

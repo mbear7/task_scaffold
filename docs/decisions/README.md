@@ -17,3 +17,5 @@ them is usually still relevant to whatever replaced them.
 | [0002](0002-keep-core-tests-independent-of-tasks.md) | Keep the core test suite independent of task files |
 | [0003](0003-gc-collect-for-remote-workbook-handles.md) | Releasing a workbook requires `gc.collect()` |
 | [0004](0004-lowercase-portable-identifiers.md) | Portable identifiers are lower-case ASCII |
+| [0005](0005-prepare-staging-outside-the-publication-transaction.md) | Prepare staging tables outside the publication transaction |
+| [0006](0006-three-rules-that-keep-cleanup-safe.md) | Three rules that keep staging cleanup safe |

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Level 2: Postgres input resource. No file_access/source_tracking
+"""Level 2: Postgres input resource. No source_access/source_tracking
 dependency -- reads via psycopg2 and task_core.db_publish (internal)
 only."""
 

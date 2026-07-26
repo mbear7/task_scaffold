@@ -18,6 +18,7 @@ them, SourceStateStore's own code crashes on construction, before ever
 reaching the logic these tests actually care about.
 """
 
+import logging
 import unittest
 
 import pandas as pd
@@ -111,6 +112,14 @@ class FakeSourceStateConn:
             return None
         raise AssertionError(f'FakeSourceStateConn: unrecognized query: {sql!r}')
 
+    def in_transaction(self):
+        # Real SQLAlchemy Connections have this, and SourceStateStore now
+        # calls it to close its own read phase. The earlier version of this
+        # fake lacked it and the resulting AttributeError was swallowed by
+        # the store's catch-all -- which is how a failed read-phase commit
+        # could report a successful comparison.
+        return self.implicit_transaction_open
+
     def commit(self):
         if self.pending_rows is not None:
             self.committed_rows = self.pending_rows
@@ -189,7 +198,10 @@ class FakeDbPublisher:
     DbPublisher's own internals would just mean two tests checking the
     same thing two different, redundant ways."""
 
-    def __init__(self, *, creds, schema, logger=None, fail_commit=False):
+    def __init__(self, *, creds, schema, logger=None, fail_commit=False, **kwargs):
+        self.publication_plan = kwargs.get('publication_plan')
+        self.identifier_policy = kwargs.get('identifier_policy')
+        self.task_name = kwargs.get('task_name')
         self.creds = creds
         self.schema = schema
         self.log = logger
@@ -207,7 +219,9 @@ class FakeDbPublisher:
     def ensure_connection(self):
         return self.conn
 
-    def discard_pending_read(self):
+    def begin_run(self):
+
+        return True
         # Mirrors the real DbPublisher.discard_pending_read(): with no
         # explicit transaction of its own, it rolls the connection back to
         # clear whatever the source-state read autobegan.
@@ -222,18 +236,27 @@ class FakeDbPublisher:
         # DbPublisher's internals, but so this file can see whether the
         # RUNNER clears the pending read before publishing, which is an
         # ordering question and therefore this file's own scope.
+        # Under the staged model a pending read is COMMITTED rather than
+        # rejected: the source-state read is its own bounded phase, and
+        # _ensure_transaction() closes it out before opening an explicit
+        # transaction. The earlier version of this fake raised here,
+        # modelling the contract discard_pending_read() used to enforce --
+        # a lifecycle state the architecture no longer has.
         if self.conn.implicit_transaction_open:
-            raise RuntimeError(
-                'This connection has already initialized a SQLAlchemy '
-                'Transaction() object via begin() or autobegin; '
-                "can't call begin() here unless rollback() or commit() "
-                'is called first.'
-            )
+            self.conn.commit()
         self._written_tables.append(payload)
         self._table_rows[payload.table_name] = len(payload.rows)
 
     def commit(self):
         self.commit_calls += 1
+        # The publication plan is part of what commit() MEANS under the
+        # staged model: the runner queues the source-state write there so
+        # it lands in the same transaction as the swaps. A fake that
+        # ignored the plan would make "did the queued work actually run"
+        # invisible -- and that is an ordering property of the runner,
+        # which is this file's scope.
+        if self.publication_plan is not None:
+            self.publication_plan.run(self.log or logging.getLogger(__name__))
         if self.fail_commit:
             self.fail_commit = False  # fail once, matching a real transient commit failure
             raise RuntimeError('simulated commit failure')
@@ -712,91 +735,6 @@ class Test3TransactionAtomicity(unittest.TestCase):
         self.assertTrue(resource.closed, 'ctx.close() did not run despite publisher.close() also failing')
 
 
-class Test6RunnerClearsThePendingSourceStateReadBeforePublishing(unittest.TestCase):
-    """run_pipelines() must call publisher.discard_pending_read() between
-    the source-state read and the pipeline loop. Nothing tested that
-    ordering, in this file or any other -- confirmed directly by deleting
-    the call from runner.py and watching all 217 tests pass.
-
-    Why it matters: SourceStateStore's ensure_table()/read_state() go
-    through publisher.ensure_connection(), never through
-    _ensure_transaction(), so a source-check-enabled run arrives at the
-    pipeline loop with an implicit transaction already autobegun on the
-    connection. The first publish() then calls _ensure_transaction() ->
-    conn.begin(), which genuine SQLAlchemy 2.0.43 rejects outright
-    (InvalidRequestError, confirmed directly against a real SQLite
-    engine). Without the discard, every source-check-enabled run that also
-    publishes a table fails on its first publish, in production,
-    immediately -- while the test suite stayed green.
-
-    This lives here rather than in tests/test_db_publish.py deliberately.
-    That file now covers DbPublisher's own discard/begin mechanics
-    (Test9), and those passed even with the runner's call deleted, because
-    the mechanism working in isolation says nothing about whether the
-    runner invokes it at the right moment -- the same distinction already
-    recorded for stabilize() in the README, and the same mistake made
-    again here before being caught.
-    """
-
-    def test_a_publish_after_the_source_state_read_succeeds(self):
-        # The end-to-end property. Fails with InvalidRequestError-shaped
-        # RuntimeError if runner.py stops discarding the pending read.
-        publishers = []
-
-        def factory(**kwargs):
-            publisher = FakeDbPublisher(**kwargs)
-            publishers.append(publisher)
-            return publisher
-
-        result = tc.run_pipelines(
-            task_name='discard_ordering',
-            build_context=lambda: make_context()[0],
-            pipelines={'p': make_pipeline(db_table='out_tbl')},
-            run_sequence=['p'],
-            output_excel=False,
-            output_db=True,
-            creds={'user': 'x', 'host': 'x', 'dbname': 'x'},
-            source_change_check=tc.SourceChangeCheckConfig(enabled=True),
-            publisher_factory=factory,
-        )
-
-        self.assertFalse(result.skipped)
-        self.assertTrue(result.db_committed)
-        self.assertEqual(len(publishers), 1)
-        self.assertEqual(publishers[0].discard_calls, 1)
-        self.assertEqual([p.table_name for p in publishers[0].written_tables], ['out_tbl'])
-
-    def test_the_discard_happens_before_the_first_publish_not_after(self):
-        # Ordering specifically, not merely "was it called at some point":
-        # a discard issued after the loop would leave publish() broken and
-        # additionally throw away the staged source-state write.
-        order = []
-
-        class OrderRecordingPublisher(FakeDbPublisher):
-            def discard_pending_read(self):
-                order.append('discard')
-                super().discard_pending_read()
-
-            def publish(self, payload):
-                order.append('publish')
-                super().publish(payload)
-
-        tc.run_pipelines(
-            task_name='discard_ordering',
-            build_context=lambda: make_context()[0],
-            pipelines={'p': make_pipeline(db_table='out_tbl')},
-            run_sequence=['p'],
-            output_excel=False,
-            output_db=True,
-            creds={'user': 'x', 'host': 'x', 'dbname': 'x'},
-            source_change_check=tc.SourceChangeCheckConfig(enabled=True),
-            publisher_factory=OrderRecordingPublisher,
-        )
-
-        self.assertEqual(order, ['discard', 'publish'])
-
-
-
 class Test7SourceStateTableIsValidatedBeforeItIsUsed(unittest.TestCase):
     """The source-state table is a real PostgreSQL table this run creates
     and writes, and it was outside both tiers of identifier validation at
@@ -885,6 +823,34 @@ class Test7SourceStateTableIsValidatedBeforeItIsUsed(unittest.TestCase):
         store = SourceStateStore(conn, schema='bsr', table='task_scaffold_meta')
         store.ensure_table()
 
+    def test_an_inspection_failure_on_postgres_is_not_swallowed(self):
+        """The original catch-all covered backends without
+        information_schema, but also swallowed permission failures,
+        connection failures, and any future incompatibility in the query --
+        and in each case the fail-early guarantee silently disappeared
+        while the run went on to fail later at the upsert anyway.
+        """
+        class _FailingInspection(Test7SourceStateTableIsValidatedBeforeItIsUsed._Conn):
+            def execute(self, statement, params=None):
+                text = str(statement).lower()
+                if 'information_schema.columns' in text:
+                    raise RuntimeError('permission denied for schema information_schema')
+                return super().execute(statement, params)
+
+        store = SourceStateStore(_FailingInspection(), schema='bsr', table='task_scaffold_meta')
+        with self.assertRaises(SourceCheckError) as caught:
+            store.ensure_table()
+        self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+
+    def test_a_non_postgres_backend_skips_inspection_without_failing(self):
+        class _Sqlite(Test7SourceStateTableIsValidatedBeforeItIsUsed._Conn):
+            def __init__(self):
+                super().__init__()
+                self.dialect = type('D', (), {'name': 'sqlite'})()
+
+        store = SourceStateStore(_Sqlite(), schema='bsr', table='task_scaffold_meta')
+        store.ensure_table()
+
     def test_a_table_that_does_not_exist_yet_is_accepted(self):
         # information_schema returns nothing for a table being created for
         # the first time; that is not a drift signal.
@@ -899,6 +865,111 @@ class _Scalar:
 
     def scalar(self):
         return self._value
+
+
+
+class Test8RunnerSkipsWhenAnotherRunHoldsTheLock(unittest.TestCase):
+    """run_pipelines() claims the task before doing anything expensive,
+    and treats losing that race as a SKIP rather than an error.
+
+    A cron overlap is expected operation, not a failure: it should compose
+    with the existing sources-unchanged skip instead of paging someone
+    every time a long run overlaps its own schedule. It is logged at
+    WARNING all the same, because chronic overlap means the schedule is
+    wrong even when each individual skip is correct.
+
+    The ordering is the property under test, not the mechanism -- which is
+    why this lives here rather than in tests/test_db_publish.py. Testing
+    begin_run() in isolation says nothing about whether the runner calls
+    it before fingerprinting, and fingerprinting is the expensive part on
+    a remote share.
+    """
+
+    def _pipeline(self, ran):
+        class pipeline:
+            spec = tc.PipelineSpec(db_table='out_tbl')
+
+            @classmethod
+            def run(cls, ctx):
+                ran.append('ran')
+                import petl as etl
+                return etl.wrap([('v',), ('x',)])
+
+        return pipeline
+
+    def _run(self, publisher_factory, ran):
+        ctx, _resources = make_context()
+        return tc.run_pipelines(
+            task_name='t',
+            build_context=lambda: ctx,
+            pipelines={'p': self._pipeline(ran)},
+            run_sequence=['p'],
+            output_excel=False, output_db=True, creds={},
+            source_change_check=tc.SourceChangeCheckConfig(
+                enabled=True, schema='bsr', table='task_scaffold_meta',
+            ),
+            publisher_factory=publisher_factory,
+        )
+
+    def test_a_lost_race_skips_without_running_any_pipeline(self):
+        ran = []
+
+        class Contended(FakeDbPublisher):
+            def begin_run(self):
+                return False
+
+        result = self._run(Contended, ran)
+
+        self.assertTrue(result.skipped)
+        self.assertEqual(
+            result.skip_reason,
+            'another run of this task holds the advisory lock',
+        )
+        self.assertEqual(ran, [], 'a pipeline ran while another run held the lock')
+
+    def test_the_claim_happens_before_fingerprints_are_collected(self):
+        # Fingerprinting is the expensive part on a remote share. Claiming
+        # after it would mean paying for it and then losing anyway -- and
+        # update_source_state() WRITES, so two runs past the read are both
+        # intending to write the same rows.
+        order = []
+
+        class Recording(FakeDbPublisher):
+            def begin_run(self):
+                order.append('begin_run')
+                return True
+
+        original = tc.task_context.collect_source_fingerprints
+
+        def recording_collect(self):
+            order.append('collect_fingerprints')
+            return original(self)
+
+        tc.task_context.collect_source_fingerprints = recording_collect
+        self.addCleanup(
+            setattr, tc.task_context, 'collect_source_fingerprints', original,
+        )
+
+        self._run(Recording, [])
+
+        self.assertEqual(order[:2], ['begin_run', 'collect_fingerprints'])
+
+    def test_a_skipped_run_still_closes_the_publisher(self):
+        # It holds no lock, but it does hold a connection.
+        publishers = []
+
+        class Contended(FakeDbPublisher):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                publishers.append(self)
+
+            def begin_run(self):
+                return False
+
+        self._run(Contended, [])
+
+        self.assertEqual(len(publishers), 1)
+        self.assertEqual(publishers[0].close_calls, 1, 'the publisher was left open')
 
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import task_core as tc
 import petl as etl
-from task_core.file_access import file_access as FileAccessImpl, NoMatchingFilesError
+from task_core.file_access import source_access as FileAccessImpl, NoMatchingFilesError
 from task_core.resources.excel import build_latest_xlsx_resource
 from task_core.resources.file_set import build_file_set_resource
 
@@ -1003,10 +1003,16 @@ class Test18RetainedWorkbookGetsTheSameGcTreatmentAsMetadata(unittest.TestCase):
     """
 
     def _counting_access(self):
-        """A file_access whose gc.collect() calls are counted, patched on
-        the module rather than the class -- note task_core.file_access the
-        ATTRIBUTE resolves to the class, not the module, because the facade
-        re-exports a class sharing its module's name."""
+        """A source_access whose gc.collect() calls are counted, patched
+        on the module.
+
+        Reached through sys.modules because that is unambiguous. Until
+        0.3.1 it was also NECESSARY: the facade re-exported a class named
+        after its own module, so task_core.file_access resolved to the
+        class and there was no way to reach the module by attribute. The
+        class is now source_access and the attribute resolves to the
+        module, but going through sys.modules costs nothing and states the
+        intent."""
         import gc
         import sys
 
@@ -1020,7 +1026,7 @@ class Test18RetainedWorkbookGetsTheSameGcTreatmentAsMetadata(unittest.TestCase):
 
         module.gc.collect = counting_collect
         self.addCleanup(setattr, module.gc, 'collect', real_collect)
-        return module.file_access(), counter
+        return module.source_access(), counter
 
     def test_open_workbook_collects_on_the_success_path(self):
         with TempDir() as tmp:
@@ -1077,7 +1083,7 @@ class Test18RetainedWorkbookGetsTheSameGcTreatmentAsMetadata(unittest.TestCase):
             module.gc.collect = introspecting_collect
             self.addCleanup(setattr, module.gc, 'collect', real_collect)
 
-            access = module.file_access()
+            access = module.source_access()
             cm = access.open_workbook(str(path), read_only=True)
             wb = cm.__enter__()
             wb.close = lambda: (_ for _ in ()).throw(RuntimeError('close failed'))

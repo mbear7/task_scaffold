@@ -18,7 +18,7 @@ resolves; this one behavior intentionally does not. See README
 message for the rationale.
 """
 
-__version__ = '0.2.12'
+__version__ = '0.3.3'
 
 from task_core.types import (
     DbRunResult,
@@ -44,7 +44,7 @@ from task_core.file_access import (
     NoMatchingFilesError,
     SelectedFile,
     build_source_access,
-    file_access,
+    source_access,
     is_excel_temp_file,
     is_hidden_file,
     is_system_file,

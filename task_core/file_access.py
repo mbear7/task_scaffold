@@ -6,7 +6,7 @@ for warning suppression -- does not need types.py or source_tracking.py
 at all.
 
 _table_ref() lives here, not in resources/excel.py, deliberately: it's
-called from inside xlsx_info(), a file_access method -- putting it in
+called from inside xlsx_info(), a source_access method -- putting it in
 resources/excel.py (level 2) would make this module (level 1) import
 upward, which the package's own layering rule forbids.
 """
@@ -101,7 +101,17 @@ def _table_ref(tbl):
         return tbl
 
 
-class file_access:
+class source_access:
+    """Local or SMB file and workbook access.
+
+    Named `file_access` until 0.3.1. The facade re-exported a class with
+    its own module's name, so `task_core.file_access` resolved to the
+    CLASS and shadowed the submodule -- the same trap as types.py
+    shadowing the stdlib, and it cost a working session a wrong turn.
+    `source_access` matches build_source_access(), which is how every
+    caller actually obtains one; nothing imported the class by name.
+    """
+
     def __init__(self, dfs_creds=None):
         self._dfs_creds = dfs_creds
         self._conn_kwargs = {}
@@ -520,11 +530,11 @@ class file_access:
         return sheets, t
 
 
-LOCAL_FILE_ACCESS = file_access()
+LOCAL_FILE_ACCESS = source_access()
 
 
 def build_source_access(dfs_creds=None):
-    return LOCAL_FILE_ACCESS if dfs_creds is None else file_access(dfs_creds=dfs_creds)
+    return LOCAL_FILE_ACCESS if dfs_creds is None else source_access(dfs_creds=dfs_creds)
 
 
 def _resolve_source_access(source_access=None):
