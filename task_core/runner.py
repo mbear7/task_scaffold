@@ -285,7 +285,18 @@ def run_pipelines(
     build_context,
     pipelines,
     run_sequence,
-    output_excel=True,
+    # Both outputs default OFF. Excel defaulted on until 0.3.6, which sat
+    # badly against decisions/0007: an aid you opt into should not be
+    # produced by a task that never asked for it. It also made the two
+    # outputs inconsistent for no reason -- output_db has always defaulted
+    # off.
+    #
+    # The failure mode of this change is silent: a caller that relied on
+    # the default stops getting workbooks with no error. Every call site in
+    # this repository passes it explicitly (checked: 57 of 57), so nothing
+    # here changes behaviour, but an external caller may need the keyword
+    # added.
+    output_excel=False,
     output_db=False,
     creds=None,
     pg_schema='bsr',
@@ -440,7 +451,7 @@ def run_pipelines(
                 )
                 return _skipped_result(
                     ctx, output_db,
-                    reason='another run of this task holds the advisory lock',
+                    reason='task_already_running',
                     source_check_enabled=source_check_enabled,
                 )
 

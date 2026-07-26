@@ -46,11 +46,24 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
 
     def test_run_pipelines_defaults_are_as_documented(self):
         params = inspect.signature(tc.run_pipelines).parameters
-        for name, default in (('output_excel', True), ('output_db', False),
+        for name, default in (('output_excel', False), ('output_db', False),
                               ('pg_schema', 'bsr'), ('force_run', False),
                               ('db_max_identifier_bytes', 63)):
             with self.subTest(parameter=name):
                 self.assertEqual(params[name].default, default)
+
+    def test_both_outputs_default_off(self):
+        """Excel defaulted on until 0.3.6, which contradicted
+        decisions/0007: an aid you opt into should not be produced by a
+        task that never asked for it.
+
+        Asserted as a pair, because the point is the consistency -- a task
+        that declares no outputs produces none, and each is switched on
+        deliberately.
+        """
+        params = inspect.signature(tc.run_pipelines).parameters
+        self.assertFalse(params['output_excel'].default)
+        self.assertFalse(params['output_db'].default)
 
     def test_required_run_pipelines_parameters_are_as_documented(self):
         params = inspect.signature(tc.run_pipelines).parameters
@@ -251,6 +264,28 @@ class Test4DocumentationFilesExistWhereLinkedFrom(unittest.TestCase):
                             match.lstrip().startswith(', *'),
                             f'{path}: bound resources must be keyword-only, got "def run(cls, ctx{match})"',
                         )
+
+    def test_the_excel_debugging_only_rule_is_stated_where_it_is_needed(self):
+        """A decision only prevents a question from recurring if it is
+        findable from wherever the question gets asked.
+
+        Excel output not being a publication target is stated in the ADR,
+        in the README's limitations, in the architecture's lifecycle, and
+        in task-authoring where an author decides what to depend on. This
+        asserts all four, because the ADR alone did not stop the topic
+        coming back.
+        """
+        expected = {
+            'docs/decisions/0007-excel-output-is-a-debugging-aid.md': 'debugging aid',
+            'README.md': 'debugging aid',
+            'docs/architecture.md': 'debugging aid',
+            'docs/task-authoring.md': 'for debugging',
+        }
+        for path, phrase in expected.items():
+            with self.subTest(document=path):
+                text = Path(path).read_text(encoding='utf-8').lower()
+                self.assertIn(phrase, text)
+                self.assertIn('0007', text, f'{path} does not link the decision')
 
     def test_every_documented_path_exists(self):
         for path in ('docs/architecture.md', 'docs/task-authoring.md',

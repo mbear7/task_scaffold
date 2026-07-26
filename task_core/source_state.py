@@ -147,8 +147,23 @@ class SourceStateStore:
             ) from exc
 
         if not actual:
-            # The table does not exist yet -- this run is creating it.
-            return
+            # NOT 'the table does not exist yet'. That comment was wrong:
+            # this runs immediately after ensure_table()'s
+            # `create table if not exists` on the same connection, so
+            # PostgreSQL makes the new table's columns visible to this very
+            # query. An empty result therefore means something anomalous --
+            # an identifier-case mismatch against information_schema's
+            # stored values, a search_path oddity, or restricted visibility
+            # of the catalog.
+            #
+            # That is a state in which this check cannot see the table it is
+            # about to write to, which is exactly what it exists to refuse.
+            raise SourceCheckError(
+                f'source-state table {self._full_name} reports no columns in '
+                f'information_schema immediately after create-if-not-exists. The '
+                f'table cannot be inspected, so its compatibility cannot be '
+                f'confirmed; check the schema name\'s case and the search_path.'
+            )
 
         missing = self._EXPECTED_COLUMNS - actual
         if missing:

@@ -226,7 +226,7 @@ excluded by default.
 | `build_context` | required | Callable returning a `task_context`. |
 | `pipelines` | required | `{name: pipeline_class_or_binding}`. |
 | `run_sequence` | required | Ordered list of names to execute. |
-| `output_excel` | `True` | Whether `excel_name` outputs are written. |
+| `output_excel` | `False` | Whether `excel_name` outputs are written. Off by default — Excel is a debugging aid you switch on. |
 | `output_db` | `False` | Whether `db_table` outputs are published. |
 | `creds` | `None` | PostgreSQL credentials. Required only when the run actually uses PostgreSQL — a declared `db_table` or enabled source tracking. |
 | `pg_schema` | `'bsr'` | Target schema. |
@@ -267,6 +267,27 @@ Use `force_run=True` to run regardless.
 
 
 ## Limitations
+
+### Excel output is for debugging
+
+Workbooks are written immediately, inside the pipeline loop. There is no
+staging, no temporary file and no rename, and there never will be — see
+[decisions/0007](decisions/0007-excel-output-is-a-debugging-aid.md).
+
+What follows for you as a task author:
+
+- A run that fails partway leaves workbooks from the pipelines that
+  already succeeded. That is expected; delete them or re-run.
+- Those files can disagree with the database, because a run can write
+  workbooks and then fail before publishing.
+- **Do not build anything that reads these files programmatically.** If a
+  downstream process needs the data, publish a table and let it read that.
+  A job consuming a workbook this scaffold wrote has no delivery
+  guarantees at all.
+
+Two pipelines still may not declare the same `excel_name` — that check is
+about a task declaring something incoherent, not about publication
+guarantees.
 
 ### Published tables are dropped and recreated
 

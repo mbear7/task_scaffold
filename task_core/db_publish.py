@@ -413,7 +413,10 @@ class IdentifierPolicy:
     max_identifier_bytes: int = MAX_IDENTIFIER_BYTES
 
     def __post_init__(self):
-        if not isinstance(self.max_identifier_bytes, int) or self.max_identifier_bytes < 1:
+        # `type(...) is int`, not isinstance: bool subclasses int, so
+        # IdentifierPolicy(True) was accepted and produced an effective
+        # one-byte limit rather than rejecting the configuration.
+        if type(self.max_identifier_bytes) is not int or self.max_identifier_bytes < 1:
             raise DbPublishError(
                 f'max_identifier_bytes must be a positive integer, '
                 f'got {self.max_identifier_bytes!r}'
@@ -436,7 +439,16 @@ _COMMENT_MARKER = 'task_core'
 
 
 def advisory_lock_key(task_name):
-    """(namespace, key) for pg_try_advisory_lock's two-int form."""
+    """(namespace, key) for pg_try_advisory_lock's two-int form.
+
+    32 bits of task-name hash. A collision means two DIFFERENT tasks
+    serialize against each other -- safe, since neither can corrupt the
+    other's data, but confusing to diagnose: one task appears to skip
+    because 'another run is in progress' when the culprit is a different
+    task entirely. Birthday-bounded far beyond any plausible number of
+    tasks, so not worth widening; worth knowing before someone spends an
+    afternoon on it.
+    """
     digest = hashlib.blake2b(task_name.encode('utf-8'), digest_size=4).digest()
     # Signed 32-bit, which is what PostgreSQL's int4 accepts.
     key = int.from_bytes(digest, 'big', signed=True)
@@ -483,8 +495,11 @@ def build_published_comment(*, task_name, run_token, rows):
     )
 
 
+# \Z, not $. Python's `$` also matches immediately before a trailing
+# newline, and a quoted PostgreSQL identifier may contain one -- so
+# 'x__stg_deadbeef_deadbeef\n' satisfied a rule advertised as exact.
 _STAGING_NAME_SUFFIX_RE = re.compile(
-    rf'__{STAGING_NAME_KIND}_([0-9a-f]{{{_STAGING_TOKEN_HEX}}})_([0-9a-f]{{{_RUN_TOKEN_HEX}}})$'
+    rf'__{STAGING_NAME_KIND}_([0-9a-f]{{{_STAGING_TOKEN_HEX}}})_([0-9a-f]{{{_RUN_TOKEN_HEX}}})\Z'
 )
 
 
@@ -644,7 +659,7 @@ class DbPublisher:
         type_infer_sample_size=5000,
         identifier_policy=None,
         publication_plan=None,
-        task_name=None,
+        task_name,
     ):
         self.creds = validate_pg_creds(
             creds,
@@ -669,12 +684,37 @@ class DbPublisher:
         # member. Mutable and populated after construction because the
         # fingerprints do not exist until collection has run.
         self.publication_plan = publication_plan if publication_plan is not None else PublicationPlan()
+        # Validated here, not discovered at publication. An empty task
+        # name derives a lock key and stages successfully, then writes an
+        # ownership comment that parse_staging_comment() REJECTS -- so the
+        # run reports its own staging artifact as unowned and fails at
+        # commit(), after every pipeline has run. It need not be a portable
+        # identifier; it only has to be a non-empty stable string.
+        # REQUIRED, and required to be usable. None was permitted on the
+        # theory that such a publisher 'does not participate in locking or
+        # ownership' -- which was simply false: begin_run() derived an
+        # advisory key from '' and staging wrote "task": "" into ownership
+        # metadata that parse_staging_comment() then REJECTS, so the run
+        # prepared successfully and declared its own artifact unowned at
+        # publication. The staged PostgreSQL lifecycle cannot operate
+        # without a task identity; pretending otherwise only moved the
+        # failure later.
+        #
+        # It need not be a portable identifier -- it never becomes a SQL
+        # identifier -- only a non-empty stable string.
+        if not isinstance(task_name, str) or not task_name.strip():
+            raise DbPublishError(
+                f'task_name must be a non-empty string, got {task_name!r}. It '
+                f'identifies this run\'s staging artifacts in their ownership '
+                f'metadata and derives its advisory lock key; an unusable one '
+                f'fails only at publication.'
+            )
         self.task_name = task_name
         self._engine = None
         self._conn = None
         self._tx = None
         self._connection_lost = False
-        self._lock_held = False
+        self._locked_task_name = None
         self._written_tables = []
         self._pending_swaps = []
         self._run_token = new_run_token()
@@ -727,7 +767,7 @@ class DbPublisher:
 
     def mark_connection_lost(self):
         self._connection_lost = True
-        self._lock_held = False
+        self._locked_task_name = None
 
     def _note_connection_loss(self):
         """Transition to the terminal state if the session is already gone.
@@ -757,7 +797,7 @@ class DbPublisher:
 
     # -- task advisory lock -------------------------------------------
 
-    def try_acquire_task_lock(self, task_name):
+    def try_acquire_task_lock(self):
         """Session-level pg_try_advisory_lock. True if this run may proceed.
 
         try, not the blocking form: a five-minute schedule on a
@@ -778,34 +818,41 @@ class DbPublisher:
             # No advisory locks outside PostgreSQL. Treated as acquired so
             # non-PostgreSQL test backends exercise the rest of the flow;
             # production is PostgreSQL by construction.
-            self._lock_held = True
+            self._locked_task_name = self.task_name
             return True
 
-        namespace, key = advisory_lock_key(task_name)
+        namespace, key = advisory_lock_key(self.task_name)
         acquired = bool(
             conn.execute(
                 sa.text('select pg_try_advisory_lock(:ns, :key)'),
                 {'ns': namespace, 'key': key},
             ).scalar()
         )
-        self._lock_held = acquired
+        # The identity, not a flag. A boolean only proved that SOME lock
+        # was held, so a publisher holding task_a's lock would happily
+        # clean task_b's artifacts -- the exact cross-run risk the guard
+        # exists to remove, reached through a direct caller instead.
+        self._locked_task_name = self.task_name if acquired else None
         return acquired
 
-    def release_task_lock(self, task_name):
+    def release_task_lock(self):
         """Explicit unlock before closing, rather than relying on session
         end. Today make_engine() uses NullPool so the two are equivalent --
         but the whole dedicated-connection contract rests on NullPool, and
         an explicit unlock keeps this honest if that ever changes.
         """
-        if not self._lock_held or self._conn is None or self._note_connection_loss():
-            self._lock_held = False
+        if not self.lock_held or self._conn is None or self._note_connection_loss():
+            self._locked_task_name = None
             return
 
         if self._conn.dialect.name != 'postgresql':
-            self._lock_held = False
+            self._locked_task_name = None
             return
 
-        namespace, key = advisory_lock_key(task_name)
+        # Unlocks the task actually locked, not one supplied by the caller.
+        # release_task_lock('task_b') used to clear the flag while task_a
+        # stayed locked for the rest of the session.
+        namespace, key = advisory_lock_key(self._locked_task_name)
         try:
             self._conn.execute(
                 sa.text('select pg_advisory_unlock(:ns, :key)'),
@@ -813,11 +860,15 @@ class DbPublisher:
             )
             self._conn.commit()
         finally:
-            self._lock_held = False
+            self._locked_task_name = None
 
     @property
     def lock_held(self):
-        return self._lock_held
+        return self._locked_task_name is not None
+
+    @property
+    def locked_task_name(self):
+        return self._locked_task_name
 
     def _ensure_transaction(self):
         conn = self.ensure_connection()
@@ -864,10 +915,10 @@ class DbPublisher:
         # honour.
         self._effective_identifier_limit()
 
-        if not self.try_acquire_task_lock(self.task_name or ''):
+        if not self.try_acquire_task_lock():
             return False
 
-        self.cleanup_predecessor_artifacts(self.task_name or '')
+        self.cleanup_predecessor_artifacts()
         return True
 
     def _require_task_lock(self, action):
@@ -882,12 +933,20 @@ class DbPublisher:
         conn = self.ensure_connection()
         if conn.dialect.name != 'postgresql':
             return
-        if not self._lock_held:
+        if self._locked_task_name is None:
             raise DbPublishError(
                 f'cannot {action}: this publisher does not hold the task '
                 f'advisory lock. Call begin_run() first -- without it, another '
                 f'run of the same task may be preparing or publishing '
                 f'concurrently, and predecessor cleanup is not safe.'
+            )
+        # Identity, not presence. Holding SOME lock is not authority over
+        # THIS task's artifacts.
+        if self._locked_task_name != self.task_name:
+            raise DbPublishInvariantError(
+                f'internal invariant violated -- cannot {action}: the held '
+                f'advisory lock is for task {self._locked_task_name!r}, but this '
+                f'publisher is configured for {self.task_name!r}'
             )
 
     @classmethod
@@ -1274,7 +1333,7 @@ class DbPublisher:
         out of sync.
         """
         comment = build_staging_comment(
-            task_name=self.task_name or '',
+            task_name=self.task_name,
             run_token=self._run_token,
             schema=payload.schema,
             table_name=payload.table_name,
@@ -1338,7 +1397,7 @@ class DbPublisher:
                     f'this run\'s ownership metadata; refusing to publish it over '
                     f'{table_name!r}'
                 )
-            if owner.get('run') != self._run_token or owner.get('task') != (self.task_name or ''):
+            if owner.get('run') != self._run_token or owner.get('task') != self.task_name:
                 raise DbPublishError(
                     f'staging table {staging_name} belongs to task '
                     f'{owner.get("task")!r} run {owner.get("run")!r}, not to this run'
@@ -1400,7 +1459,7 @@ class DbPublisher:
             # and look to cleanup like an abandoned artifact. Replacing it
             # is both the safeguard and useful provenance.
             self._set_comment(schema, table_name, build_published_comment(
-                task_name=self.task_name or '', run_token=self._run_token, rows=rows,
+                task_name=self.task_name, run_token=self._run_token, rows=rows,
             ))
             swapped.append(f'{schema}.{table_name}' if schema else table_name)
 
@@ -1451,9 +1510,17 @@ class DbPublisher:
                 )
                 self._conn.commit()
             except Exception:
+                # break, not continue. A failed DROP leaves the PostgreSQL
+                # transaction in an aborted state, so every subsequent
+                # statement fails too -- continuing would produce a cascade
+                # of misleading errors rather than dropping more tables.
+                # 'Drop as many as possible' is the plausible-looking edit
+                # here; it does not work without an intervening rollback,
+                # and the orphans are safely the next run's problem either
+                # way.
                 self.log.warning(
-                    'could not drop staging table %s during rollback; it will be '
-                    'cleaned by the next run of this task',
+                    'could not drop staging table %s during rollback; it and any '
+                    'remaining ones will be cleaned by the next run of this task',
                     staging_name, exc_info=True,
                 )
                 break
@@ -1475,7 +1542,7 @@ class DbPublisher:
             except Exception:
                 self.log.warning('rolling back the open transaction failed', exc_info=True)
 
-    def cleanup_predecessor_artifacts(self, task_name):
+    def cleanup_predecessor_artifacts(self):
         """Drop staging tables left by a dead previous run of this task.
 
         Safe without any age threshold, and that is the point. This runs
@@ -1490,6 +1557,13 @@ class DbPublisher:
         UNKNOWN ownership, and unknown is never dropped. That rule is what
         keeps cleanup from becoming an outage.
         """
+        # Enforced here, not merely by begin_run() calling it in the right
+        # order. This method drops tables; leaving a load-bearing invariant
+        # to caller ordering means a direct caller can delete another live
+        # run's artifacts -- confirmed directly, it dropped a staging table
+        # with lock_held False.
+        self._require_task_lock('clean up predecessor staging artifacts')
+
         conn = self.ensure_connection()
         if conn.dialect.name != 'postgresql':
             return []
@@ -1501,7 +1575,11 @@ class DbPublisher:
                 'where n.nspname = :schema and c.relkind = \'r\' '
                 'and c.relname like :pattern'
             ),
-            {'schema': self.schema, 'pattern': f'%__{STAGING_NAME_KIND}\\_%'},
+            # Every underscore escaped. Leaving the leading two unescaped
+            # made them single-character wildcards, so the scan also
+            # returned names like 'xastg_...'. The strict regex filtered
+            # them out anyway, but a pattern should say what it means.
+            {'schema': self.schema, 'pattern': f'%\\_\\_{STAGING_NAME_KIND}\\_%'},
         ).all()
 
         dropped = []
@@ -1515,7 +1593,7 @@ class DbPublisher:
             target_token, run_token = tokens
 
             owner = parse_staging_comment(comment)
-            if owner is None or owner.get('task') != task_name:
+            if owner is None or owner.get('task') != self.task_name:
                 continue
             if run_token == self._run_token:
                 continue
@@ -1538,7 +1616,7 @@ class DbPublisher:
         if dropped:
             self.log.warning(
                 'dropped %s staging table(s) left by a previous run of %s: %s',
-                len(dropped), task_name, ', '.join(dropped),
+                len(dropped), self.task_name, ', '.join(dropped),
             )
         conn.commit()
         return dropped
@@ -1566,12 +1644,12 @@ class DbPublisher:
         # NullPool, and an explicit unlock keeps this honest if that ever
         # changes. Failures here must not mask whatever is already
         # unwinding.
-        if self._lock_held and self.task_name:
+        if self.lock_held:
             try:
-                self.release_task_lock(self.task_name)
+                self.release_task_lock()
             except Exception:
                 self.log.warning('releasing the task advisory lock failed', exc_info=True)
-                self._lock_held = False
+                self._locked_task_name = None
 
         conn, self._conn = self._conn, None
         engine, self._engine = self._engine, None

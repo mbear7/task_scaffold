@@ -100,6 +100,21 @@ database.
   stays with tasks. Putting it here would make every task pay for one
   task's rule.
 
+## The extension seam, and the plan for it
+
+`publisher_factory` now takes six parameters. The 0.3.0 break that added
+three was deliberate and handled — minor bump, changelog, migration note —
+but the seam is visibly under growth pressure, and `IdentifierPolicy` was
+itself created to stop two independently-defaulted integers drifting
+apart.
+
+**The next parameter that wants in should not be a parameter.** Fold the
+lot into one frozen `PublisherConfig` and the signature stops breaking
+forever. Doing it now would be a gratuitous second break for no present
+benefit; doing it as part of the third addition costs nothing extra. This
+is written down so that addition triggers the change rather than another
+parameter.
+
 ## Rejected
 
 **Keeping one transaction and accepting the duration.** Defensible while

@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.3.3. This describes the present system, not
+How `task_core` works as of 0.3.7. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -221,6 +221,19 @@ If nothing changed and `force_run` is not set, the run returns
 The state table is written in the same transaction as the published
 tables, so a failed run does not advance it. A retry after a failure sees
 the same sources as changed and runs again.
+
+
+## Excel output
+
+Written immediately, inside the pipeline loop, with no staging and no
+temporary files. A workbook exists as soon as its pipeline has produced
+it, whether or not the rest of the run succeeds.
+
+This is deliberate and permanent: Excel output is a local debugging aid,
+not a publication target, and does not get the guarantees the database
+path has. See
+[decisions/0007](decisions/0007-excel-output-is-a-debugging-aid.md) for
+why the asymmetry is the design rather than an unfinished half of it.
 
 
 ## Database publication

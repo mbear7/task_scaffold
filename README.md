@@ -8,6 +8,11 @@ tables, do both, or neither. A task with no declared outputs still runs its
 pipelines and returns their results, which is a reasonable way to use it
 for computation that another process consumes.
 
+**PostgreSQL tables are the production output. Excel output is a local
+debugging aid** — no staging, no temporary files, no renames, and no
+transactional relationship with database publication. See
+[decisions/0007](docs/decisions/0007-excel-output-is-a-debugging-aid.md).
+
 It exists to remove the parts every such task repeats: opening remote
 workbooks and closing their handles reliably, deciding whether the sources
 changed since last time, running a sequence of pipelines, exporting
@@ -94,8 +99,8 @@ wrapper should inspect rather than relying on the exit code:
 ```python
 result = main()
 
-result.skipped            # True when sources were unchanged
-result.skip_reason
+result.skipped            # True when execution was intentionally skipped
+result.skip_reason        # 'sources_unchanged' | 'task_already_running'
 result.pipeline_rows      # {pipeline_name: row_count}
 result.excel_outputs      # workbooks written
 result.db.committed       # whether the publication transaction committed
@@ -135,6 +140,11 @@ Known constraints that will affect you, in rough order of how likely they
 are to matter. Each is expanded in
 [task-authoring.md](docs/task-authoring.md#limitations).
 
+- **Excel output is for debugging, not production.** A failed run may
+  leave workbooks from pipelines that succeeded before it failed, and those
+  files may disagree with the database. Nothing downstream may read them
+  programmatically; if something needs the data, it reads the published
+  table.
 - **Published tables are dropped and recreated on every run.** Column
   types are inferred from the data, so a table's schema can change between
   runs. Grants are not preserved, and a dependent view makes the publish

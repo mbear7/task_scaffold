@@ -19,3 +19,4 @@ them is usually still relevant to whatever replaced them.
 | [0004](0004-lowercase-portable-identifiers.md) | Portable identifiers are lower-case ASCII |
 | [0005](0005-prepare-staging-outside-the-publication-transaction.md) | Prepare staging tables outside the publication transaction |
 | [0006](0006-three-rules-that-keep-cleanup-safe.md) | Three rules that keep staging cleanup safe |
+| [0007](0007-excel-output-is-a-debugging-aid.md) | Excel output is a debugging aid, not a publication target |

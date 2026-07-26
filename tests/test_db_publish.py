@@ -219,7 +219,7 @@ def make_publisher_with_fake_engine():
     the first place: set ._engine directly before ensure_connection() is
     ever called, so its own `if self._engine is None` lazy-init just uses
     the fake."""
-    publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr')
+    publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t')
     engine = FakeSqlaEngine()
     publisher._engine = engine
     return publisher, engine
@@ -367,15 +367,15 @@ class Test4ChunkSizeValidation(unittest.TestCase):
     def test_zero_is_rejected(self):
         from task_core.db_publish import DbPublishError
         with self.assertRaises(DbPublishError):
-            DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', chunk_size=0)
+            DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t', chunk_size=0)
 
     def test_negative_is_rejected(self):
         from task_core.db_publish import DbPublishError
         with self.assertRaises(DbPublishError):
-            DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', chunk_size=-1)
+            DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t', chunk_size=-1)
 
     def test_positive_still_works(self):
-        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', chunk_size=100)
+        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t', chunk_size=100)
         self.assertEqual(publisher.chunk_size, 100)
 
 
@@ -399,7 +399,7 @@ class Test5CloseIsolatesItsOwnCleanupSteps(unittest.TestCase):
             def dispose(self):
                 self.dispose_calls += 1
 
-        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr')
+        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t')
         engine = TrackedEngine()
         publisher._engine = engine
         publisher._conn = FailingConn()
@@ -422,7 +422,7 @@ class Test5CloseIsolatesItsOwnCleanupSteps(unittest.TestCase):
             def dispose(self):
                 raise RuntimeError('engine dispose failed')
 
-        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr')
+        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t')
         conn = TrackedConn()
         publisher._conn = conn
         publisher._engine = FailingEngine()
@@ -441,7 +441,7 @@ class Test5CloseIsolatesItsOwnCleanupSteps(unittest.TestCase):
             def dispose(self):
                 raise RuntimeError('engine dispose failed')
 
-        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr')
+        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t')
         publisher._conn = FailingConn()
         publisher._engine = FailingEngine()
 
@@ -457,13 +457,13 @@ class Test5CloseIsolatesItsOwnCleanupSteps(unittest.TestCase):
             def dispose(self):
                 pass
 
-        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr')
+        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t')
         publisher._conn = GoodConn()
         publisher._engine = GoodEngine()
         publisher.close()  # must not raise
 
     def test_close_with_nothing_ever_connected_does_not_raise(self):
-        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr')
+        publisher = DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t')
         publisher.close()
 
 
@@ -1845,7 +1845,7 @@ class Test18ConnectionLossIsFatal(unittest.TestCase):
 
     def test_a_lost_connection_drops_the_lock_flag(self):
         publisher = self._publisher()
-        publisher.try_acquire_task_lock('demo_task')
+        publisher.try_acquire_task_lock()
         self.assertTrue(publisher.lock_held)
 
         publisher.mark_connection_lost()
@@ -2110,7 +2110,7 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
         publisher.begin_run()
         publisher.mark_connection_lost()
 
-        publisher.release_task_lock('demo_task')
+        publisher.release_task_lock()
         self.assertEqual([kind for kind, _ in conn.lock_calls], ['acquire'])
 
 
@@ -2444,7 +2444,7 @@ class Test21CleanupNeverReconnectsAfterSessionLoss(unittest.TestCase):
         lost = self._Invalidated()
         publisher._conn = lost
 
-        publisher.release_task_lock('demo_task')
+        publisher.release_task_lock()
 
         self.assertEqual(lost.statements, [])
         self.assertFalse(publisher.lock_held)
@@ -2545,6 +2545,194 @@ class Test23ProtocolAndTransactionRefinements(unittest.TestCase):
             source.index('self._ensure_transaction()'),
             'the preparation transaction opens before type inference runs',
         )
+
+
+
+class Test24InvariantsEnforcedRatherThanAssumed(unittest.TestCase):
+    """Guarantees that held only because callers happened to do the right
+    thing, or that were advertised as exact and were not."""
+
+    def test_cleanup_refuses_without_the_task_lock(self):
+        """begin_run() calls cleanup in the right order, so the runner path
+        was safe -- but the method drops tables and could be called
+        directly, which would delete another live run's artifacts.
+        Confirmed directly: it dropped a staging table with lock_held
+        False. A load-bearing invariant left to caller ordering is not
+        enforced.
+        """
+        conn = Test19TaskAdvisoryLockAndPredecessorCleanup._Conn()
+        publisher = DbPublisher(creds=_CREDS, schema='bsr', task_name='demo_task')
+        publisher._conn = conn
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.cleanup_predecessor_artifacts()
+        self.assertIn('advisory lock', str(caught.exception))
+        self.assertEqual(conn.dropped, [])
+
+    def test_an_unusable_task_name_is_rejected_at_construction(self):
+        """An empty task name derived a lock key and staged successfully,
+        then wrote an ownership comment that parse_staging_comment()
+        REJECTS -- so the run reported its own artifact as unowned and
+        failed at commit(), after every pipeline had already run.
+        """
+        for bad in ('', '   ', 123, []):
+            with self.subTest(task_name=bad):
+                with self.assertRaises(DbPublishError):
+                    DbPublisher(creds=_CREDS, schema='bsr', task_name=bad)
+
+        # None is no longer allowed either. This test used to assert it
+        # was, on the stated grounds that such a publisher 'does not
+        # participate in locking or ownership' -- which was false:
+        # begin_run() derived an advisory key from '' and staging wrote
+        # "task": "" into ownership metadata its own parser rejects. The
+        # claim was wrong in the test and in the code it described.
+        with self.assertRaises(DbPublishError):
+            DbPublisher(creds=_CREDS, schema='bsr', task_name=None)
+
+    def test_a_task_name_need_not_be_a_portable_identifier(self):
+        # It only has to be a non-empty stable string; it never becomes a
+        # SQL identifier.
+        DbPublisher(creds=_CREDS, schema='bsr', task_name='Отчёт по HR / weekly')
+
+    def test_the_staging_name_rule_is_literally_exact(self):
+        """`$` also matches immediately before a trailing newline, and a
+        quoted PostgreSQL identifier may contain one -- so a name
+        advertised as exactly `__stg_<8 hex>_<8 hex>` accepted a trailing
+        newline.
+        """
+        from task_core.db_publish import owned_staging_tokens
+
+        self.assertIsNotNone(owned_staging_tokens('x__stg_deadbeef_cafebabe'))
+        for rejected in ('x__stg_deadbeef_cafebabe\n',
+                         'x__stg_deadbeef_cafebabe ',
+                         'x__stg_deadbeef_cafebabe\t'):
+            with self.subTest(relname=repr(rejected)):
+                self.assertIsNone(owned_staging_tokens(rejected))
+
+    def test_a_boolean_identifier_limit_is_rejected(self):
+        # bool subclasses int, so isinstance() accepted True and produced
+        # an effective one-byte limit instead of rejecting the config.
+        from task_core.db_publish import IdentifierPolicy
+
+        for bad in (True, False, 1.0, '63', None, 0, -1):
+            with self.subTest(value=bad):
+                with self.assertRaises(DbPublishError):
+                    IdentifierPolicy(bad)
+
+        self.assertEqual(IdentifierPolicy(63).max_identifier_bytes, 63)
+
+
+
+class Test25TheLockProvesIdentityNotMerelyPresence(unittest.TestCase):
+    """`_lock_held` was a boolean, while the lock methods took an arbitrary
+    task name. Holding SOME lock is not authority over THIS task's
+    artifacts.
+
+    Confirmed directly: a publisher configured for task_a, holding task_a's
+    lock, dropped task_b's staging table on request -- the cross-run
+    cleanup risk the guard exists to remove, reached through a direct
+    caller rather than through ordering. And release_task_lock('task_b')
+    cleared the flag while task_a stayed locked for the rest of the
+    session.
+
+    The methods no longer take a task name at all; they use self.task_name,
+    and the publisher records which task it actually locked.
+    """
+
+    def _publisher(self, task_name='task_a'):
+        conn = Test19TaskAdvisoryLockAndPredecessorCleanup._Conn()
+        publisher = DbPublisher(creds=_CREDS, schema='bsr', task_name=task_name)
+        publisher._conn = conn
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        return publisher, conn
+
+    def test_the_lock_records_which_task_it_is_for(self):
+        publisher, _conn = self._publisher()
+        self.assertIsNone(publisher.locked_task_name)
+
+        publisher.begin_run()
+        self.assertEqual(publisher.locked_task_name, 'task_a')
+        self.assertTrue(publisher.lock_held)
+
+    def test_the_lock_methods_take_no_task_argument(self):
+        # The signature is the fix: a caller cannot name a task other than
+        # the one the publisher is configured for, because there is nowhere
+        # to name it.
+        import inspect
+        for name in ('try_acquire_task_lock', 'release_task_lock',
+                     'cleanup_predecessor_artifacts'):
+            with self.subTest(method=name):
+                params = list(inspect.signature(getattr(DbPublisher, name)).parameters)
+                self.assertEqual(params, ['self'], f'{name} still accepts a task name')
+
+    def test_a_mismatched_lock_identity_is_an_invariant_violation(self):
+        publisher, _conn = self._publisher()
+        publisher.begin_run()
+        publisher._locked_task_name = 'task_b'   # only reachable by tampering
+
+        with self.assertRaises(DbPublishInvariantError) as caught:
+            publisher.cleanup_predecessor_artifacts()
+        self.assertIn('task_b', str(caught.exception))
+
+    def test_releasing_unlocks_the_task_that_was_actually_locked(self):
+        publisher, conn = self._publisher()
+        publisher.begin_run()
+        publisher.release_task_lock()
+
+        from task_core.db_publish import advisory_lock_key
+        released = [params for kind, params in conn.lock_calls if kind == 'release']
+        self.assertEqual(len(released), 1)
+        namespace, key = advisory_lock_key('task_a')
+        self.assertEqual(released[0], {'ns': namespace, 'key': key})
+        self.assertFalse(publisher.lock_held)
+
+    def test_a_failed_acquisition_records_no_identity(self):
+        conn = Test19TaskAdvisoryLockAndPredecessorCleanup._Conn(lock_granted=False)
+        publisher = DbPublisher(creds=_CREDS, schema='bsr', task_name='task_a')
+        publisher._conn = conn
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+
+        self.assertFalse(publisher.begin_run())
+        self.assertIsNone(publisher.locked_task_name)
+
+
+class Test26TaskNameIsRequiredAndUsable(unittest.TestCase):
+    """The staged PostgreSQL lifecycle cannot operate without a task
+    identity, so permitting None only moved the failure later.
+
+    Confirmed directly: with task_name=None, begin_run() derived an
+    advisory key from '', staging wrote "task": "" into ownership metadata,
+    and parse_staging_comment() rejected it -- so the run prepared
+    successfully and declared its own artifact unowned at publication.
+    """
+
+    def test_task_name_is_required(self):
+        import inspect
+        parameter = inspect.signature(DbPublisher.__init__).parameters['task_name']
+        self.assertIs(parameter.default, inspect.Parameter.empty)
+
+    def test_none_and_empty_are_both_rejected(self):
+        for bad in (None, '', '   ', 123, []):
+            with self.subTest(task_name=bad):
+                with self.assertRaises(DbPublishError):
+                    DbPublisher(creds=_CREDS, schema='bsr', task_name=bad)
+
+    def test_a_usable_name_round_trips_through_ownership_metadata(self):
+        # The property that was actually broken: a publisher's own comment
+        # must parse back as its own.
+        from task_core.db_publish import build_staging_comment, parse_staging_comment
+
+        for name in ('hr_task', 'Отчёт по HR / weekly', 'a'):
+            with self.subTest(task_name=name):
+                publisher = DbPublisher(creds=_CREDS, schema='bsr', task_name=name)
+                comment = build_staging_comment(
+                    task_name=publisher.task_name, run_token='deadbeef',
+                    schema='bsr', table_name='t',
+                )
+                parsed = parse_staging_comment(comment)
+                self.assertIsNotNone(parsed, 'a publisher wrote metadata it cannot read back')
+                self.assertEqual(parsed['task'], name)
 
 
 

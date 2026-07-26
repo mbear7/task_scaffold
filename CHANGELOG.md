@@ -12,6 +12,136 @@ chronologically rather than by release.
 ## Unreleased
 
 
+## 0.3.7
+
+### Fixed
+- **The advisory lock recorded presence, not identity.** `_lock_held` was
+  a boolean while the lock methods took an arbitrary task name, so a
+  publisher holding task A's lock dropped task B's staging table on
+  request — confirmed directly. `release_task_lock('task_b')` likewise
+  cleared the flag while task A stayed locked for the session.
+
+  `try_acquire_task_lock()`, `release_task_lock()` and
+  `cleanup_predecessor_artifacts()` no longer take a task name; they use
+  `self.task_name`, the publisher records which task it actually locked,
+  and `_require_task_lock()` verifies the held identity.
+
+- **`task_name` is now required and must be non-empty.** `None` was
+  permitted on the theory that such a publisher does not participate in
+  locking or ownership — false: `begin_run()` derived a key from `''` and
+  staging wrote `"task": ""` into metadata `parse_staging_comment()`
+  rejects, so the run prepared successfully and declared its own artifact
+  unowned at publication. The test asserting `None` was allowed carried
+  the same false claim and is rewritten.
+
+- **`skip_reason` for a lock collision is now the token
+  `'task_already_running'`**, matching `'sources_unchanged'` rather than
+  being a sentence. `skip_reason` exists to be compared against.
+
+- `README.md` documents both skip reasons; it previously described
+  `skipped` as meaning sources were unchanged.
+
+### Migration
+- Custom publishers: `DbPublisher(...)` requires `task_name`, and the
+  three lock methods lost their task argument. Both fail loudly.
+
+
+## 0.3.6
+
+### Changed
+- **`output_excel` now defaults to `False`**, matching `output_db`. A task
+  that declares no outputs produces none, and each output is switched on
+  deliberately.
+
+  It defaulted to `True`, which contradicted `docs/decisions/0007` in the
+  one place a reader would notice: an aid you opt into should not be
+  produced by a task that never asked for it.
+
+  Patch, not minor: one default, zero affected call sites in this
+  repository. The version number is not what warns anyone here — the
+  migration note below is.
+
+  **Migration.** A caller relying on the old default stops receiving
+  workbooks with no error — nothing raises, the files simply are not
+  written. Add `output_excel=True` explicitly. Every call site in this
+  repository already passes it (57 of 57, checked with an AST walk before
+  the change), so `tasks/` and `examples/` are unaffected.
+
+
+## 0.3.5
+
+### Documentation
+- **`docs/decisions/0007` states plainly that Excel output is a local
+  debugging aid, not a publication target.** No staging, no temporary
+  files, no renames, no cleanup of abandoned artifacts, and no
+  transactional relationship with database publication — permanently, not
+  pending implementation.
+
+  The asymmetry with the database path had been recorded as an open
+  boundary, which read as an unfinished half of the publication design and
+  kept reopening the question. It is not: a published table is consumed by
+  things that must never see partial data, while a workbook is opened by a
+  person. Giving files transactional guarantees would import temporary
+  naming, ownership metadata, orphan cleanup and a scavenger for artifacts
+  left by killed runs — on a filesystem that may be a remote share — to
+  serve a consumer who is looking at them by eye.
+
+  The ADR records what follows: a failed run may leave workbooks from
+  pipelines that succeeded, those files may disagree with the database,
+  and nothing downstream may read them programmatically. It also records
+  the two cheaper alternatives that were rejected and why.
+
+- `README.md`, `docs/architecture.md` and `docs/task-authoring.md` state
+  the same rule where each audience meets it.
+
+
+## 0.3.4
+
+Invariants that held only because callers happened to do the right thing,
+and two rules advertised as exact that were not.
+
+### Fixed
+- **`cleanup_predecessor_artifacts()` enforces the task lock itself.** It
+  drops tables, and a direct caller could delete another live run's
+  artifacts — confirmed directly with `lock_held` False. The runner path
+  was safe by ordering; the invariant was not.
+- **`task_name` is validated at construction.** An empty one derived a
+  lock key and staged successfully, then wrote an ownership comment that
+  `parse_staging_comment()` rejects — so the run reported its own artifact
+  as unowned and failed at `commit()`, after every pipeline had run. It
+  need not be a portable identifier, only a non-empty stable string.
+- **The staging-name rule is literally exact.** `$` also matches
+  immediately before a trailing newline and a quoted PostgreSQL identifier
+  may contain one, so `x__stg_deadbeef_deadbeef\n` satisfied it. Now `\Z`.
+- **`IdentifierPolicy(True)` was accepted**, producing an effective
+  one-byte limit, because `bool` subclasses `int`. Now type-checked.
+- **`_verify_columns()`'s empty-result branch raises instead of
+  returning.** Its comment claimed the table might not exist yet; it
+  cannot, because this runs immediately after `create table if not exists`
+  on the same connection. An empty result means the check cannot see the
+  table it is about to write to — an identifier-case or `search_path`
+  anomaly — which is exactly what it exists to refuse. The test asserting
+  the old behaviour was written from the same false premise and is
+  rewritten.
+- The predecessor-scan `LIKE` escapes all three underscores; the leading
+  two were single-character wildcards, so the scan also matched names like
+  `xastg_...`. Harmless — the strict regex filtered them — but the pattern
+  now says what it means.
+
+### Changed
+- `rollback()`'s `break` after a failed `DROP` records why: the
+  transaction is aborted, so continuing would cascade failures rather than
+  drop more tables. "Drop as many as possible" is the plausible-looking
+  edit that does not work without an intervening rollback.
+- `advisory_lock_key()` notes the collision consequence — two different
+  tasks serializing against each other, safe but confusing to diagnose.
+
+### Notes
+- `docs/decisions/0005` records the plan for `publisher_factory`: the next
+  parameter that wants in should instead become one frozen
+  `PublisherConfig`. Doing it now would be a gratuitous second break.
+
+
 ## 0.3.3
 
 ### Fixed
@@ -90,10 +220,10 @@ merely tightening it.
   now resolves it first, honouring the stated before-first-DDL contract.
 
 ### Known boundary
-- Excel output is still written immediately inside the pipeline loop, so a
-  later failure can leave new workbooks while DB publication is rolled back
-  or left at its previous state. The staged model addresses DB publication
-  duration and atomicity; staged filesystem publication is not implemented.
+- Excel output is written immediately inside the pipeline loop, so a later
+  failure can leave new workbooks while DB publication is rolled back or
+  left at its previous state. *(Recorded here as an open gap; settled in
+  0.3.5 as a deliberate decision — see `docs/decisions/0007`.)*
 
 
 ## 0.3.1

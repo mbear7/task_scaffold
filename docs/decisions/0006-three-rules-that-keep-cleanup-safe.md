@@ -104,6 +104,25 @@ outage.
   operation and should compose with the sources-unchanged skip rather than
   paging someone. Logged at WARNING, because chronic overlap means the
   schedule is wrong even when each skip is correct.
+- **The lock records an identity, not a flag.** A boolean proved only
+  that *some* lock was held, so a publisher holding task A's lock would
+  clean task B's artifacts on request — the same cross-run risk, reached
+  through a direct caller instead of through ordering. The lock methods
+  take no task argument at all now: there is nowhere to name a task other
+  than the publisher's own, and `_require_task_lock()` verifies the held
+  identity matches.
+- **`task_name` is required and must be usable.** The lifecycle cannot
+  operate without one: an empty name derives an advisory key from `''` and
+  writes ownership metadata that this module's own parser rejects, so the
+  run prepares successfully and declares its own artifact unowned at
+  publication.
+- **Every invariant is enforced where it lives, not by caller ordering.**
+  `cleanup_predecessor_artifacts()` requires the lock itself, because it
+  drops tables and a direct caller could otherwise delete another live
+  run's artifacts. `task_name` is validated at construction, because an
+  empty one writes an ownership comment its own parser rejects — the run
+  stages successfully and then reports its own artifact as unowned at
+  publication, after every pipeline has run.
 - **The lock key is namespaced.** Advisory locks are database-wide and
   shared with anything else using them; a bare `hash(task_name)` could
   collide with an unrelated application and present as this task

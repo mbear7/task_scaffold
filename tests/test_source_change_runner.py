@@ -851,12 +851,26 @@ class Test7SourceStateTableIsValidatedBeforeItIsUsed(unittest.TestCase):
         store = SourceStateStore(_Sqlite(), schema='bsr', table='task_scaffold_meta')
         store.ensure_table()
 
-    def test_a_table_that_does_not_exist_yet_is_accepted(self):
-        # information_schema returns nothing for a table being created for
-        # the first time; that is not a drift signal.
+    def test_an_uninspectable_table_is_refused(self):
+        """An empty information_schema result here is anomalous, not
+        benign.
+
+        This test previously asserted the opposite, on the same false
+        premise as the comment it was written from: that the table might
+        not exist yet. It cannot -- this runs immediately after
+        `create table if not exists` on the same connection, so PostgreSQL
+        makes the new table's columns visible to this very query. An empty
+        result means the check cannot see the table it is about to write
+        to, which is precisely what it exists to refuse: an
+        identifier-case mismatch against information_schema's stored
+        values, or a search_path oddity.
+        """
         conn = self._Conn(columns=[])
         store = SourceStateStore(conn, schema='bsr', table='task_scaffold_meta')
-        store.ensure_table()
+
+        with self.assertRaises(SourceCheckError) as caught:
+            store.ensure_table()
+        self.assertIn('cannot be inspected', str(caught.exception))
 
 
 class _Scalar:
@@ -923,7 +937,7 @@ class Test8RunnerSkipsWhenAnotherRunHoldsTheLock(unittest.TestCase):
         self.assertTrue(result.skipped)
         self.assertEqual(
             result.skip_reason,
-            'another run of this task holds the advisory lock',
+            'task_already_running',
         )
         self.assertEqual(ran, [], 'a pipeline ran while another run held the lock')
 
