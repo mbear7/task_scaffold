@@ -2687,6 +2687,41 @@ class Test25TheLockProvesIdentityNotMerelyPresence(unittest.TestCase):
         self.assertEqual(released[0], {'ns': namespace, 'key': key})
         self.assertFalse(publisher.lock_held)
 
+    def test_acquiring_twice_is_rejected(self):
+        """PostgreSQL counts session advisory locks: acquiring the same one
+        twice requires releasing it twice. A second acquisition would leave
+        the server holding a lock after release_task_lock() while this
+        object reported itself unlocked.
+
+        Loud rather than silently idempotent, because a second begin_run()
+        also repeats predecessor cleanup — it signals incorrect lifecycle
+        use, not a harmless retry.
+        """
+        publisher, conn = self._publisher()
+        self.assertTrue(publisher.begin_run())
+
+        with self.assertRaises(DbPublishInvariantError) as caught:
+            publisher.try_acquire_task_lock()
+        self.assertIn('already held', str(caught.exception))
+
+        # And no second acquisition reached the server.
+        acquisitions = [k for k, _ in conn.lock_calls if k == 'acquire']
+        self.assertEqual(len(acquisitions), 1)
+
+    def test_a_second_begin_run_is_rejected(self):
+        publisher, conn = self._publisher()
+        publisher.begin_run()
+        with self.assertRaises(DbPublishInvariantError):
+            publisher.begin_run()
+
+    def test_the_lock_can_be_reacquired_after_release(self):
+        # Rejecting a repeat must not make the lifecycle single-use.
+        publisher, conn = self._publisher()
+        publisher.begin_run()
+        publisher.release_task_lock()
+        self.assertTrue(publisher.try_acquire_task_lock())
+        self.assertEqual(publisher.locked_task_name, 'task_a')
+
     def test_a_failed_acquisition_records_no_identity(self):
         conn = Test19TaskAdvisoryLockAndPredecessorCleanup._Conn(lock_granted=False)
         publisher = DbPublisher(creds=_CREDS, schema='bsr', task_name='task_a')

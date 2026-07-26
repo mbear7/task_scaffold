@@ -12,6 +12,27 @@ chronologically rather than by release.
 ## Unreleased
 
 
+## 0.3.8
+
+### Fixed
+- **Advisory-lock acquisition was reentrant.** PostgreSQL counts session
+  advisory locks, so acquiring the same one twice requires releasing it
+  twice — a second acquisition would leave the server holding a lock after
+  `release_task_lock()` while the publisher reported itself unlocked.
+  A repeat now raises `DbPublishInvariantError` before any SQL is issued.
+
+  Loud rather than silently idempotent: a second `begin_run()` also
+  repeats predecessor cleanup, so it signals incorrect lifecycle use
+  rather than a harmless retry. Releasing and reacquiring still works.
+
+  The runner calls `begin_run()` once and closes afterwards, so this only
+  ever affected direct callers and the extension seam.
+
+- The constructor's `task_name` error said an unusable name "fails only at
+  publication", which described the behaviour before validation was added.
+  It now says "would otherwise fail only at publication".
+
+
 ## 0.3.7
 
 ### Fixed

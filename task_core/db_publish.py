@@ -707,7 +707,7 @@ class DbPublisher:
                 f'task_name must be a non-empty string, got {task_name!r}. It '
                 f'identifies this run\'s staging artifacts in their ownership '
                 f'metadata and derives its advisory lock key; an unusable one '
-                f'fails only at publication.'
+                f'would otherwise fail only at publication.'
             )
         self.task_name = task_name
         self._engine = None
@@ -813,6 +813,24 @@ class DbPublisher:
         PostgreSQL releases the lock, with no lock table needing cleanup of
         its own.
         """
+        # PostgreSQL session advisory locks are COUNTED: the same session
+        # may acquire the same lock repeatedly and must release it as many
+        # times. A second acquisition here would leave the server holding
+        # one lock after release_task_lock(), while this object reported
+        # itself unlocked -- state that disagrees with the database in the
+        # direction that matters.
+        #
+        # Loud rather than silently idempotent: a second begin_run() also
+        # repeats predecessor cleanup, so it signals incorrect lifecycle
+        # use rather than a harmless retry. The runner calls it once.
+        if self._locked_task_name is not None:
+            raise DbPublishInvariantError(
+                f'internal invariant violated -- the task advisory lock for '
+                f'{self._locked_task_name!r} is already held by this publisher. '
+                f'PostgreSQL counts session locks, so acquiring twice would '
+                f'leave one held after release.'
+            )
+
         conn = self.ensure_connection()
         if conn.dialect.name != 'postgresql':
             # No advisory locks outside PostgreSQL. Treated as acquired so
