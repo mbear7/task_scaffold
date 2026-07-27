@@ -1675,7 +1675,8 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
                 # JSON body, which is full of double quotes -- an earlier
                 # version of this fake did exactly that and silently
                 # recorded a timestamp as the table name.
-                head, body = text.split(' is ', 1)
+                split_at = lowered.index(' is ')
+                head, body = text[:split_at], text[split_at + 4:]
                 name = head[len('comment on table '):].strip().strip('"')
                 self.comments[name] = body.strip()[1:-1].replace("''", "'")
                 return None
@@ -2162,7 +2163,8 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
                 ), {'t': (params or {}).get('table')})
                 return [(row[0],) for row in rows]
             if lowered.startswith('comment on table'):
-                head, body = text.split(' is ', 1)
+                split_at = lowered.index(' is ')
+                head, body = text[:split_at], text[split_at + 4:]
                 name = head[len('comment on table '):].strip().strip('"')
                 self.comments[name] = body.strip()[1:-1].replace("''", "'")
                 return None
@@ -2770,6 +2772,40 @@ class Test26TaskNameIsRequiredAndUsable(unittest.TestCase):
                 self.assertEqual(parsed['task'], name)
 
 
+
+
+class Test27PostgresqlCommentDDL(unittest.TestCase):
+    def test_numeric_json_fields_are_not_parsed_as_bind_parameters(self):
+        import sqlalchemy as sa
+        from sqlalchemy.dialects import postgresql
+        from task_core.db_publish import build_published_comment
+
+        class CapturingConnection:
+            dialect = postgresql.dialect()
+
+            def __init__(self):
+                self.statement = None
+
+            def execute(self, statement, params=None):
+                self.statement = statement
+
+        conn = CapturingConnection()
+        publisher = DbPublisher.__new__(DbPublisher)
+        publisher.ensure_connection = lambda: conn
+
+        comment = build_published_comment(
+            task_name='demo_task', run_token='deadbeef', rows=7,
+        )
+        publisher._set_comment('bsr', 'demo_table', comment)
+
+        self.assertIsInstance(conn.statement, sa.schema.SetTableComment)
+        compiled = conn.statement.compile(dialect=conn.dialect)
+        self.assertIsNone(compiled.params)
+        sql = str(compiled)
+        self.assertIn('"v":1', sql)
+        self.assertIn('"rows":7', sql)
+        self.assertNotIn('%(1)s', sql)
+        self.assertNotIn('%(7)s', sql)
 
 if __name__ == '__main__':
     unittest.main()

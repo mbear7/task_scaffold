@@ -1362,11 +1362,22 @@ class DbPublisher:
         conn = self.ensure_connection()
         if conn.dialect.name != 'postgresql':
             return
-        # Comments take a literal, not a bind parameter, so the value is
-        # quoted here. json.dumps output contains no NUL and doubling
-        # single quotes is sufficient.
-        literal = "'" + comment.replace("'", "''") + "'"
-        conn.execute(sa.text(f'comment on table {_quoted_name(schema, table_name)} is {literal}'))
+        # Do not embed JSON inside sa.text(). TextClause scans colon-number
+        # sequences even inside SQL string literals, so compact JSON such as
+        # ``"v":1`` is misread as a bind parameter named ``1``. Use the
+        # dedicated SQLAlchemy DDL construct: it renders the comment as a
+        # literal through the PostgreSQL dialect without bind parsing.
+        table = sa.Table(
+            sa.quoted_name(table_name, quote=True),
+            sa.MetaData(),
+            schema=(
+                sa.quoted_name(schema, quote=True)
+                if schema is not None
+                else None
+            ),
+            comment=comment,
+        )
+        conn.execute(sa.schema.SetTableComment(table))
 
     def _commit_transaction(self):
         if self._tx is not None:

@@ -12,6 +12,33 @@ chronologically rather than by release.
 ## Unreleased
 
 
+## 0.3.9
+
+### Fixed
+- **PostgreSQL publication failed while attaching table comments.**
+  `_set_comment()` embedded compact JSON inside `sa.text()`. SQLAlchemy scans
+  `TextClause` contents for bind parameters even inside SQL string literals,
+  so numeric JSON such as `"v":1` was interpreted as a missing bind parameter
+  named `1`. Every real PostgreSQL publication therefore failed after loading
+  and validating its first staging table, before that preparation transaction
+  could commit.
+
+  Table comments now use SQLAlchemy's PostgreSQL-aware
+  `sa.schema.SetTableComment` DDL construct. The dialect renders the comment as
+  a literal without parsing JSON colons as bind markers. This fixes both
+  staging ownership comments and live-table provenance comments.
+
+- Added a regression test that compiles a published comment containing numeric
+  fields (`"v":1` and `"rows":7`) against the PostgreSQL dialect and verifies
+  that no bind parameters are produced.
+
+### Verification
+- Complete scaffold suite: 390 tests passed, including 158 subtests.
+- Real PostgreSQL smoke run: `ops_task` prepared and atomically published all
+  five output tables, updated source state in the publication transaction, and
+  left zero staging tables behind.
+
+
 ## 0.3.8
 
 ### Fixed
