@@ -22,10 +22,9 @@ import os
 from typing import TYPE_CHECKING
 
 from task_core.db_publish import (
-    MAX_IDENTIFIER_BYTES,
     DbPublisher,
-    IdentifierPolicy,
     PublicationPlan,
+    PublisherConfig,
 )
 
 from task_core.types import (
@@ -302,18 +301,23 @@ def run_pipelines(
     pg_schema='bsr',
     source_change_check=None,
     force_run=False,
-    publisher_factory=DbPublisher,
-    db_max_identifier_bytes=MAX_IDENTIFIER_BYTES,
+    publisher_config=None,
 ):
-    """publisher_factory: the DbPublisher constructor to use, real by
-    default. Pass a fake here for tests -- e.g. tc.run_pipelines(...,
-    publisher_factory=FakeDbPublisher) -- rather than monkeypatching
-    tc.runner.DbPublisher, which this default parameter value no longer
-    responds to: like any default argument, it's bound once, to whatever
-    DbPublisher was at the time this function was defined (module import
-    time), not re-read from the module namespace on every call."""
+    """publisher_config: a frozen PublisherConfig holding publisher_factory,
+    identifier_policy and publication_lock_policy. Defaults to
+    PublisherConfig(). Resolved once here and read from thereafter, so
+    there is no second defaulting point that could diverge from what
+    preflight validated against.
+    """
     log = logging.getLogger(task_name)
-    identifier_policy = IdentifierPolicy(max_identifier_bytes=db_max_identifier_bytes)
+
+    # Resolved ONCE. Every later use reads from this object, so there is no
+    # second defaulting point that could silently diverge -- which is the
+    # failure IdentifierPolicy was created to stop, now prevented for the
+    # whole publisher configuration rather than one integer.
+    config = publisher_config if publisher_config is not None else PublisherConfig()
+    publisher_factory = config.resolved_factory()
+    identifier_policy = config.identifier_policy
     publication_plan = PublicationPlan()
 
     specs = validate_pipeline_classes(pipelines, run_sequence)
@@ -429,6 +433,7 @@ def run_pipelines(
                 schema=pg_schema,
                 logger=log,
                 identifier_policy=identifier_policy,
+                publication_lock_policy=config.publication_lock_policy,
                 publication_plan=publication_plan,
                 task_name=ctx.task_name,
             )

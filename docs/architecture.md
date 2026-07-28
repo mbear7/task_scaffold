@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.3.9. This describes the present system, not
+How `task_core` works as of 0.4.0. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -357,6 +357,13 @@ survived until the first `publish()` — which, for a source-check-only task
 or one whose first DB output came late, was the whole run. `no transaction
 spans the run` only holds because the store closes its own phase.
 
+**Lock bounding.** All targets are locked in one sorted statement under a
+bounded wait before anything is swapped, and the whole publication is
+retried on lock unavailability within a wall-clock horizon. Without it, a
+publisher waiting on one long reader blocks every reader arriving
+afterwards. See
+[decisions/0008](decisions/0008-bound-the-publication-lock-wait.md).
+
 **Atomicity.** Publication is all-or-nothing: every swap and the
 source-state write land in one transaction, so a failed publication does
 not advance the stored fingerprints and a retry sees the same sources as
@@ -422,10 +429,13 @@ anything, so a failure part-way through does not leave it half-open.
 
 ## Extension points
 
-- **`publisher_factory`** — anything with `publish`, `commit`, `rollback`,
-  `close`, `begin_run`, `ensure_connection`, and the four result
-  properties. Constructed with `creds`, `schema`, `logger`,
-  `identifier_policy`, `publication_plan` and `task_name`. May optionally provide a `preflight` classmethod; if
+- **`PublisherConfig`** — one frozen object holding `publisher_factory`,
+  `identifier_policy` and `publication_lock_policy`, passed to
+  `run_pipelines()` as `publisher_config`. A factory is anything with
+  `publish`, `commit`, `rollback`, `close`, `begin_run`,
+  `ensure_connection`, and the four result properties; it is constructed
+  with `creds`, `schema`, `logger`, `identifier_policy`,
+  `publication_lock_policy`, `publication_plan` and `task_name`. May optionally provide a `preflight` classmethod; if
   it does not, the real `DbPublisher.preflight` is used, so validation
   always runs.
 - **`build_context`** — the task supplies its own, or uses

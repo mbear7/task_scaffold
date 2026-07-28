@@ -347,7 +347,7 @@ class Test4StabilizePreventsRepeatedTraversal(unittest.TestCase):
             task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline},
             run_sequence=['p'], output_excel=False, output_db=True,
             creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, pg_schema='bsr',
-            publisher_factory=FakeDbPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=FakeDbPublisher),
         )
 
         self.assertEqual(

@@ -115,6 +115,13 @@ benefit; doing it as part of the third addition costs nothing extra. This
 is written down so that addition triggers the change rather than another
 parameter.
 
+**Executed in 0.4.0.** `PublicationLockPolicy` (see 0008) was the addition
+that triggered it. `publisher_factory` and `db_max_identifier_bytes` were
+removed from `run_pipelines()` and became fields of a frozen
+`PublisherConfig`, in one deliberate break with no compatibility aliases.
+Per-task facts — `creds`, `pg_schema` — stayed direct arguments: a task
+widening a lock timeout should not have to restate its credentials.
+
 ## Rejected
 
 **Keeping one transaction and accepting the duration.** Defensible while

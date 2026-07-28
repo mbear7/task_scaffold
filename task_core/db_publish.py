@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
 import logging
+import math
 import re
 from itertools import islice
+import random
+import time
 from uuid import uuid4
 from typing import Any, Iterator
 
@@ -425,6 +428,146 @@ class IdentifierPolicy:
 
 DEFAULT_IDENTIFIER_POLICY = IdentifierPolicy()
 
+@dataclass(frozen=True)
+class PublicationLockPolicy:
+    """How long publication may wait for ACCESS EXCLUSIVE on its targets.
+
+    PostgreSQL queues new ACCESS SHARE requests behind a waiting ACCESS
+    EXCLUSIVE, so a publisher waiting on one long reader blocks every
+    subsequent reader too. Bounding the wait is what stops one slow query
+    turning a publication into a read outage.
+
+    `retry_horizon_seconds` is the primary bound and gates COMPLETION of
+    the lock phase, not merely permission to start another attempt --
+    otherwise an attempt begun just inside the horizon could run well past
+    it and the horizon would be a hint rather than a limit. The per-attempt
+    timeouts are therefore ceilings: each attempt gets
+    min(configured, time remaining), so a final attempt may run with far
+    less than the configured budget.
+
+    `max_attempts` is a defensive ceiling only, not the policy. Under these
+    defaults it is unreachable -- a 1s minimum delay inside a 60s horizon
+    admits far fewer -- and it exists to stop a runaway if someone
+    configures a sub-second delay.
+    """
+
+    lock_timeout_ms: int = 500
+    acquisition_timeout_ms: int = 5_000
+    retry_horizon_seconds: float = 60.0
+    retry_delay_min_seconds: float = 1.0
+    retry_delay_max_seconds: float = 5.0
+    max_attempts: int = 100
+
+    # Margin by which lock_timeout must stay below statement_timeout, so a
+    # lock wait always expires first.
+    TIMEOUT_MARGIN_MS = 50
+
+    def __post_init__(self):
+        for name in ('lock_timeout_ms', 'acquisition_timeout_ms', 'max_attempts'):
+            value = getattr(self, name)
+            # type(...) is int, not isinstance: bool subclasses int.
+            if type(value) is not int or value < 1:
+                raise DbPublishError(f'{name} must be a positive integer, got {value!r}')
+        for name in ('retry_horizon_seconds', 'retry_delay_min_seconds',
+                     'retry_delay_max_seconds'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise DbPublishError(f'{name} must be a number, got {value!r}')
+            # isfinite: NaN and inf passed a type-and-sign check and then
+            # failed later inside int(), random.uniform() or sleep(), far
+            # from the configuration that caused them.
+            if not math.isfinite(value) or value < 0:
+                raise DbPublishError(f'{name} must be a finite non-negative number, got {value!r}')
+        if self.retry_delay_min_seconds > self.retry_delay_max_seconds:
+            raise DbPublishError(
+                f'retry_delay_min_seconds ({self.retry_delay_min_seconds}) exceeds '
+                f'retry_delay_max_seconds ({self.retry_delay_max_seconds})'
+            )
+        # PostgreSQL documents that a nonzero lock_timeout is pointless
+        # once it reaches statement_timeout, because the statement timeout
+        # fires first. Here that is not merely pointless but harmful: it
+        # converts retryable 55P03 lock_not_available into terminal 57014
+        # query_canceled, so ordinary contention would end the run instead
+        # of being retried.
+        if self.acquisition_timeout_ms < self.lock_timeout_ms + self.TIMEOUT_MARGIN_MS:
+            raise DbPublishError(
+                f'acquisition_timeout_ms ({self.acquisition_timeout_ms}) must exceed '
+                f'lock_timeout_ms ({self.lock_timeout_ms}) by at least '
+                f'{self.TIMEOUT_MARGIN_MS}ms. Otherwise statement_timeout fires first '
+                f'and retryable lock contention (55P03) arrives as terminal '
+                f'cancellation (57014).'
+            )
+
+    def attempt_budgets_ms(self, remaining_seconds):
+        """(statement_timeout_ms, lock_timeout_ms) for an attempt with this
+        much of the horizon left, or None if there is not enough left to
+        run a well-formed one.
+
+        Clamping both to the same remaining budget would make them equal on
+        a short final attempt, which is exactly the inversion rejected
+        above -- so the statement budget is derived from the horizon first
+        and the lock budget is then held below it by the margin. If no
+        positive margin remains, there is no attempt worth starting.
+        """
+        remaining_ms = int(remaining_seconds * 1000)
+        if remaining_ms <= 0:
+            return None
+
+        statement_ms = min(self.acquisition_timeout_ms, remaining_ms)
+        lock_ms = min(self.lock_timeout_ms, statement_ms - self.TIMEOUT_MARGIN_MS)
+        if lock_ms < 1:
+            return None
+        return statement_ms, lock_ms
+
+
+@dataclass(frozen=True)
+class PublisherConfig:
+    """Everything about how publication behaves, in one frozen object.
+
+    Introduced by executing the plan recorded in decisions/0005: the
+    publisher seam had reached six constructor parameters, and
+    IdentifierPolicy had itself been created to stop two independently
+    defaulted integers drifting apart. A seventh loose argument would have
+    repeated the mistake at a larger scale, so the whole set became one
+    object instead.
+
+    Per-task facts -- creds, pg_schema -- deliberately stay direct
+    run_pipelines() arguments. A task widening a lock timeout should not
+    have to restate its credentials to do it. Runner concerns such as
+    source_change_check stay outside for the same reason.
+    """
+
+    publisher_factory: Any = None
+    identifier_policy: IdentifierPolicy = field(default_factory=IdentifierPolicy)
+    publication_lock_policy: PublicationLockPolicy = field(
+        default_factory=PublicationLockPolicy
+    )
+
+    def __post_init__(self):
+        # Enforced, not assumed. None on either policy restored exactly the
+        # independent downstream defaulting this object exists to
+        # eliminate -- the publisher would have substituted its own,
+        # silently diverging from what preflight validated against.
+        if not isinstance(self.identifier_policy, IdentifierPolicy):
+            raise DbPublishError(
+                f'identifier_policy must be an IdentifierPolicy, '
+                f'got {self.identifier_policy!r}'
+            )
+        if not isinstance(self.publication_lock_policy, PublicationLockPolicy):
+            raise DbPublishError(
+                f'publication_lock_policy must be a PublicationLockPolicy, '
+                f'got {self.publication_lock_policy!r}'
+            )
+        if self.publisher_factory is not None and not callable(self.publisher_factory):
+            raise DbPublishError(
+                f'publisher_factory must be callable or None, got {self.publisher_factory!r}'
+            )
+
+    def resolved_factory(self):
+        # Defaults to DbPublisher, which is defined below this dataclass.
+        return self.publisher_factory if self.publisher_factory is not None else DbPublisher
+
+
 # Advisory lock namespace. The two-int form gives a 32-bit namespace in the
 # high half; advisory locks are database-wide and shared with anything else
 # using them, so a bare hashtext(task_name) could collide with an unrelated
@@ -658,6 +801,7 @@ class DbPublisher:
         chunk_size=5000,
         type_infer_sample_size=5000,
         identifier_policy=None,
+        publication_lock_policy=None,
         publication_plan=None,
         task_name,
     ):
@@ -677,6 +821,7 @@ class DbPublisher:
             if self.type_infer_sample_size < 1:
                 raise DbPublishError('type_infer_sample_size must be a positive integer or None')
         self.identifier_policy = identifier_policy or DEFAULT_IDENTIFIER_POLICY
+        self.publication_lock_policy = publication_lock_policy or PublicationLockPolicy()
         self.max_identifier_bytes = self.identifier_policy.max_identifier_bytes
         # Work queued by the runner and executed inside the publication
         # transaction, so the source-state write is atomic with the swaps
@@ -1438,6 +1583,111 @@ class DbPublisher:
                     f'not {schema}.{table_name}'
                 )
 
+    # SQLSTATEs, and why only one of them is retried.
+    #
+    # 55P03 lock_not_available is unambiguous here: this code never issues
+    # NOWAIT, and the connection is exclusively ours -- dedicated, NullPool,
+    # never returned to a pool -- so nothing else can be requesting locks on
+    # it. It means precisely "a reader still held it when my budget
+    # expired", which is the retryable condition.
+    #
+    # 57014 query_canceled is NOT uniquely statement_timeout. An operator's
+    # pg_cancel_backend(), a client-side cancel, or a role- or
+    # database-level statement_timeout set outside this code all produce
+    # it. Retrying would mean the scaffold arguing with a human who
+    # deliberately stopped it, so it is terminal -- deliberately
+    # conservative, and it costs only the case where retrying might have
+    # worked anyway.
+    #
+    # 40P01 deadlock_detected is retryable in principle, but sorted lock
+    # order already prevents deadlock between two task_core publications.
+    # Seeing one means something outside this scaffold takes exclusive
+    # locks on published tables, which a retry does not fix and which
+    # should be loud.
+    _RETRYABLE_SQLSTATES = frozenset({'55P03'})
+    _TERMINAL_LOUD_SQLSTATES = frozenset({'40P01'})
+
+    @staticmethod
+    def _sqlstate(exc):
+        return getattr(getattr(exc, 'orig', None), 'pgcode', None)
+
+    def _lock_publication_targets(self, deadline):
+        """Take ACCESS EXCLUSIVE on every existing target, in one statement.
+
+        One statement rather than letting each DROP acquire its own,
+        because the incremental form holds locks on already-swapped tables
+        while queuing for the next -- and each held lock is itself blocking
+        new readers, so the amplification compounds. Either every lock is
+        held here or none is.
+
+        Sorted, which is what stops two tasks with overlapping targets
+        deadlocking against each other.
+
+        Budgets are derived from the remaining horizon rather than taken
+        from the policy directly: the horizon gates COMPLETION of this
+        phase, so a final attempt may legitimately run with far less than
+        the configured timeout. SET LOCAL, so neither setting escapes the
+        transaction.
+        """
+        conn = self.ensure_connection()
+        if conn.dialect.name != 'postgresql':
+            return []
+
+        targets = sorted(
+            {(schema, table) for schema, table, _staging, _rows in self._pending_swaps}
+        )
+        # Exact catalog values, NOT to_regclass() on an assembled string.
+        # regclass input follows SQL identifier rules, so it folds anything
+        # unquoted to lower case: a live table named "Sales" was passed as
+        # bsr.Sales, looked up as bsr.sales, and reported missing. It was
+        # then EXCLUDED from the bounded LOCK, and its later
+        # DROP TABLE IF EXISTS acquired ACCESS EXCLUSIVE with no timeout at
+        # all -- so the one table most needing the bound silently escaped
+        # it.
+        #
+        # This is the same defect already fixed once in
+        # _verify_prepared_artifacts() and reintroduced here. The lesson is
+        # that assembling a name for the parser is the trap, not any
+        # particular call site.
+        existing = [
+            (schema, table) for schema, table in targets
+            if conn.execute(
+                sa.text(
+                    'select c.oid from pg_class c '
+                    'join pg_namespace n on n.oid = c.relnamespace '
+                    'where n.nspname = :schema and c.relname = :table'
+                ),
+                {'schema': schema, 'table': table},
+            ).scalar() is not None
+        ]
+        if not existing:
+            # A first-ever publication has nothing to lock.
+            return []
+
+        policy = self.publication_lock_policy
+        budgets = policy.attempt_budgets_ms(deadline - time.monotonic())
+        if budgets is None:
+            raise DbPublishError(
+                'publication horizon exhausted before its target locks could be '
+                'requested with a usable timeout budget'
+            )
+        statement_ms, lock_ms = budgets
+
+        conn.execute(sa.text(f'set local lock_timeout = {lock_ms}'))
+        conn.execute(sa.text(f'set local statement_timeout = {statement_ms}'))
+
+        names = ', '.join(_quoted_name(schema, table) for schema, table in existing)
+        self.log.info('locking %s publication target(s) for swap', len(existing))
+        conn.execute(sa.text(f'lock table {names} in access exclusive mode'))
+
+        # Budgets lifted once the locks are held. The horizon bounds the
+        # WAIT, not the work: verify/plan/swap/comment are catalog
+        # operations measured in milliseconds, and cancelling them halfway
+        # would be strictly worse than letting them finish.
+        conn.execute(sa.text('set local lock_timeout = 0'))
+        conn.execute(sa.text('set local statement_timeout = 0'))
+        return existing
+
     def commit(self):
         """The publication phase: one short transaction that verifies the
         prepared artifacts, performs the queued source-state write, swaps
@@ -1450,19 +1700,131 @@ class DbPublisher:
         same transaction either way. Comments must follow the swaps,
         because they are set on the renamed relations.
         """
-        conn = self.ensure_connection()
         # Queued work counts. A publication plan holding only the
         # source-state update writes to the database just as a swap does,
         # and could previously be committed by a direct caller without ever
         # claiming the task.
         if self._pending_swaps or len(self.publication_plan):
             self._require_task_lock('commit')
+
+        policy = self.publication_lock_policy
+        started = time.monotonic()
+        deadline = started + policy.retry_horizon_seconds
+        attempt = 0
+
+        while True:
+            attempt += 1
+            try:
+                return self._publish_once(deadline)
+            except BaseException as exc:
+                # Rolled back on EVERY unsuccessful attempt, before any
+                # classification. Catching only DBAPIError left the
+                # publication transaction OPEN whenever the failure was
+                # anything else -- a DbPublishError from an exhausted
+                # horizon, an invariant violation, or KeyboardInterrupt --
+                # after _publish_once() had already opened the transaction,
+                # verified the staging artifacts, and possibly run the
+                # source-state plan. The runner's cleanup happens to reach
+                # rollback() eventually; a direct caller, or one that
+                # catches the exception, was left holding a dirty
+                # transaction.
+                self._drop_open_transaction()
+
+                if not isinstance(exc, sa.exc.DBAPIError):
+                    raise
+
+                state = self._sqlstate(exc)
+
+                if state in self._TERMINAL_LOUD_SQLSTATES:
+                    # Deliberately phase-neutral. Target locking is sorted,
+                    # so it cannot deadlock two task_core publications
+                    # against each other -- but the publication plan now
+                    # runs BEFORE locking, and a deadlock there is
+                    # reachable with zero lock attempts. Naming the target
+                    # locks would misdirect the investigation.
+                    self.log.error(
+                        'publication encountered a deadlock (%s) on attempt %s. '
+                        'Automatic retry is disabled: a deadlock indicates an '
+                        'external lock-order conflict that needs investigation '
+                        'rather than repetition.', state, attempt,
+                    )
+                    raise
+                if state not in self._RETRYABLE_SQLSTATES:
+                    raise
+
+                elapsed = time.monotonic() - started
+                remaining = deadline - time.monotonic()
+
+                # The jitter range is DERIVED from what is left, not sampled
+                # and then rejected. Sampling first threw the run away
+                # whenever the draw happened to exceed the remaining
+                # horizon -- with 4s left and a 1-5s range, a 4.5s draw
+                # ended it while a shorter delay and another bounded
+                # attempt would have fitted, and the error then claimed the
+                # horizon was exhausted while deliberately leaving part of
+                # it unused.
+                reserved = policy.acquisition_timeout_ms / 1000.0
+                latest_delay = remaining - reserved
+
+                # ACTUAL elapsed and attempts, not the configured policy:
+                # budgets are derived from the remaining horizon, so a final
+                # attempt may have run with far less than
+                # acquisition_timeout_ms and the two would not reconcile.
+                if attempt >= policy.max_attempts:
+                    raise DbPublishError(
+                        f'publication could not acquire its target locks: {attempt} '
+                        f'attempts in {elapsed:.1f}s hit the defensive max_attempts '
+                        f'ceiling of {policy.max_attempts}'
+                    ) from exc
+
+                # Stop rather than sleep past the horizon: sleeping in order
+                # to give up wastes the wait and holds the task advisory
+                # lock longer for nothing.
+                if latest_delay < policy.retry_delay_min_seconds:
+                    raise DbPublishError(
+                        f'publication could not acquire its target locks within '
+                        f'{policy.retry_horizon_seconds}s ({attempt} attempts, '
+                        f'{elapsed:.1f}s elapsed). A long-running reader is holding '
+                        f'one of them.'
+                    ) from exc
+
+                delay = random.uniform(
+                    policy.retry_delay_min_seconds,
+                    min(policy.retry_delay_max_seconds, latest_delay),
+                )
+
+                self.log.warning(
+                    'publication lock unavailable (attempt %s, %.1fs elapsed, %.1fs '
+                    'of horizon left); retrying in %.1fs',
+                    attempt, elapsed, remaining, delay,
+                )
+                # Already rolled back above, so nothing is held across the
+                # sleep -- holding locks while waiting is the disease.
+                time.sleep(delay)
+
+    def _publish_once(self, deadline):
+        conn = self.ensure_connection()
         self._ensure_transaction()
 
         self._verify_prepared_artifacts()
 
         if len(self.publication_plan):
             self.publication_plan.run(self.log)
+
+        # Locks taken LAST, immediately before the swaps. The publication
+        # plan is not harmless catalog work: on the standard runner path it
+        # runs create-if-not-exists, a DELETE and an upsert against the
+        # source-state table. With the locks already held -- and both
+        # timeouts reset to zero the moment they were acquired -- any wait
+        # in that work kept every live target under ACCESS EXCLUSIVE for
+        # its whole duration, recreating the read outage this is supposed
+        # to bound.
+        #
+        # Atomicity is unchanged: a 55P03 here still rolls back the
+        # source-state write with everything else and the whole attempt is
+        # retried. The exclusive window now contains only swaps and
+        # comments.
+        self._lock_publication_targets(deadline)
 
         swapped = []
         # Sorted by final name. Two tasks publishing an overlapping set of

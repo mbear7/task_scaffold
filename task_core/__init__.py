@@ -18,8 +18,15 @@ resolves; this one behavior intentionally does not. See README
 message for the rationale.
 """
 
-__version__ = '0.3.9'
+__version__ = '0.4.0'
 
+from task_core.db_publish import (
+    DbPublishError,
+    DbPublishInvariantError,
+    IdentifierPolicy,
+    PublicationLockPolicy,
+    PublisherConfig,
+)
 from task_core.types import (
     DbRunResult,
     PipelineContractError,

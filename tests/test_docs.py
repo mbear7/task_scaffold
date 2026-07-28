@@ -48,7 +48,7 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
         params = inspect.signature(tc.run_pipelines).parameters
         for name, default in (('output_excel', False), ('output_db', False),
                               ('pg_schema', 'bsr'), ('force_run', False),
-                              ('db_max_identifier_bytes', 63)):
+                              ('publisher_config', None)):
             with self.subTest(parameter=name):
                 self.assertEqual(params[name].default, default)
 

@@ -377,7 +377,7 @@ class Test4SourceStateGenuinelyRollsBack(unittest.TestCase):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
                 output_excel=False, output_db=True, creds={}, source_change_check=config,
-                publisher_factory=FailingPublisher,
+                publisher_config=tc.PublisherConfig(publisher_factory=FailingPublisher),
             )
 
         self.assertEqual(len(ran), 1, 'pipeline should have run -- sources were genuinely changed')
@@ -445,7 +445,7 @@ class Test5FingerprintCollectionFailureCleanup(unittest.TestCase):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
                 output_excel=False, output_db=True, creds={}, source_change_check=config,
-                publisher_factory=TrackingPublisher,
+                publisher_config=tc.PublisherConfig(publisher_factory=TrackingPublisher),
             )
 
         self.assertEqual(len(ran), 0, 'a pipeline ran despite fingerprint collection failing')
@@ -479,7 +479,7 @@ class Test1SourceUnchangedSkipsExecution(unittest.TestCase):
         tc.run_pipelines(
             task_name='t', build_context=lambda: ctx1, pipelines=pipelines, run_sequence=['p'],
             output_excel=False, output_db=True, creds={}, source_change_check=config,
-            publisher_factory=FakeDbPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=FakeDbPublisher),
         )
         self.assertEqual(len(ran), 1)
 
@@ -497,7 +497,7 @@ class Test1SourceUnchangedSkipsExecution(unittest.TestCase):
         tc.run_pipelines(
             task_name='t', build_context=lambda: ctx1b, pipelines=pipelines, run_sequence=['p'],
             output_excel=False, output_db=True, creds={}, source_change_check=config,
-            publisher_factory=SeededPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=SeededPublisher),
         )
         ran.clear()
 
@@ -505,7 +505,7 @@ class Test1SourceUnchangedSkipsExecution(unittest.TestCase):
         result = tc.run_pipelines(
             task_name='t', build_context=lambda: ctx2, pipelines=pipelines, run_sequence=['p'],
             output_excel=False, output_db=True, creds={}, source_change_check=config,
-            publisher_factory=SeededPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=SeededPublisher),
         )
         self.assertEqual(len(ran), 0, 'pipeline ran despite unchanged sources')
         self.assertTrue(result.skipped)
@@ -528,7 +528,7 @@ class Test1SourceUnchangedSkipsExecution(unittest.TestCase):
         tc.run_pipelines(
             task_name='t', build_context=lambda: ctx1, pipelines=pipelines, run_sequence=['p'],
             output_excel=False, output_db=True, creds={}, source_change_check=config,
-            publisher_factory=SeededPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=SeededPublisher),
         )
         ran.clear()
 
@@ -536,7 +536,7 @@ class Test1SourceUnchangedSkipsExecution(unittest.TestCase):
         result = tc.run_pipelines(
             task_name='t', build_context=lambda: ctx2, pipelines=pipelines, run_sequence=['p'],
             output_excel=False, output_db=True, creds={}, source_change_check=config,
-            force_run=True, publisher_factory=SeededPublisher,
+            force_run=True, publisher_config=tc.PublisherConfig(publisher_factory=SeededPublisher),
         )
         self.assertEqual(len(ran), 1, 'force_run=True did not run despite unchanged sources')
         self.assertFalse(result.skipped)
@@ -558,7 +558,7 @@ class Test1SourceUnchangedSkipsExecution(unittest.TestCase):
         tc.run_pipelines(
             task_name='t', build_context=lambda: ctx1, pipelines=pipelines, run_sequence=['p'],
             output_excel=False, output_db=True, creds={}, source_change_check=config,
-            publisher_factory=SeededPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=SeededPublisher),
         )
         ran.clear()
 
@@ -566,7 +566,7 @@ class Test1SourceUnchangedSkipsExecution(unittest.TestCase):
         result = tc.run_pipelines(
             task_name='t', build_context=lambda: ctx2, pipelines=pipelines, run_sequence=['p'],
             output_excel=False, output_db=True, creds={}, source_change_check=config,
-            publisher_factory=SeededPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=SeededPublisher),
         )
         self.assertEqual(len(ran), 1, 'changed sources did not trigger a run')
         self.assertFalse(result.skipped)
@@ -583,7 +583,7 @@ class Test2SourceCheckWithNoTrackedSources(unittest.TestCase):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
                 output_excel=False, output_db=True, creds={}, source_change_check=config,
-                publisher_factory=FakeDbPublisher,
+                publisher_config=tc.PublisherConfig(publisher_factory=FakeDbPublisher),
             )
 
 
@@ -603,7 +603,7 @@ class Test3TransactionAtomicity(unittest.TestCase):
         ctx = tc.task_context(task_name='t', loaders={})
         tc.run_pipelines(
             task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p1', 'p2'],
-            output_excel=False, output_db=True, creds={}, publisher_factory=TrackingPublisher,
+            output_excel=False, output_db=True, creds={}, publisher_config=tc.PublisherConfig(publisher_factory=TrackingPublisher),
         )
         self.assertEqual(len(published), 1)
         pub = published[0]
@@ -627,7 +627,7 @@ class Test3TransactionAtomicity(unittest.TestCase):
         with self.assertRaises(tc.PipelineError):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p1', 'p2'],
-                output_excel=False, output_db=True, creds={}, publisher_factory=TrackingPublisher,
+                output_excel=False, output_db=True, creds={}, publisher_config=tc.PublisherConfig(publisher_factory=TrackingPublisher),
             )
         pub = published[0]
         self.assertEqual(pub.commit_calls, 0, 'commit() was called despite the second pipeline failing')
@@ -646,7 +646,7 @@ class Test3TransactionAtomicity(unittest.TestCase):
         ctx = tc.task_context(task_name='t', loaders={})
         tc.run_pipelines(
             task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
-            output_excel=False, output_db=True, creds={}, publisher_factory=TrackingPublisher,
+            output_excel=False, output_db=True, creds={}, publisher_config=tc.PublisherConfig(publisher_factory=TrackingPublisher),
         )
         self.assertEqual(len(published), 0, 'a DbPublisher was created despite no db-output pipeline')
 
@@ -668,7 +668,7 @@ class Test3TransactionAtomicity(unittest.TestCase):
         tc.run_pipelines(
             task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
             output_excel=False, output_db=True, creds={}, source_change_check=config,
-            publisher_factory=TrackingPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=TrackingPublisher),
         )
         self.assertEqual(len(published), 1)
 
@@ -686,7 +686,7 @@ class Test3TransactionAtomicity(unittest.TestCase):
         ctx.get_resource('r')  # force it into the cache so close() has something to close
         tc.run_pipelines(
             task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
-            output_excel=False, output_db=True, creds={}, publisher_factory=TrackingPublisher,
+            output_excel=False, output_db=True, creds={}, publisher_config=tc.PublisherConfig(publisher_factory=TrackingPublisher),
         )
         self.assertEqual(published[0].close_calls, 1)
         self.assertTrue(resource.closed)
@@ -706,7 +706,7 @@ class Test3TransactionAtomicity(unittest.TestCase):
         with self.assertRaises(tc.PipelineError):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
-                output_excel=False, output_db=True, creds={}, publisher_factory=TrackingPublisher,
+                output_excel=False, output_db=True, creds={}, publisher_config=tc.PublisherConfig(publisher_factory=TrackingPublisher),
             )
         self.assertEqual(published[0].close_calls, 1, 'publisher.close() was not called on failure')
         self.assertTrue(resource.closed, 'ctx.close() did not close the resource on failure')
@@ -728,7 +728,7 @@ class Test3TransactionAtomicity(unittest.TestCase):
         with self.assertRaises(tc.PipelineError) as cm:
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines=pipelines, run_sequence=['p'],
-                output_excel=False, output_db=True, creds={}, publisher_factory=CloseFailingPublisher,
+                output_excel=False, output_db=True, creds={}, publisher_config=tc.PublisherConfig(publisher_factory=CloseFailingPublisher),
             )
 
         self.assertIn('failed during pipeline execution', str(cm.exception))
@@ -922,7 +922,7 @@ class Test8RunnerSkipsWhenAnotherRunHoldsTheLock(unittest.TestCase):
             source_change_check=tc.SourceChangeCheckConfig(
                 enabled=True, schema='bsr', table='task_scaffold_meta',
             ),
-            publisher_factory=publisher_factory,
+            publisher_config=tc.PublisherConfig(publisher_factory=publisher_factory),
         )
 
     def test_a_lost_race_skips_without_running_any_pipeline(self):

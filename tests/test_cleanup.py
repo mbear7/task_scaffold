@@ -209,7 +209,9 @@ class Test3ContextClosedWhenPublisherCloseRaises(unittest.TestCase):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline}, run_sequence=['p'],
                 output_excel=False, output_db=True, creds={},
-                publisher_factory=lambda **kw: FakePublisher(**kw, close_error=OSError('SMB close failed')),
+                publisher_config=tc.PublisherConfig(
+                    publisher_factory=lambda **kw: FakePublisher(**kw, close_error=OSError('SMB close failed')),
+                ),
             )
 
         self.assertEqual(resource.close_calls, 1, 'ctx.close() did not run when publisher.close() raised')
@@ -253,7 +255,9 @@ class Test4PipelineErrorRemainsPrimaryWhenCleanupAlsoFails(unittest.TestCase):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline}, run_sequence=['p'],
                 output_excel=False, output_db=True, creds={},
-                publisher_factory=lambda **kw: FakePublisher(**kw, close_error=publisher_close_error),
+                publisher_config=tc.PublisherConfig(
+                    publisher_factory=lambda **kw: FakePublisher(**kw, close_error=publisher_close_error),
+                ),
             )
 
         self.assertIs(cm.exception.__cause__, pipeline_error)
@@ -290,7 +294,9 @@ class Test5CleanupErrorSurfacedWhenTaskSucceeds(unittest.TestCase):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline}, run_sequence=['p'],
                 output_excel=False, output_db=True, creds={},
-                publisher_factory=lambda **kw: FakePublisher(**kw, close_error=OSError('SMB close failed')),
+                publisher_config=tc.PublisherConfig(
+                    publisher_factory=lambda **kw: FakePublisher(**kw, close_error=OSError('SMB close failed')),
+                ),
             )
         # ctx.close() must still have run despite the publisher error.
         self.assertEqual(resource.close_calls, 1)
@@ -395,7 +401,7 @@ class Test8RollbackFailureHandling(unittest.TestCase):
         with self.assertRaises(tc.PipelineError) as cm:
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline}, run_sequence=['p'],
-                output_excel=False, output_db=True, creds={}, publisher_factory=factory,
+                output_excel=False, output_db=True, creds={}, publisher_config=tc.PublisherConfig(publisher_factory=factory),
             )
 
         self.assertIs(cm.exception.__cause__, pipeline_error)
@@ -415,7 +421,7 @@ class Test8RollbackFailureHandling(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline}, run_sequence=['p'],
-                output_excel=False, output_db=True, creds={}, publisher_factory=factory,
+                output_excel=False, output_db=True, creds={}, publisher_config=tc.PublisherConfig(publisher_factory=factory),
             )
 
         self.assertEqual(str(cm.exception), 'commit failed', 'the rollback failure masked the real commit failure')
@@ -511,7 +517,7 @@ class Test8RollbackFailureHandling(unittest.TestCase):
             tc.run_pipelines(
                 task_name='t', build_context=lambda: ctx, pipelines={'p': pipeline}, run_sequence=['p'],
                 output_excel=False, output_db=True, creds={}, source_change_check=config,
-                publisher_factory=factory,
+                publisher_config=tc.PublisherConfig(publisher_factory=factory),
             )
 
         self.assertEqual(pipeline_ran, [], 'pipeline ran despite unchanged sources')

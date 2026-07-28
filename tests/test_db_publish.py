@@ -32,11 +32,13 @@ FakeDbPublisher couldn't.
 """
 
 import sys
+import time
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
 
 import pandas as pd
+import sqlalchemy as sa
 from sqlalchemy import exc as sa_exc
 
 import task_core as tc
@@ -1660,6 +1662,19 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
 
             if 'max_identifier_length' in lowered:
                 return _Scalar(63)
+            if lowered.startswith('select to_regclass'):
+                # The lock phase probes which targets already exist. SQLite
+                # has no to_regclass, and the proxied connection would
+                # otherwise raise.
+                name = (params or {}).get('name', '').split('.')[-1]
+                found = self._real.execute(sa.text(
+                    "select name from sqlite_master where type='table' and name = :n"
+                ), {'n': name}).scalar()
+                return _Scalar(found)
+            if lowered.startswith('lock table'):
+                return None
+            if lowered.startswith('set local'):
+                return None
             if 'pg_try_advisory_lock' in lowered:
                 return _Scalar(True)
             if 'pg_class' in lowered and 'relname like' in lowered:
@@ -2149,6 +2164,14 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
 
             if 'max_identifier_length' in lowered:
                 return _Scalar(63)
+            if lowered.startswith('select to_regclass'):
+                name = (params or {}).get('name', '').split('.')[-1]
+                found = self._real.execute(sa.text(
+                    "select name from sqlite_master where type='table' and name = :n"
+                ), {'n': name}).scalar()
+                return _Scalar(found)
+            if lowered.startswith('lock table') or lowered.startswith('set local'):
+                return None
             if 'pg_try_advisory_lock' in lowered or 'pg_advisory_unlock' in lowered:
                 return _Scalar(True)
             if 'relname like' in lowered:
@@ -2806,6 +2829,496 @@ class Test27PostgresqlCommentDDL(unittest.TestCase):
         self.assertIn('"rows":7', sql)
         self.assertNotIn('%(1)s', sql)
         self.assertNotIn('%(7)s', sql)
+
+class Test27PublicationLockIsBounded(unittest.TestCase):
+    """PostgreSQL queues new ACCESS SHARE behind a waiting ACCESS
+    EXCLUSIVE, so a publisher waiting on one long reader blocks every
+    reader that arrives afterwards. Bounding the wait is what stops one
+    slow query turning a publication into a read outage.
+    """
+
+    class _Conn:
+        invalidated = False
+
+        def __init__(self, lock_failures=0, sqlstate='55P03'):
+            self.statements = []
+            self._lock_failures = lock_failures
+            self._sqlstate = sqlstate
+            self.lock_attempts = 0
+
+        @property
+        def dialect(self):
+            return type('D', (), {'name': 'postgresql'})()
+
+        def execute(self, statement, params=None):
+            text = str(statement)
+            self.statements.append(text)
+            lowered = text.lower()
+
+            if 'max_identifier_length' in lowered:
+                return _Scalar(63)
+            if 'advisory' in lowered:
+                return _Scalar(True)
+            if 'from pg_class c' in lowered and 'relname = :table' in lowered and 'oid from' in lowered:
+                return _Scalar('oid')      # every target already exists
+            if lowered.startswith('lock table'):
+                self.lock_attempts += 1
+                if self.lock_attempts <= self._lock_failures:
+                    raise _DbapiError(self._sqlstate)
+                return None
+            if 'relname like' in lowered:
+                return _Rows([])
+            if 'relname = ' in lowered:
+                return _Scalar(self.owner_comment)
+            return None
+
+        def in_transaction(self): return False
+        def begin(self): return _NoopTx(self)
+        def commit(self): pass
+        def rollback(self): pass
+        def close(self): pass
+
+    def _publisher(self, conn, policy=None):
+        from task_core.db_publish import PublicationLockPolicy
+        publisher = DbPublisher(
+            creds=_CREDS, schema='bsr', task_name='demo_task',
+            publication_lock_policy=policy or PublicationLockPolicy(
+                lock_timeout_ms=10, acquisition_timeout_ms=100,
+                retry_horizon_seconds=30,
+                retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+            ),
+        )
+        publisher._conn = conn
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        publisher.begin_run()
+        from task_core.db_publish import build_staging_comment, staging_table_name
+        staging = staging_table_name('bsr', 'target', publisher._run_token)
+        conn.owner_comment = build_staging_comment(
+            task_name='demo_task', run_token=publisher._run_token,
+            schema='bsr', table_name='target',
+        )
+        publisher._pending_swaps = [('bsr', 'target', staging, 1)]
+        publisher._generated_names = {('bsr', staging)}
+        return publisher
+
+    def _lock_statement(self, conn):
+        return next(s for s in conn.statements if s.lower().startswith('lock table'))
+
+    def test_all_targets_are_locked_in_one_sorted_statement(self):
+        """One statement, not one lock per DROP. The incremental form holds
+        locks on already-swapped tables while queuing for the next, and
+        each held lock blocks new readers -- so the amplification compounds.
+        Sorted, which is what stops two tasks with overlapping targets
+        deadlocking against each other.
+        """
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+        from task_core.db_publish import build_staging_comment, staging_table_name
+        for table in ('zebra', 'alpha'):
+            staging = staging_table_name('bsr', table, publisher._run_token)
+            publisher._pending_swaps.append(('bsr', table, staging, 1))
+        conn.owner_comment = None   # verification is not what this test is about
+        publisher._verify_prepared_artifacts = lambda: None
+
+        publisher.commit()
+
+        statement = self._lock_statement(conn)
+        self.assertEqual(conn.lock_attempts, 1, 'locks were acquired incrementally')
+        self.assertIn('access exclusive mode', statement.lower())
+        self.assertLess(statement.index('"alpha"'), statement.index('"target"'))
+        self.assertLess(statement.index('"target"'), statement.index('"zebra"'))
+
+    def test_both_timeouts_are_set_local_before_locking(self):
+        conn = self._Conn()
+        publisher = self._publisher(conn)
+        publisher.commit()
+
+        before_lock = conn.statements[:conn.statements.index(self._lock_statement(conn))]
+        joined = ' '.join(s.lower() for s in before_lock)
+        self.assertIn('set local lock_timeout', joined)
+        self.assertIn('set local statement_timeout', joined)
+
+    def test_the_budgets_are_lifted_once_the_locks_are_held(self):
+        # The horizon bounds the WAIT, not the work. Cancelling the swap
+        # halfway would be strictly worse than letting it finish.
+        conn = self._Conn()
+        self._publisher(conn).commit()
+        after = conn.statements[conn.statements.index(self._lock_statement(conn)) + 1:]
+        joined = ' '.join(s.lower() for s in after)
+        self.assertIn('set local lock_timeout = 0', joined)
+        self.assertIn('set local statement_timeout = 0', joined)
+
+    def test_a_first_ever_publication_locks_nothing(self):
+        class _Fresh(Test27PublicationLockIsBounded._Conn):
+            def execute(self, statement, params=None):
+                lowered = str(statement).lower()
+                if 'from pg_class c' in lowered and 'oid from' in lowered:
+                    self.statements.append(str(statement))
+                    return _Scalar(None)      # target does not exist yet
+                return super().execute(statement, params)
+
+        conn = _Fresh()
+        self._publisher(conn).commit()
+        self.assertFalse(any(s.lower().startswith('lock table') for s in conn.statements))
+
+    def test_a_lock_timeout_retries_the_whole_publication(self):
+        """Retry is cheap only because preparation already committed: a
+        failed publication discards a swap, not the run. Under the
+        single-transaction design this replaced, a lock timeout would have
+        meant redoing every pipeline.
+        """
+        conn = self._Conn(lock_failures=2)
+        publisher = self._publisher(conn)
+
+        publisher.commit()
+
+        self.assertEqual(conn.lock_attempts, 3)
+        self.assertTrue(publisher.committed)
+
+    def test_an_operator_cancellation_is_terminal(self):
+        """57014 is NOT uniquely statement_timeout -- pg_cancel_backend(),
+        a client cancel, or a role-level statement_timeout all produce it.
+        Retrying would mean arguing with a human who deliberately stopped
+        the run.
+        """
+        conn = self._Conn(lock_failures=1, sqlstate='57014')
+        publisher = self._publisher(conn)
+
+        with self.assertRaises(Exception) as caught:
+            publisher.commit()
+        self.assertNotIsInstance(caught.exception, DbPublishError)
+        self.assertEqual(conn.lock_attempts, 1, 'an explicit cancellation was retried')
+
+    def test_a_deadlock_is_terminal(self):
+        # Sorted order prevents deadlock between task_core publications, so
+        # one means something outside the scaffold takes exclusive locks on
+        # these tables -- which a retry does not fix.
+        conn = self._Conn(lock_failures=1, sqlstate='40P01')
+        publisher = self._publisher(conn)
+
+        with self.assertLogs(publisher.log, level='ERROR') as captured:
+            with self.assertRaises(Exception):
+                publisher.commit()
+
+        self.assertEqual(conn.lock_attempts, 1)
+        # Loud as well as terminal. Terminality alone would be satisfied by
+        # the catch-all branch, so asserting only that leaves the ERROR
+        # unverified -- confirmed by removing 40P01 from the loud set and
+        # watching an earlier version of this test still pass.
+        self.assertIn('40P01', ' '.join(captured.output))
+
+    def test_the_horizon_gates_completion_not_merely_starting(self):
+        """A horizon that only gated permission to START an attempt would
+        let one begun just inside it run well past -- a hint, not a limit.
+        """
+        from task_core.db_publish import PublicationLockPolicy
+        conn = self._Conn(lock_failures=99)
+        publisher = self._publisher(conn, PublicationLockPolicy(
+            lock_timeout_ms=10, acquisition_timeout_ms=100,
+            retry_horizon_seconds=0.3,
+            retry_delay_min_seconds=0.25, retry_delay_max_seconds=0.25,
+        ))
+
+        started = time.monotonic()
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.commit()
+        elapsed = time.monotonic() - started
+
+        # Stopped rather than slept past the horizon: sleeping in order to
+        # give up wastes the wait and holds the advisory lock longer.
+        self.assertLess(elapsed, 0.25)
+        self.assertIn('elapsed', str(caught.exception))
+
+    def test_an_exhausted_horizon_refuses_to_start_a_useless_attempt(self):
+        # A remaining budget too small for lock_timeout to sit below
+        # statement_timeout cannot produce a well-formed attempt, so there
+        # is nothing worth starting.
+        from task_core.db_publish import PublicationLockPolicy
+        conn = self._Conn(lock_failures=99)
+        publisher = self._publisher(conn, PublicationLockPolicy(
+            lock_timeout_ms=10, acquisition_timeout_ms=100,
+            retry_horizon_seconds=0.02,
+            retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+        ))
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.commit()
+        self.assertIn('usable timeout budget', str(caught.exception))
+        self.assertEqual(conn.lock_attempts, 0, 'a useless attempt was issued')
+
+    def test_exhaustion_reports_actual_elapsed_and_attempts(self):
+        # Budgets are derived from the remaining horizon, so reporting the
+        # configured policy would not reconcile with what happened.
+        from task_core.db_publish import PublicationLockPolicy
+        conn = self._Conn(lock_failures=99)
+        publisher = self._publisher(conn, PublicationLockPolicy(
+            lock_timeout_ms=10, acquisition_timeout_ms=100,
+            retry_horizon_seconds=1.0,
+            retry_delay_min_seconds=0.05, retry_delay_max_seconds=0.05,
+        ))
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.commit()
+        message = str(caught.exception)
+        self.assertIn('attempts', message)
+        self.assertIn('elapsed', message)
+        self.assertGreater(conn.lock_attempts, 1)
+
+    def test_max_attempts_is_a_defensive_ceiling(self):
+        from task_core.db_publish import PublicationLockPolicy
+        conn = self._Conn(lock_failures=99)
+        publisher = self._publisher(conn, PublicationLockPolicy(
+            lock_timeout_ms=10, acquisition_timeout_ms=100,
+            retry_horizon_seconds=60, max_attempts=3,
+            retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+        ))
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.commit()
+        self.assertEqual(conn.lock_attempts, 3)
+        self.assertIn('max_attempts', str(caught.exception))
+
+
+class _DbapiError(sa.exc.DBAPIError):
+    """A real SQLAlchemy DBAPIError carrying a SQLSTATE.
+
+    Subclasses the genuine class rather than Exception: commit() catches
+    sa.exc.DBAPIError specifically, so a stand-in that merely looked like
+    one would sail past the handler under test and prove nothing.
+    """
+
+    def __init__(self, pgcode):
+        self.orig = type('Orig', (), {'pgcode': pgcode})()
+        self.statement = None
+        self.params = None
+        self.connection_invalidated = False
+        Exception.__init__(self, f'simulated {pgcode}')
+
+
+
+class Test28LockPhaseFindingsFromReview(unittest.TestCase):
+    """Three release blockers plus their neighbours, each confirmed
+    directly before fixing."""
+
+    def test_a_quoted_live_target_is_found_and_therefore_locked(self):
+        """to_regclass() folds unquoted input to lower case, so a live
+        table named "Sales" was passed as bsr.Sales, looked up as
+        bsr.sales, and reported missing -- then EXCLUDED from the bounded
+        LOCK, leaving its DROP to acquire ACCESS EXCLUSIVE with no timeout.
+        The one table most needing the bound escaped it.
+
+        Same defect already fixed once in _verify_prepared_artifacts() and
+        reintroduced here: assembling a name for the parser is the trap,
+        not any particular call site.
+        """
+        probes = []
+
+        class _Probe(Test27PublicationLockIsBounded._Conn):
+            def execute(self, statement, params=None):
+                lowered = str(statement).lower()
+                if 'from pg_class c' in lowered and 'oid from' in lowered:
+                    probes.append(dict(params or {}))
+                return super().execute(statement, params)
+
+        for table in ('Sales', 'sales report', 'a"quote', 'portable_name'):
+            with self.subTest(table=table):
+                probes.clear()
+                conn = _Probe()
+                publisher = self._publisher(conn, table_name=table)
+                publisher._verify_prepared_artifacts = lambda: None
+                publisher.commit()
+
+                # Passed as an exact value, never assembled into a name the
+                # parser will re-interpret.
+                self.assertIn({'schema': 'bsr', 'table': table}, probes)
+                statement = next(
+                    s for s in conn.statements if s.lower().startswith('lock table')
+                )
+                self.assertIn(table.replace('"', '""'), statement)
+
+    def _publisher(self, conn, table_name='target', policy=None):
+        from task_core.db_publish import (
+            PublicationLockPolicy, build_staging_comment, staging_table_name,
+        )
+        publisher = DbPublisher(
+            creds=_CREDS, schema='bsr', task_name='demo_task',
+            publication_lock_policy=policy or PublicationLockPolicy(
+                lock_timeout_ms=10, acquisition_timeout_ms=100,
+                retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+            ),
+        )
+        publisher._conn = conn
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        publisher.begin_run()
+        staging = staging_table_name('bsr', table_name, publisher._run_token)
+        conn.owner_comment = build_staging_comment(
+            task_name='demo_task', run_token=publisher._run_token,
+            schema='bsr', table_name=table_name,
+        )
+        publisher._pending_swaps = [('bsr', table_name, staging, 1)]
+        publisher._generated_names = {('bsr', staging)}
+        return publisher
+
+    def test_the_timeout_ordering_is_a_configuration_invariant(self):
+        """PostgreSQL fires statement_timeout first once it reaches
+        lock_timeout, which here converts retryable 55P03 into terminal
+        57014 -- ordinary contention would end the run instead of being
+        retried.
+        """
+        from task_core.db_publish import PublicationLockPolicy
+        for acquisition in (100, 500, 549):
+            with self.subTest(acquisition_timeout_ms=acquisition):
+                with self.assertRaises(DbPublishError) as caught:
+                    PublicationLockPolicy(lock_timeout_ms=500,
+                                          acquisition_timeout_ms=acquisition)
+                self.assertIn('55P03', str(caught.exception))
+        PublicationLockPolicy(lock_timeout_ms=500, acquisition_timeout_ms=551)
+
+    def test_derived_budgets_never_invert_the_ordering(self):
+        # Clamping both to the same remaining budget made them EQUAL on a
+        # short final attempt -- the same inversion, arrived at by
+        # arithmetic instead of configuration.
+        from task_core.db_publish import PublicationLockPolicy
+        policy = PublicationLockPolicy()
+        for remaining in (60, 5, 1, 0.6, 0.55, 0.051):
+            with self.subTest(remaining=remaining):
+                budgets = policy.attempt_budgets_ms(remaining)
+                if budgets is None:
+                    continue
+                statement_ms, lock_ms = budgets
+                self.assertLess(lock_ms, statement_ms)
+
+    def test_no_attempt_is_started_after_the_deadline(self):
+        from task_core.db_publish import PublicationLockPolicy
+        policy = PublicationLockPolicy()
+        self.assertIsNone(policy.attempt_budgets_ms(0))
+        self.assertIsNone(policy.attempt_budgets_ms(-5))
+
+    def test_source_state_work_happens_before_the_targets_are_locked(self):
+        """The publication plan runs create-if-not-exists, a DELETE and an
+        upsert against the source-state table. With the locks already held
+        -- and both timeouts reset to zero on acquisition -- any wait in
+        that work kept every live target under ACCESS EXCLUSIVE for its
+        duration, recreating the outage this is meant to bound.
+        """
+        from task_core.db_publish import PublicationPlan
+
+        order = []
+        plan = PublicationPlan()
+        plan.add('source state', lambda: order.append('plan'))
+
+        class _Ordered(Test27PublicationLockIsBounded._Conn):
+            def execute(self, statement, params=None):
+                if str(statement).lower().startswith('lock table'):
+                    order.append('lock')
+                return super().execute(statement, params)
+
+        conn = _Ordered()
+        publisher = self._publisher(conn)
+        publisher.publication_plan = plan
+        publisher.commit()
+
+        self.assertEqual(order, ['plan', 'lock'])
+
+    def test_the_jitter_range_is_derived_from_what_remains(self):
+        """Sampling first and rejecting threw the run away whenever the
+        draw exceeded the remaining horizon -- with 4s left and a 1-5s
+        range, a 4.5s draw ended it while a shorter delay and another
+        bounded attempt would have fitted.
+        """
+        from task_core.db_publish import PublicationLockPolicy
+        conn = Test27PublicationLockIsBounded._Conn(lock_failures=1)
+        publisher = self._publisher(conn, policy=PublicationLockPolicy(
+            lock_timeout_ms=10, acquisition_timeout_ms=100,
+            retry_horizon_seconds=1.0,
+            retry_delay_min_seconds=0.01, retry_delay_max_seconds=30.0,
+        ))
+
+        publisher.commit()   # a 30s draw would have ended the run
+
+        self.assertEqual(conn.lock_attempts, 2)
+
+    def test_every_unsuccessful_attempt_leaves_no_open_transaction(self):
+        """commit() caught only DBAPIError, so any other failure left the
+        publication transaction OPEN -- after _publish_once() had already
+        opened it, verified the staging artifacts, and possibly run the
+        source-state plan. The runner's cleanup reaches rollback()
+        eventually; a direct caller, or one catching the exception, was
+        left holding a dirty transaction.
+        """
+        from task_core.db_publish import PublicationLockPolicy
+
+        # Horizon too short to form an attempt -> DbPublishError, not DBAPI.
+        conn = Test27PublicationLockIsBounded._Conn()
+        publisher = self._publisher(conn, policy=PublicationLockPolicy(
+            lock_timeout_ms=10, acquisition_timeout_ms=100,
+            retry_horizon_seconds=0.001,
+        ))
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertRaises(DbPublishError):
+            publisher.commit()
+        self.assertIsNone(publisher._tx, 'the publication transaction was left open')
+
+    def test_a_non_dbapi_failure_is_still_terminal_and_clean(self):
+        # Rolling back on everything must not turn an invariant violation
+        # or an interruption into a retry.
+        from task_core.db_publish import PublicationPlan
+
+        plan = PublicationPlan()
+        plan.add('boom', lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+        conn = Test27PublicationLockIsBounded._Conn()
+        publisher = self._publisher(conn)
+        publisher.publication_plan = plan
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertRaises(KeyboardInterrupt):
+            publisher.commit()
+        self.assertIsNone(publisher._tx)
+        self.assertEqual(conn.lock_attempts, 0, 'a non-DBAPI failure was retried')
+
+    def test_the_deadlock_message_does_not_name_the_target_locks(self):
+        """The publication plan runs BEFORE locking, so a deadlock is
+        reachable with zero lock attempts. Blaming the target locks would
+        misdirect the investigation.
+        """
+        conn = Test27PublicationLockIsBounded._Conn(lock_failures=1, sqlstate='40P01')
+        publisher = self._publisher(conn)
+
+        with self.assertLogs(publisher.log, level='ERROR') as captured:
+            with self.assertRaises(Exception):
+                publisher.commit()
+
+        message = ' '.join(captured.output)
+        self.assertIn('deadlock', message.lower())
+        self.assertNotIn('exclusive locks on these tables', message)
+
+    def test_the_margin_boundary_matches_its_own_error_message(self):
+        # The check rejected a difference of exactly the margin while the
+        # message said "by at least" it.
+        from task_core.db_publish import PublicationLockPolicy
+        margin = PublicationLockPolicy.TIMEOUT_MARGIN_MS
+        PublicationLockPolicy(lock_timeout_ms=500, acquisition_timeout_ms=500 + margin)
+        with self.assertRaises(DbPublishError):
+            PublicationLockPolicy(lock_timeout_ms=500, acquisition_timeout_ms=500 + margin - 1)
+
+    def test_the_config_rejects_a_missing_policy(self):
+        from task_core.db_publish import PublisherConfig
+        for kwargs in ({'identifier_policy': None},
+                       {'publication_lock_policy': None},
+                       {'publisher_factory': 3}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(DbPublishError):
+                    PublisherConfig(**kwargs)
+
+    def test_the_policy_rejects_non_finite_numbers(self):
+        from task_core.db_publish import PublicationLockPolicy
+        for field in ('retry_horizon_seconds', 'retry_delay_min_seconds',
+                      'retry_delay_max_seconds'):
+            for value in (float('nan'), float('inf')):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(DbPublishError):
+                        PublicationLockPolicy(**{field: value})
+
+
 
 if __name__ == '__main__':
     unittest.main()

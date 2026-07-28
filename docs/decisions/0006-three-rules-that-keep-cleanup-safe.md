@@ -95,6 +95,51 @@ unknown is never dropped.** A parse failure must not fall through to a
 drop; that is the failure mode that turns cleanup from hygiene into an
 outage.
 
+## Verification status
+
+The three rules were argued from PostgreSQL semantics before they were
+observed. They have since been checked against a real server, so the
+reasoning below is now a description of measured behaviour rather than an
+expectation of it.
+
+**Confirmed against PostgreSQL 16 (0.3.9):**
+
+- A concurrent publisher is refused while the first is alive, and the run
+  skips with `skip_reason='task_already_running'` rather than failing.
+- Terminating the lock-owning backend releases the lock: a successor
+  acquired the same lock afterwards, which is the property rule 1 rests on
+  and the one that cannot be inferred from a lock table.
+- The surviving publisher object refused to reconnect, with the terminal
+  state reached through `ensure_connection()` rather than left to a
+  caller. Its committed staging table survived its dead run, and the
+  successor removed it under its own lock -- rules 2 and 3 doing exactly
+  the job the trace in this document describes, in that order.
+- Cleanup dropped a genuine predecessor artifact while preserving four
+  negatives: no comment, an invalid comment, another task's comment, and a
+  name whose token was not hexadecimal. That last one is the strict
+  physical-name rule above, exercised against a real catalog.
+- Ownership comments survive `ALTER TABLE ... RENAME`, which is why the
+  swap replaces them; and `max_identifier_length` is 63 on that server,
+  which had been an assumption about a stock build rather than a
+  measurement.
+
+**Not confirmed, and worth knowing:**
+
+- Everything above was observed on one PostgreSQL 16 instance. Advisory
+  locks, transactional DDL and catalog comment behaviour are stable across
+  supported versions, but "stable" is itself an expectation.
+- A backend killed by the OS rather than by `pg_terminate_backend()`, and
+  a network partition that leaves the server believing the session is
+  alive, are both untested. The second is the interesting one: it is the
+  case where a stalled run could in principle still hold its lock while
+  being unable to make progress, and the design's answer is that the
+  server reaps the session eventually.
+
+Recorded here rather than linked to a test artifact: the harness that
+produced these results is not part of this project, and a reader should
+not be sent looking for a file that is not in the repository.
+
+
 ## Consequences
 
 - **`pg_try_advisory_lock`, not the blocking form.** A schedule firing

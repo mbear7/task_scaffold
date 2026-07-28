@@ -149,9 +149,11 @@ are to matter. Each is expanded in
   types are inferred from the data, so a table's schema can change between
   runs. Grants are not preserved, and a dependent view makes the publish
   fail.
-- **One PostgreSQL publication transaction spans the pipeline run.** It
-  opens at the first DB publish and stays open until the final swap and
-  commit. Atomic, but long.
+- **Publication is atomic; preparation is not.** Each DB target is
+  prepared in its own committed transaction, and one short publication
+  transaction swaps them all. No transaction spans the run — but a failed
+  run leaves committed staging tables, which the next run of the same task
+  removes.
 - **Column names published to PostgreSQL must be lower-case ASCII
   identifiers** unless a pipeline opts into `db_identifier_mode='quoted'`.
 - **`task_core.types` shadows the standard library `types` module** inside

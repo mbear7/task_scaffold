@@ -232,14 +232,55 @@ excluded by default.
 | `pg_schema` | `'bsr'` | Target schema. |
 | `source_change_check` | `None` | `SourceChangeCheckConfig`, or `None` to always run. |
 | `force_run` | `False` | Run even if sources are unchanged. |
-| `publisher_factory` | `DbPublisher` | Extension seam; see [architecture.md](architecture.md#extension-points). |
-| `db_max_identifier_bytes` | `63` | Identifier byte limit used by preflight. |
+| `publisher_config` | `None` | `PublisherConfig()` — everything about how publication behaves. See below. |
 
 Returns a `RunResult`: `task_name`, `pipeline_rows`, `excel_outputs`,
 `db`, `skipped`, `skip_reason`, `source_check_enabled`, `source_changed`,
 `source_fingerprints`. The `db` field is a `DbRunResult` with `requested`,
 `had_outputs`, `committed`, `committed_tables`, `published_tables`,
 `row_counts`.
+
+
+## PublisherConfig
+
+Every publication-behaviour setting lives in one frozen object, so a task
+that needs to change one does not have to restate the rest.
+
+```python
+from task_core import PublisherConfig, PublicationLockPolicy
+
+run_pipelines(
+    ...,
+    publisher_config=PublisherConfig(
+        publication_lock_policy=PublicationLockPolicy(
+            retry_horizon_seconds=300,
+            retry_delay_max_seconds=15,
+        ),
+    ),
+)
+```
+
+| field | default | meaning |
+| --- | --- | --- |
+| `publisher_factory` | `DbPublisher` | Extension seam; see [architecture.md](architecture.md#extension-points). |
+| `identifier_policy` | `IdentifierPolicy()` | Identifier rules, currently the byte limit. |
+| `publication_lock_policy` | `PublicationLockPolicy()` | How long publication may wait for its target locks. |
+
+`PublicationLockPolicy` bounds the `ACCESS EXCLUSIVE` wait during
+publication, so a long-running reader cannot turn one publication into a
+read outage. Defaults: `lock_timeout_ms=500`,
+`acquisition_timeout_ms=5000`, `retry_horizon_seconds=60`,
+`retry_delay_min_seconds=1`, `retry_delay_max_seconds=5`,
+`max_attempts=100`.
+
+The horizon is the real bound: it gates *completion* of lock acquisition,
+so the per-attempt timeouts are ceilings and a final attempt may run with
+less. `max_attempts` is a defensive ceiling only — unreachable under the
+defaults, and there to stop a runaway if someone configures a sub-second
+delay.
+
+Widen the horizon for tables under constant BI load; leave it alone
+otherwise. Nothing about a normal task changes.
 
 
 ## Source-change checking

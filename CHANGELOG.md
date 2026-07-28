@@ -12,6 +12,162 @@ chronologically rather than by release.
 ## Unreleased
 
 
+## 0.4.0
+
+One deliberate public API break, executing the consolidation recorded in
+`docs/decisions/0005`.
+
+### Added
+- **`PublicationLockPolicy`** — bounds the `ACCESS EXCLUSIVE` wait during
+  publication. All targets are locked in one sorted statement under
+  `lock_timeout` and `statement_timeout`; the whole publication is retried
+  on `55P03` within a wall-clock horizon that gates *completion*, so
+  per-attempt budgets are ceilings and a final attempt may run with less.
+
+  Without this, PostgreSQL's queueing means a publisher waiting on one
+  long reader blocks every reader arriving afterwards — and the previous
+  per-table acquisition compounded it by holding locks on already-swapped
+  tables while queuing for the next. See `docs/decisions/0008`.
+
+  `57014` is terminal, including operator cancellation: it is not uniquely
+  `statement_timeout`, and the scaffold should not argue with a human who
+  stopped it. `40P01` is terminal and logged at ERROR.
+
+- **`PublisherConfig`** — `publisher_factory`, `identifier_policy` and
+  `publication_lock_policy` in one frozen object.
+
+### Changed
+- **`run_pipelines()` takes `publisher_config` instead of
+  `publisher_factory` and `db_max_identifier_bytes`.** Both loose
+  parameters are removed with no compatibility alias. Per-task facts —
+  `creds`, `pg_schema` — stay direct arguments.
+
+  ```python
+  run_pipelines(..., publisher_config=PublisherConfig(
+      publication_lock_policy=PublicationLockPolicy(retry_horizon_seconds=300),
+  ))
+  ```
+
+  Nothing changes for a task that does not need to tune publication.
+
+### Removed
+- The rationale claiming the source-state write is ordered before the
+  swaps to keep it out of the exclusive window. With pre-locking the
+  window opens at `LOCK`, so the claim was false and has been deleted
+  rather than left standing.
+
+
+### Fixed during review, before release
+These correct 0.4.0 itself rather than following it; the package never
+shipped with them outstanding.
+
+- **Quoted live targets escaped the bounded lock.** `to_regclass()` folds
+  unquoted input to lower case, so a table named `"Sales"` was passed as
+  `bsr.Sales`, looked up as `bsr.sales`, and reported missing — then
+  excluded from the bounded `LOCK`, leaving its `DROP` to take
+  `ACCESS EXCLUSIVE` with no timeout. The one table most needing the bound
+  escaped it. Now an exact `pg_class`/`pg_namespace` lookup.
+
+  This is the same defect fixed in `_verify_prepared_artifacts()` in 0.3.2
+  and reintroduced in the new lock phase. The trap is assembling a name
+  for the parser, not any particular call site.
+
+- **`acquisition_timeout_ms <= lock_timeout_ms` was accepted**, which makes
+  `statement_timeout` fire first and converts retryable `55P03` into
+  terminal `57014` — ordinary contention would have ended the run. Now a
+  configuration invariant with a 50 ms margin, and the derived per-attempt
+  budgets preserve the ordering instead of clamping both to the same
+  remaining value.
+
+- **Target locks were taken before the publication plan ran.** The plan
+  performs create-if-not-exists, a `DELETE` and an upsert against the
+  source-state table; with the locks held and both timeouts already reset,
+  any wait there kept every live target exclusive for its duration.
+  Locking now happens last, immediately before the swaps.
+
+- Retry jitter was sampled and then rejected, so a long draw ended the run
+  with part of the horizon deliberately unused. The range is now derived
+  from what remains, and no attempt starts once the deadline has passed.
+
+- `PublisherConfig` rejects a `None` policy or a non-callable factory, and
+  `PublicationLockPolicy` rejects NaN and infinity — both previously
+  restored the independent defaulting these objects exist to remove.
+
+- **`commit()` could leave the publication transaction open.** It caught
+  only `DBAPIError`, so any other failure — an exhausted horizon, an
+  invariant violation, `KeyboardInterrupt` — returned with the transaction
+  still open, after `_publish_once()` had opened it, verified the staging
+  artifacts and possibly run the source-state plan. Every unsuccessful
+  attempt now rolls back before the failure is classified, and only DBAPI
+  errors are considered for retry.
+- The `40P01` message no longer blames the target locks. The publication
+  plan runs before locking, so a deadlock is reachable with zero lock
+  attempts, and naming the locks would misdirect the investigation.
+- The timeout-margin check rejected a difference of exactly the margin
+  while its message said "by at least" it. Exactly the margin is now
+  accepted.
+
+### Documentation
+- `docs/decisions/0008` records verification status. The bounded-wait
+  behaviour is confirmed against PostgreSQL 16.14: reader C blocked behind
+  the queued publisher as expected, then resumed in 2.0s **while reader A
+  was still open** — so its delay was bounded by the publisher's budget
+  rather than by the long reader's lifetime, which is the property the
+  decision exists to produce. The same run confirmed quoted-target
+  locking, `55P03` rather than `57014` on contention, source-state work
+  preceding the lock, and clean rollback on horizon exhaustion.
+
+  The multi-table and deadlock paths are confirmed too. Two contended
+  targets produced one sorted `LOCK` carrying both, and the ADR now
+  records what the run showed: a single statement **bounds** the
+  compounding rather than removing it — PostgreSQL acquires in sequence,
+  and a reader arriving on an already-acquired target does block until
+  rollback.
+
+  It also records the consequence that surfaced: multi-table contention
+  tends to exhaust the aggregate `statement_timeout`, which raises the
+  terminal `57014` rather than the retryable `55P03`. So such publications
+  are likelier to fail cleanly than to retry — an argument for widening
+  `acquisition_timeout_ms` rather than `lock_timeout_ms` on tasks
+  publishing several contended tables.
+
+  `40P01` was provoked from the publication plan with zero lock attempts,
+  confirming the phase-neutral diagnostic: the older wording would have
+  blamed a phase that had not yet run.
+- ADR 0008's real-server criterion was wrong: it asked that a third reader
+  never block, which contradicts the queueing behaviour the ADR itself
+  describes. The correct observation is that the third reader's delay is
+  *bounded* by the publisher's remaining budget.
+- ADR 0008 no longer claims locks are acquired atomically; PostgreSQL
+  takes them in sequence, and the all-or-none outcome is application-level,
+  via rollback.
+- `README.md` no longer says one publication transaction spans the run.
+- `run_pipelines()`'s docstring no longer documents the removed
+  `publisher_factory` argument.
+
+
+
+- `docs/decisions/0006` records verification status. Its three rules were
+  argued from PostgreSQL semantics; they have now been checked against a
+  real server, including the connection-loss path that a shared instance
+  could not safely exercise. Terminating the lock-owning backend releases
+  the lock, the surviving publisher refuses to reconnect, and a successor
+  removes the orphan under its own lock — the interlock this decision
+  describes, observed in that order rather than inferred.
+
+  What remains unconfirmed is recorded alongside it: one server version,
+  and no coverage of a backend killed by the OS or of a network partition
+  that leaves the server believing the session is alive.
+
+### Migration
+- `run_pipelines(publisher_factory=X)` becomes
+  `run_pipelines(publisher_config=PublisherConfig(publisher_factory=X))`.
+- `run_pipelines(db_max_identifier_bytes=N)` becomes
+  `publisher_config=PublisherConfig(identifier_policy=IdentifierPolicy(max_identifier_bytes=N))`.
+- Custom publishers gain a `publication_lock_policy` constructor keyword.
+- All fail loudly.
+
+
 ## 0.3.9
 
 ### Fixed

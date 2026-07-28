@@ -542,7 +542,7 @@ class Test10DynamicDbContractOnBoundPipeline(unittest.TestCase):
             output_excel=False,
             output_db=True,
             creds={'user': 'x', 'host': 'x', 'dbname': 'x'},
-            publisher_factory=FakeDbPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=FakeDbPublisher),
         )
         # publisher_factory is a plain argument -- confirms it didn't need
         # to touch the real DbPublisher class at all, unlike the
@@ -888,7 +888,7 @@ class Test12RunnerInvokesBackendPreflightBeforeBuildingResources(unittest.TestCa
             build_context=lambda: tc.task_context(task_name='t', loaders={}),
             pipelines={'p': self._pipeline(db_table='hr_staff')},
             run_sequence=['p'], output_excel=False, output_db=False,
-            publisher_factory=ConnectionWatchingPublisher,
+            publisher_config=tc.PublisherConfig(publisher_factory=ConnectionWatchingPublisher),
         )
 
         self.assertFalse(result.skipped)
@@ -917,7 +917,7 @@ class Test12RunnerInvokesBackendPreflightBeforeBuildingResources(unittest.TestCa
                 build_context=lambda: tc.task_context(task_name='t', loaders={}),
                 pipelines={'p': self._pipeline(db_table='Sales')},
                 run_sequence=['p'], output_excel=False, output_db=False,
-                publisher_factory=lambda **kwargs: None,
+                publisher_config=tc.PublisherConfig(publisher_factory=lambda **kwargs: None),
             )
 
 
