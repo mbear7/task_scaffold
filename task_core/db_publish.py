@@ -23,7 +23,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
-from task_core.types import IDENTIFIER_MODES, PORTABLE_IDENTIFIER_RE, find_duplicates
+from task_core.types import PORTABLE_IDENTIFIER_RE, find_duplicates
 
 
 @dataclass(frozen=True)
@@ -43,11 +43,6 @@ class DbPayload:
     rows: list[dict[str, Any]]
     type_overrides: dict[str, Any] | None = None
     db_table_id_pix: Any | None = None
-    # Carried from PipelineSpec.db_identifier_mode so publish() can apply
-    # the right column-name policy at the only point where the real column
-    # names exist. Defaults to the strict mode, so a payload built directly
-    # (tests, ad-hoc callers) is validated rather than waved through.
-    identifier_mode: str = 'portable'
 
 
 class DbPublishError(RuntimeError):
@@ -181,7 +176,7 @@ def _apply_db_contract_columns(columns, rows, db_contract, *, table_name):
     ]
 
 
-def from_petl(tbl, *, table_name, schema, type_overrides=None, db_contract=None, db_table_id_pix=None, identifier_mode='portable'):
+def from_petl(tbl, *, table_name, schema, type_overrides=None, db_contract=None, db_table_id_pix=None):
     if isinstance(tbl, pd.DataFrame):
         raise DbPublishError(
             f'{table_name!r}: from_petl() received a pandas DataFrame, '
@@ -213,12 +208,11 @@ def from_petl(tbl, *, table_name, schema, type_overrides=None, db_contract=None,
         rows=rows,
         type_overrides=type_overrides,
         db_table_id_pix=db_table_id_pix,
-        identifier_mode=identifier_mode,
     )
 
 
 
-def from_pandas(df: pd.DataFrame, *, table_name, schema, type_overrides=None, db_contract=None, db_table_id_pix=None, identifier_mode='portable'):
+def from_pandas(df: pd.DataFrame, *, table_name, schema, type_overrides=None, db_contract=None, db_table_id_pix=None):
     if not isinstance(df, pd.DataFrame):
         raise DbPublishError(
             f'{table_name!r}: from_pandas() received a {type(df).__name__!r}, '
@@ -246,7 +240,6 @@ def from_pandas(df: pd.DataFrame, *, table_name, schema, type_overrides=None, db
         rows=rows,
         type_overrides=type_overrides,
         db_table_id_pix=db_table_id_pix,
-        identifier_mode=identifier_mode,
     )
 
 
@@ -323,8 +316,7 @@ def validate_portable_identifier(name, *, kind, context=''):
     if not PORTABLE_IDENTIFIER_RE.fullmatch(name):
         raise DbPublishError(
             f'{context}{kind} is not a portable identifier '
-            f'({PORTABLE_IDENTIFIER_RE.pattern}): {name!r}. '
-            f"Rename it, or set db_identifier_mode='quoted' on the pipeline spec."
+            f'({PORTABLE_IDENTIFIER_RE.pattern}): {name!r}. Rename it.'
         )
     return name
 
@@ -364,6 +356,31 @@ def server_identifier_limit(conn, configured):
         ) from exc
 
     return min(configured, int(value))
+
+
+_FIND_RELATION_SQL = sa.text(
+    "select c.oid, c.relkind "
+    "from pg_catalog.pg_class c "
+    "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+    "where n.nspname = :schema and c.relname = :table"
+)
+
+
+def _find_relation(conn, schema, table):
+    """Return the exact PostgreSQL relation ``(oid, relkind)``, or ``None``.
+
+    Schema and relation names remain separate bound values. Nothing is
+    assembled into parser input, so search-path lookup and identifier case
+    folding cannot change which catalog object is resolved. Callers own the
+    missing-relation and relation-kind policy.
+    """
+    row = conn.execute(
+        _FIND_RELATION_SQL,
+        {'schema': schema, 'table': table},
+    ).one_or_none()
+    if row is None:
+        return None
+    return int(row[0]), str(row[1])
 
 
 class PublicationPlan:
@@ -1188,9 +1205,8 @@ class DbPublisher:
         if not declaring and not source_state_target:
             return
 
-        # Schema is task-wide, so it is always portable and never governed
-        # by any pipeline's db_identifier_mode -- see PipelineSpec's own
-        # note on why a per-spec flag must not reach a per-run value.
+        # The package has one identifier contract: every schema, table and
+        # published column name is a portable lower-case identifier.
         if schema and declaring:
             validate_identifier(schema, max_identifier_bytes, kind='schema')
             validate_portable_identifier(schema, kind='schema')
@@ -1229,11 +1245,8 @@ class DbPublisher:
         seen_staging = {}
         for pipeline_name, spec in declaring.items():
             context = f'{pipeline_name}: '
-            portable = spec.db_identifier_mode == 'portable'
-
             validate_identifier(spec.db_table, max_identifier_bytes, kind='table name', context=context)
-            if portable:
-                validate_portable_identifier(spec.db_table, kind='table name', context=context)
+            validate_portable_identifier(spec.db_table, kind='table name', context=context)
 
             if reserved is not None and (schema, spec.db_table) == reserved:
                 raise DbPublishError(
@@ -1264,8 +1277,7 @@ class DbPublisher:
 
             for column in cls._declared_column_targets(spec):
                 validate_identifier(column, max_identifier_bytes, kind='column name', context=context)
-                if portable:
-                    validate_portable_identifier(column, kind='column name', context=context)
+                validate_portable_identifier(column, kind='column name', context=context)
 
     @staticmethod
     def _declared_column_targets(spec):
@@ -1296,58 +1308,25 @@ class DbPublisher:
 
 
     def _validate_payload_identifiers(self, payload, limit):
-        """The runtime half: the actual column names, after db_contract has
-        been applied, after any db_output projection, and after
-        apply_db_updated_at() has appended its column -- which is the only
-        point at which they all exist. Preflight covers what is statically
-        declarable; this covers dynamic contracts and pipelines that
-        declare no contract at all.
+        """Validate actual output names after contracts and projections apply.
 
-        Placement is load-bearing, not incidental. Confirmed directly: run
-        before the contract, this rejects 77 of 79 source names (raw
-        Cyrillic spreadsheet headers) and breaks every hr_task pipeline;
-        run after, all 145 target names pass. Do not move it upstream.
+        This is the only point where every runtime column name exists. All
+        database identifiers follow the same portable lower-case contract;
+        direct ``DbPayload`` callers receive the same validation as the normal
+        ``PipelineSpec`` path.
         """
-        validate_identifier(payload.table_name, limit, kind='table name')
-        if payload.schema:
-            validate_identifier(payload.schema, limit, kind='schema')
-
-        # Portability on the table name and schema, not only on columns.
-        # The standard runner path catches a bad table through preflight,
-        # but a DbPayload built directly does not go through it -- and this
-        # function already validates the payload's own identifier_mode,
-        # which means direct construction is treated as part of the
-        # contract. Under that contract the strict default was permitting a
-        # non-portable table name, confirmed directly.
-        #
-        # The schema is checked regardless of the payload's mode, matching
-        # the rule preflight applies: schema is task-wide while the mode is
-        # per-payload, so a per-payload flag must not be able to relax it.
-        if payload.schema:
-            validate_portable_identifier(
-                payload.schema, kind='schema', context=f'{payload.table_name!r}: ',
-            )
-
         context = f'{payload.table_name!r}: '
 
-        # Validated, not merely compared. PipelineSpec checks its own mode,
-        # but a DbPayload built directly does not go through it -- and
-        # `mode == 'portable'` means any typo ('portbale') silently selects
-        # the permissive branch. Confirmed directly: a misspelled mode let
-        # a Cyrillic column through.
-        if payload.identifier_mode not in IDENTIFIER_MODES:
-            raise DbPublishError(
-                f'{context}identifier_mode must be one of {IDENTIFIER_MODES}, '
-                f'got {payload.identifier_mode!r}'
-            )
-        portable = payload.identifier_mode == 'portable'
-        if portable:
-            validate_portable_identifier(payload.table_name, kind='table name', context=context)
+        validate_identifier(payload.table_name, limit, kind='table name')
+        validate_portable_identifier(payload.table_name, kind='table name', context=context)
+
+        if payload.schema:
+            validate_identifier(payload.schema, limit, kind='schema')
+            validate_portable_identifier(payload.schema, kind='schema', context=context)
 
         for column in payload.columns:
             validate_identifier(column, limit, kind='column name', context=context)
-            if portable:
-                validate_portable_identifier(column, kind='column name', context=context)
+            validate_portable_identifier(column, kind='column name', context=context)
 
     def publish(self, payload: DbPayload):
         """Prepare one output for publication, in its own committed
@@ -1574,44 +1553,40 @@ class DbPublisher:
             self._conn.commit()
 
     def _verify_prepared_artifacts(self):
-        """Cheap identity checks only, inside the publication transaction.
+        """Verify exact staging identity and ownership inside publication.
 
-        Every check here is O(number of tables), never O(rows). Recounting
-        a large staging table or re-running validation would put the run's
-        expensive work back inside the short transaction, which is the one
-        thing this phase exists to avoid. The row count recorded at
-        preparation is carried into the RunResult as metadata, not compared
-        against anything -- comparing a recorded number to itself proves
-        nothing, and comparing it to a live count is the recount just
-        excluded.
+        Every check is O(number of tables), never O(rows). The exact catalog
+        resolver is shared only with live-target locking; each caller retains
+        its own missing-relation and relation-kind policy.
         """
         conn = self.ensure_connection()
         if conn.dialect.name != 'postgresql':
             return
 
         for schema, table_name, staging_name, _rows in self._pending_swaps:
-            # Exact catalog values, NOT to_regclass() on an assembled
-            # string. to_regclass parses its argument as an identifier
-            # expression, so it down-cases anything unquoted -- which means
-            # a mixed-case, Cyrillic or spaced staging name produced under
-            # db_identifier_mode='quoted' would prepare correctly and then
-            # be reported as missing here. Matching on nspname/relname
-            # works identically for both identifier modes.
-            comment = conn.execute(
-                sa.text(
-                    'select obj_description(c.oid, \'pg_class\') '
-                    'from pg_class c join pg_namespace n on n.oid = c.relnamespace '
-                    'where n.nspname = :schema and c.relname = :table'
-                ),
-                {'schema': schema, 'table': staging_name},
-            ).scalar()
+            relation = _find_relation(conn, schema, staging_name)
+            if relation is None:
+                raise DbPublishError(
+                    f'staging table {staging_name} is missing; refusing to publish '
+                    f'it over {table_name!r}'
+                )
 
+            oid, relkind = relation
+            if relkind != 'r':
+                raise DbPublishError(
+                    f'staging relation {schema}.{staging_name} exists but is not an '
+                    f'ordinary table (relkind={relkind!r}); refusing to publish it'
+                )
+
+            comment = conn.execute(
+                sa.text("select obj_description(:oid, 'pg_class')"),
+                {'oid': oid},
+            ).scalar()
             owner = parse_staging_comment(comment)
             if owner is None:
                 raise DbPublishError(
-                    f'staging table {staging_name} is missing or no longer carries '
-                    f'this run\'s ownership metadata; refusing to publish it over '
-                    f'{table_name!r}'
+                    f'staging table {staging_name} no longer carries this run\'s '
+                    f'ownership metadata; refusing to publish it over {table_name!r}'
                 )
             if owner.get('run') != self._run_token or owner.get('task') != self.task_name:
                 raise DbPublishError(
@@ -1678,30 +1653,19 @@ class DbPublisher:
         targets = sorted(
             {(schema, table) for schema, table, _staging, _rows in self._pending_swaps}
         )
-        # Exact catalog values, NOT to_regclass() on an assembled string.
-        # regclass input follows SQL identifier rules, so it folds anything
-        # unquoted to lower case: a live table named "Sales" was passed as
-        # bsr.Sales, looked up as bsr.sales, and reported missing. It was
-        # then EXCLUDED from the bounded LOCK, and its later
-        # DROP TABLE IF EXISTS acquired ACCESS EXCLUSIVE with no timeout at
-        # all -- so the one table most needing the bound silently escaped
-        # it.
-        #
-        # This is the same defect already fixed once in
-        # _verify_prepared_artifacts() and reintroduced here. The lesson is
-        # that assembling a name for the parser is the trap, not any
-        # particular call site.
-        existing = [
-            (schema, table) for schema, table in targets
-            if conn.execute(
-                sa.text(
-                    'select c.oid from pg_class c '
-                    'join pg_namespace n on n.oid = c.relnamespace '
-                    'where n.nspname = :schema and c.relname = :table'
-                ),
-                {'schema': schema, 'table': table},
-            ).scalar() is not None
-        ]
+        existing = []
+        for schema, table in targets:
+            relation = _find_relation(conn, schema, table)
+            if relation is None:
+                continue
+
+            _oid, relkind = relation
+            if relkind != 'r':
+                raise DbPublishError(
+                    f'publication target {schema}.{table} exists but is not an '
+                    f'ordinary table (relkind={relkind!r})'
+                )
+            existing.append((schema, table))
         if not existing:
             # A first-ever publication has nothing to lock.
             return []

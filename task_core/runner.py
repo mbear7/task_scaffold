@@ -127,27 +127,9 @@ def _normalized_output_target(kind, value):
         # need realpath(); not handled here.)
         return os.path.abspath(os.path.normpath(value)).casefold()
 
-    # Correction to the original version of this function, which casefolded
-    # db_table too, on the stated grounds that PostgreSQL folds unquoted
-    # identifiers so 'Sales' and 'sales' are one table. That reasoning does
-    # not hold in this codebase: nothing here ever emits an unquoted
-    # mixed-case identifier. Confirmed directly against the real postgresql
-    # dialect's preparer -- SQLAlchemy quotes 'Sales' to preserve it, which
-    # defeats the folding:
-    #
-    #     'sales' -> sales      CREATE TABLE bsr.sales
-    #     'Sales' -> "Sales"    CREATE TABLE bsr."Sales"
-    #
-    # They are two different tables, so casefolding here rejected a pair
-    # that would actually have worked. Over-strict rather than unsafe, but
-    # wrong. Exact match is correct under both identifier modes: under
-    # 'portable' every name is lower case already, so exact and casefolded
-    # comparison coincide; under 'quoted' case is significant and only
-    # exact match is right. No mode-dependent comparison is needed.
-    # The original string, unchanged. An earlier version stripped
-    # whitespace, which contradicted the exact-comparison semantics it
-    # claimed: under 'quoted' mode "report" and "report " are two valid,
-    # distinct identifiers, and stripping treated them as one.
+    # Database identifiers are already required to satisfy the lower-case
+    # portable contract. Preserve the declared value exactly; backend
+    # preflight rejects anything outside that contract.
     return value
 
 

@@ -147,7 +147,6 @@ class derived:
 | `publish_result` | `False` | Make the result available to later pipelines via `ctx.get_result()`. |
 | `debug_display` | `False` | Print the table during the run. |
 | `table_adapter` | `None` | `'petl'`, `'pandas'`, or `None` to infer. |
-| `db_identifier_mode` | `'portable'` | `'quoted'` to allow non-portable identifiers. See [limitations](#limitations). |
 
 ### `db_output` is declarative
 
@@ -357,9 +356,8 @@ Nothing prevents two runs of the same task from overlapping.
 
 Table, schema and column names published to PostgreSQL must match
 `^[a-z_][a-z0-9_]*$`. Cyrillic headers must be renamed via `db_contract`.
-`db_identifier_mode='quoted'` relaxes the pattern only — the byte limit,
-duplicate detection and column uniqueness still apply. The schema is
-always validated as portable regardless of any pipeline's mode.
+There is no quoted-identifier escape hatch: invalid names are rejected,
+not normalized. Generated SQL still quotes identifiers defensively.
 
 Identifiers are limited to 63 bytes, counted as UTF-8 bytes rather than
 characters.

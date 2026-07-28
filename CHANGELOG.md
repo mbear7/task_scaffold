@@ -12,6 +12,39 @@ chronologically rather than by release.
 ## Unreleased
 
 
+## 0.4.1
+
+A narrowly scoped publication-correctness patch. No COPY, declared-schema,
+`TRUNCATE`, partition-swap or unrelated refactoring work is included.
+
+### Fixed
+
+- Added one contained exact relation lookup over `pg_class` and
+  `pg_namespace`, returning OID and `relkind`. It is used only by prepared
+  artifact verification and live-target locking. Views, materialized views,
+  foreign tables, partitioned tables and other non-ordinary relations are
+  rejected explicitly instead of being treated as missing targets.
+- Preserved the minimum timeout-ordering invariant
+  `acquisition_timeout_ms >= lock_timeout_ms + 50 ms`, so ordinary lock
+  contention can surface as retryable `55P03` before terminal `57014`. The
+  50 ms is only an ordering margin; sizing remains `k × L + M ≤ A`, with
+  total reader blocking constrained by `A + P ≤ B`.
+- Completed all source-state and preparatory database work before the first
+  live-target lock. Existing targets are deduplicated and locked in one
+  deterministic `(schema, table)` order immediately before `DROP`/`RENAME`;
+  after the first lock, only swap, required comments and commit remain.
+- Retry jitter is derived from the remaining absolute monotonic horizon while
+  preserving the configured minimum sleep and the budget for a useful next
+  acquisition attempt. A long random draw can no longer discard usable retry
+  time.
+
+### Changed
+
+- Removed `db_identifier_mode` and arbitrary quoted-identifier support without
+  a compatibility shim. Schemas, tables and published columns must satisfy the
+  existing portable lower-case contract `^[a-z_][a-z0-9_]*$`. Generated SQL
+  continues to quote identifiers defensively. See ADR 0010.
+
 ## 0.4.0
 
 One deliberate public API break, executing the consolidation recorded in
@@ -60,34 +93,6 @@ One deliberate public API break, executing the consolidation recorded in
 ### Fixed during review, before release
 These correct 0.4.0 itself rather than following it; the package never
 shipped with them outstanding.
-
-- **Quoted live targets escaped the bounded lock.** `to_regclass()` folds
-  unquoted input to lower case, so a table named `"Sales"` was passed as
-  `bsr.Sales`, looked up as `bsr.sales`, and reported missing — then
-  excluded from the bounded `LOCK`, leaving its `DROP` to take
-  `ACCESS EXCLUSIVE` with no timeout. The one table most needing the bound
-  escaped it. Now an exact `pg_class`/`pg_namespace` lookup.
-
-  This is the same defect fixed in `_verify_prepared_artifacts()` in 0.3.2
-  and reintroduced in the new lock phase. The trap is assembling a name
-  for the parser, not any particular call site.
-
-- **`acquisition_timeout_ms <= lock_timeout_ms` was accepted**, which makes
-  `statement_timeout` fire first and converts retryable `55P03` into
-  terminal `57014` — ordinary contention would have ended the run. Now a
-  configuration invariant with a 50 ms margin, and the derived per-attempt
-  budgets preserve the ordering instead of clamping both to the same
-  remaining value.
-
-- **Target locks were taken before the publication plan ran.** The plan
-  performs create-if-not-exists, a `DELETE` and an upsert against the
-  source-state table; with the locks held and both timeouts already reset,
-  any wait there kept every live target exclusive for its duration.
-  Locking now happens last, immediately before the swaps.
-
-- Retry jitter was sampled and then rejected, so a long draw ended the run
-  with part of the horizon deliberately unused. The range is now derived
-  from what remains, and no attempt starts once the deadline has passed.
 
 - `PublisherConfig` rejects a `None` policy or a non-callable factory, and
   `PublicationLockPolicy` rejects NaN and infinity — both previously

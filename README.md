@@ -154,8 +154,8 @@ are to matter. Each is expanded in
   transaction swaps them all. No transaction spans the run — but a failed
   run leaves committed staging tables, which the next run of the same task
   removes.
-- **Column names published to PostgreSQL must be lower-case ASCII
-  identifiers** unless a pipeline opts into `db_identifier_mode='quoted'`.
+- **Schema, table and column names published to PostgreSQL must be
+  lower-case portable identifiers** matching `^[a-z_][a-z0-9_]*$`.
 - **`task_core.types` shadows the standard library `types` module** inside
   this package. Absolute imports only.
 - **`requirements.txt` is unpinned**, and this codebase is sensitive to

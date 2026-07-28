@@ -1,6 +1,10 @@
 # 0004 — Portable identifiers are lower-case ASCII
 
-Status: accepted
+Status: superseded in part by [0010](0010-require-portable-database-identifiers.md)
+
+The lower-case portable grammar remains in force. ADR 0010 supersedes only
+the per-pipeline `db_identifier_mode='quoted'` escape hatch. The original
+reasoning is retained below as history.
 
 ## Problem
 

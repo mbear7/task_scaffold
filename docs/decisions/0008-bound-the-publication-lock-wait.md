@@ -34,6 +34,29 @@ SET LOCAL statement_timeout = 0;
 
 Configured through `PublicationLockPolicy`, a field of `PublisherConfig`.
 
+### 0.4.1 clarification
+
+The 50 ms relationship enforced between `lock_timeout_ms` and
+`acquisition_timeout_ms` is only the minimum timeout-ordering guarantee: it
+lets retryable `55P03` occur before terminal `57014`. It is not a reader-impact
+budget. Real sizing remains `k × L + M ≤ A`, while total reader blocking must
+satisfy `A + P ≤ B`.
+
+All source-state `DELETE`/upsert and other preparatory database work completes
+before the first live-target lock. Existing targets are deduplicated and
+locked in deterministic `(schema, table)` order immediately before the swap.
+After the first target lock, only `DROP`, `RENAME`, required comments and
+commit remain.
+
+Retry timing uses one absolute monotonic deadline. The existing minimum sleep
+is preserved, but jitter is sampled only inside the remaining usable horizon;
+a random draw or minimum sleep may not consume the budget reserved for a
+useful next acquisition attempt.
+
+Live and prepared relations are resolved through exact `pg_class` /
+`pg_namespace` values, and only ordinary tables (`relkind = 'r'`) are accepted.
+Views and other relation kinds are rejected explicitly.
+
 ## Why each part
 
 **One statement, not one lock per `DROP`.** PostgreSQL still acquires them
@@ -190,11 +213,10 @@ is the whole point.
 
 Also confirmed in the same run:
 
-- **A quoted target is found and therefore locked.** The live table was
-  `"Sales Report"` — mixed case with a space — and the log shows
-  `locking 1 publication target(s) for swap`. Under the `to_regclass`
-  lookup this replaced, that table would have been reported missing and
-  excluded from the bound.
+- **Exact target resolution includes every existing live table selected by
+  the publication plan.** The regression used a mixed-case table to expose
+  parser folding; 0.4.1 subsequently removed such names from the public
+  identifier contract, while retaining the exact catalog lookup.
 - **Contention arrives as retryable `55P03`, not terminal `57014`.**
   Visible as the publisher's own retry warning, which is the timeout
   ordering invariant doing its job.
@@ -221,7 +243,7 @@ total statement budget produced terminal 57014 after 2.604s
 both live tables and source state unchanged; staging dropped
 ```
 
-One sorted statement carrying both quoted targets, exactly as designed.
+One sorted statement carrying both targets, exactly as designed.
 But note **which** timeout fired: the aggregate `statement_timeout`, which
 raises `57014` — and `57014` is terminal here by the decision above.
 

@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.4.0. This describes the present system, not
+How `task_core` works as of 0.4.1. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -315,9 +315,9 @@ accident already. It also compares the existing table's columns against
 what it reads and writes, so a table left by an older version fails at
 startup instead of at the first write, mid-run.
 
-Names must match `^[a-z_][a-z0-9_]*$` unless a pipeline sets
-`db_identifier_mode='quoted'`. See
-[decisions/0004](decisions/0004-lowercase-portable-identifiers.md).
+Names must match `^[a-z_][a-z0-9_]*$`. Generated SQL still quotes
+identifiers defensively, but the public contract has no quoted-name mode.
+See [decisions/0010](decisions/0010-require-portable-database-identifiers.md).
 
 
 ## Transactions

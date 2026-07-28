@@ -731,35 +731,9 @@ class Test11DuplicateOutputTargetsRejected(unittest.TestCase):
             self._run({'a': self._pipeline(excel_name='Report.xlsx'),
                        'b': self._pipeline(excel_name='report.xlsx')}, ['a', 'b'])
 
-    def test_db_targets_differing_only_by_case_are_not_a_collision(self):
-        """Corrects the original version of this check, which casefolded
-        db_table on the stated grounds that PostgreSQL folds unquoted
-        identifiers so 'Sales' and 'sales' are one table. That reasoning
-        does not hold here: nothing in this project ever emits an unquoted
-        mixed-case identifier. Confirmed directly against the real
-        postgresql dialect's preparer -- SQLAlchemy quotes 'Sales' to
-        preserve it, which defeats the folding:
-
-            'sales' -> sales      CREATE TABLE bsr.sales
-            'Sales' -> "Sales"    CREATE TABLE bsr."Sales"
-
-        Two different tables. Casefolding rejected a pair that would
-        actually have worked -- over-strict rather than unsafe, but wrong.
-
-        Exact match is right under both identifier modes: under 'portable'
-        every name is lower case already, so exact and casefolded
-        comparison coincide, and under 'quoted' case is significant and
-        only exact match is correct. Note these must declare
-        db_identifier_mode='quoted', because 'Sales' is not a portable
-        identifier and preflight rejects it otherwise -- which is the
-        layer that actually discourages mixed case now.
-        """
-        result = self._run(
-            {'a': self._pipeline(db_table='Sales', db_identifier_mode='quoted'),
-             'b': self._pipeline(db_table='sales', db_identifier_mode='quoted')},
-            ['a', 'b'],
-        )
-        self.assertFalse(result.skipped)
+    def test_a_non_portable_db_target_is_rejected_before_resources_are_built(self):
+        with self.assertRaises(tc.DbPublishError):
+            self._run({'a': self._pipeline(db_table='Sales')}, ['a'])
 
     def test_paths_differing_only_by_a_dot_prefix_are_rejected(self):
         with self.assertRaises(tc.PipelineContractError):
@@ -779,17 +753,9 @@ class Test11DuplicateOutputTargetsRejected(unittest.TestCase):
             self._run({'a': self._pipeline(excel_name='out.xlsx'),
                        'b': self._pipeline(excel_name=absolute)}, ['a', 'b'])
 
-    def test_db_table_comparison_does_not_strip_whitespace(self):
-        # An earlier version stripped, which contradicted the exact-match
-        # semantics it claimed: under 'quoted' mode "report" and "report "
-        # are two valid, distinct PostgreSQL identifiers, and treating them
-        # as one is over-rejection.
-        result = self._run(
-            {'a': self._pipeline(db_table='report', db_identifier_mode='quoted'),
-             'b': self._pipeline(db_table='report ', db_identifier_mode='quoted')},
-            ['a', 'b'],
-        )
-        self.assertFalse(result.skipped)
+    def test_a_db_target_with_trailing_whitespace_is_rejected(self):
+        with self.assertRaises(tc.DbPublishError):
+            self._run({'a': self._pipeline(db_table='report ')}, ['a'])
 
     def test_a_collision_outside_run_sequence_is_allowed(self):
         # Only ACTIVE targets collide. A pipeline that isn't running can

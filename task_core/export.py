@@ -93,7 +93,6 @@ def _build_db_payload_with_spec(task_cls, tbl, spec, pg_schema, *, run_started_a
         type_overrides=spec.db_type_overrides,
         db_contract=db_contract,
         db_table_id_pix=spec.db_table_id_pix,
-        identifier_mode=spec.db_identifier_mode,
     )
     apply_db_updated_at(payload, spec, run_started_at)
     return payload

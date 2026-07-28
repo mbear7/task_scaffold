@@ -83,13 +83,6 @@ VALID_TABLE_ADAPTERS = frozenset({None, 'petl', 'pandas'})
 # previous [A-Za-z_] form broke nothing.
 PORTABLE_IDENTIFIER_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
 
-# The identifier-mode vocabulary. Engine-neutral, like the pattern above
-# and unlike PostgreSQL's byte limit, which stays in db_publish.py. Kept
-# here so PipelineSpec.__post_init__ and db_publish's payload validation
-# share one definition instead of each carrying its own literal tuple --
-# two sources of truth for the same closed set is a drift point with no
-# upside.
-IDENTIFIER_MODES = ('portable', 'quoted')
 
 
 @dataclass(frozen=True)
@@ -104,37 +97,12 @@ class PipelineSpec:
     publish_result: bool = False
     debug_display: bool = False
     table_adapter: str | None = None
-    # 'portable' enforces PORTABLE_IDENTIFIER_RE on this pipeline's declared
-    # db_table and declared output column names. 'quoted' permits names
-    # outside that convention -- and only that: non-empty, no NUL byte, the
-    # backend's identifier byte limit, duplicate-target detection,
-    # generated-name safety and column-name uniqueness all still apply.
-    #
-    # A mode rather than a boolean deliberately: 'allow_unsafe_identifiers'
-    # would conflate Unicode, quoting, punctuation, case sensitivity and
-    # actual SQL injection safety into one word that describes none of them.
-    # This names the behavior being selected instead.
-    #
-    # Note this does NOT govern the schema, which is task-wide (pg_schema)
-    # rather than per-pipeline and is always validated as portable. Letting
-    # a per-spec flag reach a per-run value would need an arbitrary
-    # resolution rule across specs (strictest wins? any wins?), and a
-    # non-portable schema is a deliberate run-level decision, not something
-    # one pipeline should be able to enable for every other.
-    db_identifier_mode: str = 'portable'
-
     def __post_init__(self):
         if self.excel_name is not None and not isinstance(self.excel_name, str):
             raise TypeError('excel_name must be str or None')
 
         if self.db_table is not None and not isinstance(self.db_table, str):
             raise TypeError('db_table must be str or None')
-
-        if self.db_identifier_mode not in IDENTIFIER_MODES:
-            raise ValueError(
-                f'db_identifier_mode must be one of {IDENTIFIER_MODES}, '
-                f'got {self.db_identifier_mode!r}'
-            )
 
         if self.db_output is not None:
             # Require the declared contract (list[str] | tuple[str, ...] |

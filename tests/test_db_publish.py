@@ -913,31 +913,37 @@ class Test11IdentifierValidationPreflightAndRuntime(unittest.TestCase):
         self.assertIn('p:', str(caught.exception))
 
     def test_preflight_rejects_a_non_portable_declared_name(self):
-        for spec in (tc.PipelineSpec(db_table='отчет'),
-                     tc.PipelineSpec(db_table='Sales'),
-                     tc.PipelineSpec(db_table='t', db_output=['Блок']),
-                     tc.PipelineSpec(db_table='t', db_updated_at='Загружено')):
+        specs = (
+            tc.PipelineSpec(db_table='отчет'),
+            tc.PipelineSpec(db_table='Sales'),
+            tc.PipelineSpec(db_table='sales report'),
+            tc.PipelineSpec(db_table='sales-report'),
+            tc.PipelineSpec(db_table='sales.report'),
+            tc.PipelineSpec(db_table='sales/report'),
+            tc.PipelineSpec(db_table='sales\"report'),
+            tc.PipelineSpec(db_table='1sales'),
+            tc.PipelineSpec(db_table='sales '),
+            tc.PipelineSpec(db_table='sales\n'),
+            tc.PipelineSpec(db_table='t', db_output=['Блок']),
+            tc.PipelineSpec(db_table='t', db_output=['GrossMargin']),
+            tc.PipelineSpec(db_table='t', db_output=['gross margin']),
+            tc.PipelineSpec(db_table='t', db_output=['gross-margin']),
+            tc.PipelineSpec(db_table='t', db_updated_at='Загружено'),
+            tc.PipelineSpec(db_table='t', db_updated_at='UpdatedAt'),
+        )
+        for spec in specs:
             with self.subTest(spec=spec):
                 with self.assertRaises(DbPublishError):
                     DbPublisher.preflight({'p': spec}, schema='bsr')
 
-    def test_quoted_mode_permits_non_portable_names_but_not_over_long_ones(self):
-        DbPublisher.preflight(
-            {'p': tc.PipelineSpec(db_table='отчет', db_output=['Блок'],
-                                  db_identifier_mode='quoted')},
-            schema='bsr',
-        )
-        with self.assertRaises(DbPublishError):
-            DbPublisher.preflight(
-                {'p': tc.PipelineSpec(db_table='ы' * 40, db_identifier_mode='quoted')},
-                schema='bsr',
-            )
+    def test_quoted_identifier_mode_is_not_part_of_the_spec_api(self):
+        with self.assertRaises(TypeError):
+            tc.PipelineSpec(db_table='sales', db_identifier_mode='quoted')
 
-    def test_preflight_validates_the_schema_as_portable_regardless_of_mode(self):
-        # Schema is task-wide, so no per-spec flag may reach it.
+    def test_preflight_validates_the_schema_as_portable(self):
         with self.assertRaises(DbPublishError):
             DbPublisher.preflight(
-                {'p': tc.PipelineSpec(db_table='t', db_identifier_mode='quoted')},
+                {'p': tc.PipelineSpec(db_table='t')},
                 schema='Схема',
             )
 
@@ -984,11 +990,12 @@ class Test11IdentifierValidationPreflightAndRuntime(unittest.TestCase):
         with self.assertRaises(DbPublishError):
             publisher.publish(unrenamed)
 
-    def test_quoted_payload_mode_permits_a_non_portable_column(self):
+    def test_a_non_portable_runtime_column_is_always_rejected(self):
         import petl as etl
         publisher = self._publisher()
-        payload = self._payload(tbl=etl.wrap([['Блок'], ['x']]), identifier_mode='quoted')
-        publisher.publish(payload)
+        payload = self._payload(tbl=etl.wrap([['Блок'], ['x']]))
+        with self.assertRaises(DbPublishError):
+            publisher.publish(payload)
 
     def test_an_injected_limit_tightens_validation(self):
         publisher = self._publisher(identifier_policy=IdentifierPolicy(max_identifier_bytes=20))
@@ -1169,15 +1176,12 @@ class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
         with self.assertRaises(DbPublishError):
             validate_portable_identifier('foo\n', kind='table name')
 
-    def test_an_unrecognised_payload_identifier_mode_is_rejected(self):
-        # `mode == 'portable'` meant any typo silently selected the
-        # permissive branch. PipelineSpec validates its own field, but a
-        # DbPayload built directly does not pass through it.
-        publisher = self._publisher()
-        payload = DbPayload(table_name='t', schema=None, columns=['x'],
-                            rows=[{'x': 1}], identifier_mode='portbale')
-        with self.assertRaises(DbPublishError):
-            publisher.publish(payload)
+    def test_identifier_mode_is_not_part_of_the_payload_api(self):
+        with self.assertRaises(TypeError):
+            DbPayload(
+                table_name='t', schema=None, columns=['x'], rows=[{'x': 1}],
+                identifier_mode='quoted',
+            )
 
     def test_the_source_state_table_is_a_reserved_target(self):
         """A pipeline declaring the source-state table as its db_table
@@ -1241,10 +1245,8 @@ class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
 
 
 
-class Test13IdentifierValidationGapsFromReview(unittest.TestCase):
-    """Three gaps between what the documentation claimed and what the code
-    enforced, each confirmed directly before fixing.
-    """
+class Test13PortableIdentifierContract(unittest.TestCase):
+    """The portable lower-case contract applies to every entry path."""
 
     def _publisher(self, **kwargs):
         import sqlalchemy as sa
@@ -1254,74 +1256,26 @@ class Test13IdentifierValidationGapsFromReview(unittest.TestCase):
         return publisher
 
     def test_a_direct_payload_cannot_carry_a_non_portable_table_name(self):
-        """Runtime validation applied the portable pattern to columns but
-        only length and NUL checks to payload.table_name -- so a directly
-        constructed payload in the default strict mode published to a
-        Cyrillic table. The runner path caught it through PipelineSpec
-        preflight; direct payload construction does not go through that,
-        and this function already validates the payload's own
-        identifier_mode, which means direct use is part of the contract.
-        """
         publisher = self._publisher()
-        payload = DbPayload(table_name='Отчет', schema=None, columns=['x'],
-                            rows=[{'x': 1}], identifier_mode='portable')
+        payload = DbPayload(table_name='Отчет', schema=None, columns=['x'], rows=[{'x': 1}])
         with self.assertRaises(DbPublishError):
             publisher.publish(payload)
 
-    def test_quoted_mode_still_permits_a_non_portable_table_name(self):
+    def test_a_direct_payload_cannot_carry_a_non_portable_schema(self):
         publisher = self._publisher()
-        payload = DbPayload(table_name='Отчет', schema=None, columns=['x'],
-                            rows=[{'x': 1}], identifier_mode='quoted')
-        publisher.publish(payload)
-
-    def test_the_schema_is_portable_regardless_of_payload_mode(self):
-        # Matching the rule preflight applies: schema is task-wide while
-        # the mode is per-payload, so a per-payload flag must not relax it.
-        publisher = self._publisher()
-        payload = DbPayload(table_name='t', schema='Схема', columns=['x'],
-                            rows=[{'x': 1}], identifier_mode='quoted')
+        payload = DbPayload(table_name='t', schema='Схема', columns=['x'], rows=[{'x': 1}])
         with self.assertRaises(DbPublishError):
             publisher.publish(payload)
 
-    def test_identifier_modes_have_one_definition(self):
-        # PipelineSpec.__post_init__ carried its own literal tuple while
-        # db_publish defined the constant -- the same closed set in two
-        # places, with nothing keeping them equal.
-        from task_core.types import IDENTIFIER_MODES as from_types
-        from task_core.db_publish import IDENTIFIER_MODES as from_db_publish
-        self.assertIs(from_types, from_db_publish)
-        self.assertEqual(from_types, ('portable', 'quoted'))
+    def test_identifier_mode_was_removed_without_a_compatibility_shim(self):
+        with self.assertRaises(TypeError):
+            tc.PipelineSpec(db_identifier_mode='quoted')
+        with self.assertRaises(TypeError):
+            DbPayload(
+                table_name='t', schema=None, columns=['x'], rows=[{'x': 1}],
+                identifier_mode='quoted',
+            )
 
-    def test_the_spec_accepts_exactly_the_shared_set_and_nothing_more(self):
-        # Derived from the constant rather than listing values: a hardcoded
-        # list of BAD values cannot catch the spec quietly ACCEPTING an
-        # extra one, which is precisely the drift having two definitions
-        # allowed. Confirmed by adding a third mode to the spec's own
-        # check and watching an earlier version of this test pass.
-        from task_core.types import IDENTIFIER_MODES
-
-        for mode in IDENTIFIER_MODES:
-            with self.subTest(accepted=mode):
-                self.assertEqual(tc.PipelineSpec(db_identifier_mode=mode).db_identifier_mode, mode)
-
-        for mode in ('portbale', '', None, 'PORTABLE', 'legacy', 'raw'):
-            with self.subTest(rejected=mode):
-                self.assertNotIn(mode, IDENTIFIER_MODES)
-                with self.assertRaises(ValueError):
-                    tc.PipelineSpec(db_identifier_mode=mode)
-
-    def test_the_payload_rejects_exactly_the_same_set(self):
-        # The other half: both validators must move together.
-        from task_core.types import IDENTIFIER_MODES
-
-        publisher = self._publisher()
-        for mode in ('portbale', 'legacy', 'raw'):
-            with self.subTest(mode=mode):
-                self.assertNotIn(mode, IDENTIFIER_MODES)
-                payload = DbPayload(table_name='t', schema=None, columns=['x'],
-                                    rows=[{'x': 1}], identifier_mode=mode)
-                with self.assertRaises(DbPublishError):
-                    publisher.publish(payload)
 
 
 class Test14ServerIdentifierLimitResolution(unittest.TestCase):
@@ -1647,6 +1601,8 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
             self.columns = columns
             self.comments = {}
             self.statements = []
+            self.statement_params = []
+            self._last_relation_table = None
 
         invalidated = False
 
@@ -1658,19 +1614,18 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
             import sqlalchemy as sa
             text = str(statement)
             self.statements.append(text)
+            self.statement_params.append((text, params))
             lowered = text.lower()
 
             if 'max_identifier_length' in lowered:
                 return _Scalar(63)
-            if lowered.startswith('select to_regclass'):
-                # The lock phase probes which targets already exist. SQLite
-                # has no to_regclass, and the proxied connection would
-                # otherwise raise.
-                name = (params or {}).get('name', '').split('.')[-1]
+            if 'c.oid, c.relkind' in lowered:
+                name = (params or {}).get('table', '')
                 found = self._real.execute(sa.text(
                     "select name from sqlite_master where type='table' and name = :n"
                 ), {'n': name}).scalar()
-                return _Scalar(found)
+                self._last_relation_table = name if found else None
+                return _Scalar((1, 'r') if found else None)
             if lowered.startswith('lock table'):
                 return None
             if lowered.startswith('set local'):
@@ -1679,9 +1634,6 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
                 return _Scalar(True)
             if 'pg_class' in lowered and 'relname like' in lowered:
                 return _Rows([])            # predecessor scan: nothing left behind
-            if 'pg_class' in lowered and 'relname = ' in lowered:
-                target = (params or {}).get('table', '')
-                return _Scalar(self.comments.get(target))
             if 'information_schema.columns' in lowered:
                 return [(name,) for name in (self.columns or [])]
             if lowered.startswith('comment on table'):
@@ -1696,8 +1648,7 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
                 self.comments[name] = body.strip()[1:-1].replace("''", "'")
                 return None
             if 'obj_description' in lowered:
-                target = (params or {}).get('name', '')
-                return _Scalar(self.comments.get(target.split('.')[-1]))
+                return _Scalar(self.comments.get(self._last_relation_table))
             if ' rename to ' in lowered:
                 # PostgreSQL keeps comments on the OID, so a rename CARRIES
                 # the comment to the new name. Modelled because that is
@@ -1896,6 +1847,9 @@ class _Scalar:
         self._value = value
 
     def scalar(self):
+        return self._value
+
+    def one_or_none(self):
         return self._value
 
 
@@ -2151,6 +2105,8 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
             self.catalog = list(catalog or [])
             self.columns = None
             self.statements = []
+            self.statement_params = []
+            self._last_relation_table = None
 
         @property
         def dialect(self):
@@ -2160,24 +2116,26 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
             import sqlalchemy as sa
             text = str(statement)
             self.statements.append(text)
+            self.statement_params.append((text, params))
             lowered = text.lower()
 
             if 'max_identifier_length' in lowered:
                 return _Scalar(63)
-            if lowered.startswith('select to_regclass'):
-                name = (params or {}).get('name', '').split('.')[-1]
+            if 'c.oid, c.relkind' in lowered:
+                name = (params or {}).get('table', '')
                 found = self._real.execute(sa.text(
                     "select name from sqlite_master where type='table' and name = :n"
                 ), {'n': name}).scalar()
-                return _Scalar(found)
+                self._last_relation_table = name if found else None
+                return _Scalar((1, 'r') if found else None)
             if lowered.startswith('lock table') or lowered.startswith('set local'):
                 return None
             if 'pg_try_advisory_lock' in lowered or 'pg_advisory_unlock' in lowered:
                 return _Scalar(True)
             if 'relname like' in lowered:
                 return _Rows(self.catalog)
-            if 'relname = ' in lowered:
-                return _Scalar(self.comments.get((params or {}).get('table')))
+            if 'obj_description' in lowered:
+                return _Scalar(self.comments.get(self._last_relation_table))
             if 'information_schema.columns' in lowered:
                 if self.columns is not None:
                     return [(name,) for name in self.columns]
@@ -2288,31 +2246,22 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
             publisher.publish(self._payload())
         self.assertIn('advisory lock', str(caught.exception))
 
-    # --- 3: quoted identifiers must survive verification ----------------
+    # --- 3: prepared artifacts use exact relation resolution -------------
 
-    def test_a_non_portable_staging_name_is_found_at_verification(self):
-        """Verification used to_regclass() on an assembled string, which
-        parses its argument as an identifier expression and down-cases
-        anything unquoted. A mixed-case or Cyrillic staging name produced
-        under db_identifier_mode='quoted' therefore prepared correctly and
-        was then reported missing at commit().
-        """
+    def test_prepared_artifact_verification_uses_exact_catalog_values(self):
         conn = self._Conn()
         publisher = self._publisher(conn)
+        publisher.publish(self._payload())
+        publisher.commit()
 
-        from task_core.db_publish import DbPayload
-        publisher.publish(DbPayload(
-            table_name='Sales', schema=None, columns=['a'], rows=[{'a': 1}],
-            identifier_mode='quoted',
-        ))
-        publisher.commit()   # must not raise
-
-        lookups = [s for s in conn.statements if 'obj_description' in s.lower()]
+        lookups = [
+            (statement, params)
+            for statement, params in conn.statement_params
+            if 'c.oid, c.relkind' in statement.lower()
+        ]
         self.assertTrue(lookups)
-        self.assertFalse(
-            any('to_regclass' in s.lower() for s in lookups),
-            'verification still parses an assembled relation name',
-        )
+        self.assertTrue(all('to_regclass' not in statement.lower() for statement, _ in lookups))
+        self.assertTrue(all('schema' in params and 'table' in params for _, params in lookups))
 
     # --- 4: unknown ownership is never authority ------------------------
 
@@ -2859,8 +2808,8 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
                 return _Scalar(63)
             if 'advisory' in lowered:
                 return _Scalar(True)
-            if 'from pg_class c' in lowered and 'relname = :table' in lowered and 'oid from' in lowered:
-                return _Scalar('oid')      # every target already exists
+            if 'c.oid, c.relkind' in lowered:
+                return _Scalar((1, 'r'))      # every relation exists and is an ordinary table
             if lowered.startswith('lock table'):
                 self.lock_attempts += 1
                 if self.lock_attempts <= self._lock_failures:
@@ -2868,7 +2817,7 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
                 return None
             if 'relname like' in lowered:
                 return _Rows([])
-            if 'relname = ' in lowered:
+            if 'obj_description' in lowered:
                 return _Scalar(self.owner_comment)
             return None
 
@@ -2952,9 +2901,9 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
         class _Fresh(Test27PublicationLockIsBounded._Conn):
             def execute(self, statement, params=None):
                 lowered = str(statement).lower()
-                if 'from pg_class c' in lowered and 'oid from' in lowered:
+                if 'c.oid, c.relkind' in lowered and (params or {}).get('table') == 'target':
                     self.statements.append(str(statement))
-                    return _Scalar(None)      # target does not exist yet
+                    return _Scalar(None)      # live target does not exist yet
                 return super().execute(statement, params)
 
         conn = _Fresh()
@@ -3097,41 +3046,72 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
     """Three release blockers plus their neighbours, each confirmed
     directly before fixing."""
 
-    def test_a_quoted_live_target_is_found_and_therefore_locked(self):
-        """to_regclass() folds unquoted input to lower case, so a live
-        table named "Sales" was passed as bsr.Sales, looked up as
-        bsr.sales, and reported missing -- then EXCLUDED from the bounded
-        LOCK, leaving its DROP to acquire ACCESS EXCLUSIVE with no timeout.
-        The one table most needing the bound escaped it.
 
-        Same defect already fixed once in _verify_prepared_artifacts() and
-        reintroduced here: assembling a name for the parser is the trap,
-        not any particular call site.
-        """
+    def test_the_relation_primitive_returns_oid_and_kind_from_exact_values(self):
+        from task_core.db_publish import _find_relation
+
+        calls = []
+
+        class _Conn:
+            def execute(self, statement, params=None):
+                calls.append((str(statement), dict(params or {})))
+                return _Scalar((42, 'r'))
+
+        self.assertEqual(_find_relation(_Conn(), 'bsr', 'sales'), (42, 'r'))
+        statement, params = calls[0]
+        self.assertIn('pg_catalog.pg_class', statement)
+        self.assertEqual(params, {'schema': 'bsr', 'table': 'sales'})
+        self.assertNotIn('to_regclass', statement.lower())
+
+    def test_a_view_in_the_prepared_slot_is_rejected_before_ownership_lookup(self):
+        class _View(Test27PublicationLockIsBounded._Conn):
+            def execute(self, statement, params=None):
+                if 'c.oid, c.relkind' in str(statement).lower():
+                    return _Scalar((1, 'v'))
+                return super().execute(statement, params)
+
+        conn = _View()
+        publisher = self._publisher(conn)
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.commit()
+
+        self.assertIn('not an ordinary table', str(caught.exception))
+        self.assertEqual(conn.lock_attempts, 0)
+
+    def test_a_view_live_target_is_rejected_instead_of_treated_as_missing(self):
+        class _View(Test27PublicationLockIsBounded._Conn):
+            def execute(self, statement, params=None):
+                if 'c.oid, c.relkind' in str(statement).lower():
+                    return _Scalar((1, 'v'))
+                return super().execute(statement, params)
+
+        conn = _View()
+        publisher = self._publisher(conn)
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.commit()
+
+        self.assertIn('not an ordinary table', str(caught.exception))
+        self.assertEqual(conn.lock_attempts, 0)
+
+    def test_live_target_resolution_uses_exact_bound_catalog_values(self):
         probes = []
 
         class _Probe(Test27PublicationLockIsBounded._Conn):
             def execute(self, statement, params=None):
                 lowered = str(statement).lower()
-                if 'from pg_class c' in lowered and 'oid from' in lowered:
+                if 'c.oid, c.relkind' in lowered:
                     probes.append(dict(params or {}))
                 return super().execute(statement, params)
 
-        for table in ('Sales', 'sales report', 'a"quote', 'portable_name'):
-            with self.subTest(table=table):
-                probes.clear()
-                conn = _Probe()
-                publisher = self._publisher(conn, table_name=table)
-                publisher._verify_prepared_artifacts = lambda: None
-                publisher.commit()
+        conn = _Probe()
+        publisher = self._publisher(conn, table_name='portable_name')
+        publisher._verify_prepared_artifacts = lambda: None
+        publisher.commit()
 
-                # Passed as an exact value, never assembled into a name the
-                # parser will re-interpret.
-                self.assertIn({'schema': 'bsr', 'table': table}, probes)
-                statement = next(
-                    s for s in conn.statements if s.lower().startswith('lock table')
-                )
-                self.assertIn(table.replace('"', '""'), statement)
+        self.assertIn({'schema': 'bsr', 'table': 'portable_name'}, probes)
+        self.assertFalse(any('to_regclass' in statement.lower() for statement in conn.statements))
 
     def _publisher(self, conn, table_name='target', policy=None):
         from task_core.db_publish import (
