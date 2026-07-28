@@ -126,10 +126,34 @@ shipped with them outstanding.
 
   It also records the consequence that surfaced: multi-table contention
   tends to exhaust the aggregate `statement_timeout`, which raises the
-  terminal `57014` rather than the retryable `55P03`. So such publications
-  are likelier to fail cleanly than to retry — an argument for widening
-  `acquisition_timeout_ms` rather than `lock_timeout_ms` on tasks
-  publishing several contended tables.
+  terminal `57014` rather than the retryable `55P03`, so such publications
+  are likelier to fail cleanly than to retry.
+
+  ADR 0008 now states the sizing rule as `A ≥ k·L + M` subject to
+  `A + P ≤ B`, distinguishing `n` existing targets from the `k ≤ n`
+  expected to contend, and `A` — the acquisition budget — from `B`, the
+  total reader blocking. Acquired locks are held through the swap and
+  commit (`P`), so `A` bounds only acquisition waiting; describing it as
+  the total ceiling was wrong by exactly the critical section.
+  `lock_timeout_ms` is the per-conflict wait limit.
+  `acquisition_timeout_ms` is the aggregate budget for acquiring the
+  complete sorted target set. Total reader blocking also includes the
+  post-acquisition `DROP`, `RENAME`, comment and commit critical section.
+  For `k` contended targets, size `A` as about
+  `k × lock_timeout_ms` plus margin, while preserving `A + P ≤ B`.
+  Legitimate responses to a budget conflict are to lower `L`, publish fewer
+  targets together, accept terminal `57014`, or raise `A` only together
+  with a correspondingly larger accepted total reader-blocking budget `B`.
+  Lowering `L` is not automatically right either: a short per-conflict
+  limit can make the retry loop the normal publication mechanism.
+
+  `_lock_publication_targets()` warns when `A < n·L + M` — *worst case*
+  deliberately, since the publisher knows `n` and cannot know `k`; and
+  terminal `57014` *may* follow rather than must, since an individual wait
+  can still reach `L` first. When `(A − M) // n` is zero the warning says
+  no positive `lock_timeout_ms` fits rather than recommending 1 ms.
+  Emitted once per run. The requirement includes the margin, so the
+  defaults cover nine sequentially contended targets rather than ten.
 
   `40P01` was provoked from the publication plan with zero lock attempts,
   confirming the phase-neutral diagnostic: the older wording would have

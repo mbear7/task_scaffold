@@ -3156,6 +3156,152 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         publisher._generated_names = {('bsr', staging)}
         return publisher
 
+    def test_a_policy_that_cannot_cover_the_worst_case_warns(self):
+        """A WORST-CASE capacity check, not a contention measurement.
+
+        The publisher knows n -- existing targets -- and cannot know k, how
+        many will actually contend. Claiming "mis-sized for n contended
+        targets" would assert something it has not observed, and would fire
+        on every publication for a task with many uncontended tables. The
+        warning says what it means: this policy cannot cover the case where
+        all of them contend.
+
+        The margin belongs in the requirement too. n x lock_timeout exactly
+        equal to the aggregate leaves nothing for statement execution,
+        lock-manager work or driver latency -- which is why the defaults
+        cover nine sequentially contended targets, not ten.
+        """
+        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+
+        conn = Test27PublicationLockIsBounded._Conn()
+        publisher = self._publisher(conn, policy=PublicationLockPolicy(
+            lock_timeout_ms=500, acquisition_timeout_ms=600,
+            retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+        ))
+        for table in ('second', 'third'):
+            staging = staging_table_name('bsr', table, publisher._run_token)
+            publisher._pending_swaps.append(('bsr', table, staging, 1))
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertLogs(publisher.log, level='WARNING') as captured:
+            publisher.commit()
+
+        message = ' '.join(captured.output)
+        self.assertIn('worst case', message)
+        self.assertIn('all 3 existing target', message)
+        # It must NOT claim to have observed contention it cannot see.
+        self.assertNotIn('3 contended target', message)
+        # 'may', not 'will': even fully contended, an individual wait can
+        # reach lock_timeout and raise retryable 55P03 before the aggregate
+        # is exhausted. The inequality only shows the full per-conflict
+        # budget cannot be RESERVED for every target.
+        self.assertIn('may then exhaust', message)
+        self.assertNotIn('the aggregate budget expires first', message)
+        # Lowering is offered first, raising the aggregate last and only as
+        # a deliberate acceptance.
+        self.assertIn('lower lock_timeout_ms', message.lower())
+        # And the aggregate is not described as the TOTAL ceiling: acquired
+        # locks are held through the swap that follows.
+        self.assertIn('held through the swap', message)
+
+    def test_the_boundary_case_does_not_warn(self):
+        # A == n*L + M exactly satisfies the requirement.
+        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+
+        conn = Test27PublicationLockIsBounded._Conn()
+        publisher = self._publisher(conn, policy=PublicationLockPolicy(
+            lock_timeout_ms=500, acquisition_timeout_ms=1050,
+            retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+        ))
+        staging = staging_table_name('bsr', 'second', publisher._run_token)
+        publisher._pending_swaps.append(('bsr', 'second', staging, 1))
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertNoLogs(publisher.log, level='WARNING'):
+            publisher.commit()   # 2*500 + 50 == 1050
+
+    def test_an_infeasible_recommendation_says_so_instead_of_suggesting_1ms(self):
+        """When the aggregate cannot accommodate even a 1ms per-conflict
+        wait across n targets, no positive lock_timeout_ms satisfies
+        n*L + M <= A. Clamping the recommendation to 1 would be
+        recommending something that still does not fit.
+        """
+        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+
+        conn = Test27PublicationLockIsBounded._Conn()
+        publisher = self._publisher(conn, policy=PublicationLockPolicy(
+            lock_timeout_ms=10, acquisition_timeout_ms=100,
+            retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+        ))
+        for index in range(120):
+            table = f'extra_{index}'
+            staging = staging_table_name('bsr', table, publisher._run_token)
+            publisher._pending_swaps.append(('bsr', table, staging, 1))
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertLogs(publisher.log, level='WARNING') as captured:
+            publisher.commit()
+
+        message = ' '.join(captured.output)
+        self.assertIn('no positive lock_timeout_ms can cover', message)
+        self.assertNotIn('lower lock_timeout_ms to about 1ms', message)
+
+    def test_the_worst_case_requirement_includes_the_margin(self):
+        # n x lock_timeout exactly equal to the aggregate leaves nothing for
+        # execution overhead, so it must still warn.
+        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+
+        conn = Test27PublicationLockIsBounded._Conn()
+        publisher = self._publisher(conn, policy=PublicationLockPolicy(
+            lock_timeout_ms=500, acquisition_timeout_ms=1000,
+            retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+        ))
+        staging = staging_table_name('bsr', 'second', publisher._run_token)
+        publisher._pending_swaps.append(('bsr', 'second', staging, 1))
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertLogs(publisher.log, level='WARNING'):
+            publisher.commit()   # 2 x 500 == 1000, but + margin does not fit
+
+    def test_the_policy_warning_is_emitted_once_per_run(self):
+        # This method runs on every retry attempt; repeating a static
+        # configuration warning would bury the contention messages that
+        # actually vary.
+        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+
+        conn = Test27PublicationLockIsBounded._Conn(lock_failures=2)
+        publisher = self._publisher(conn, policy=PublicationLockPolicy(
+            lock_timeout_ms=500, acquisition_timeout_ms=600,
+            retry_horizon_seconds=30,
+            retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+        ))
+        staging = staging_table_name('bsr', 'second', publisher._run_token)
+        publisher._pending_swaps.append(('bsr', 'second', staging, 1))
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertLogs(publisher.log, level='WARNING') as captured:
+            publisher.commit()
+
+        self.assertEqual(conn.lock_attempts, 3, 'the retries under test did not happen')
+        policy_warnings = [line for line in captured.output if 'worst case' in line]
+        self.assertEqual(len(policy_warnings), 1, 'the policy warning repeated per attempt')
+
+    def test_a_well_sized_policy_does_not_warn(self):
+        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+
+        conn = Test27PublicationLockIsBounded._Conn()
+        publisher = self._publisher(conn, policy=PublicationLockPolicy(
+            lock_timeout_ms=200, acquisition_timeout_ms=5000,
+            retry_delay_min_seconds=0, retry_delay_max_seconds=0,
+        ))
+        for table in ('second', 'third'):
+            staging = staging_table_name('bsr', table, publisher._run_token)
+            publisher._pending_swaps.append(('bsr', table, staging, 1))
+        publisher._verify_prepared_artifacts = lambda: None
+
+        with self.assertNoLogs(publisher.log, level='WARNING'):
+            publisher.commit()
+
     def test_the_timeout_ordering_is_a_configuration_invariant(self):
         """PostgreSQL fires statement_timeout first once it reaches
         lock_timeout, which here converts retryable 55P03 into terminal

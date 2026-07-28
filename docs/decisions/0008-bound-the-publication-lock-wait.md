@@ -229,11 +229,103 @@ So multi-table publication under contention is **more likely to fail
 terminally than to retry**, because the aggregate budget is the one it
 tends to exhaust while `lock_timeout` bounds only each individual wait.
 That is a real consequence of choosing conservative `57014` handling, not
-a defect, and it is the argument for widening `acquisition_timeout_ms`
-rather than `lock_timeout_ms` on tasks that publish several contended
-tables. A run that fails this way is clean — nothing partially published,
-source state unadvanced, staging dropped — and the next scheduled run
-republishes.
+a defect. A run that fails this way is clean — nothing partially
+published, source state unadvanced, staging dropped — and the next
+scheduled run republishes.
+
+### Sizing the two budgets
+
+They are different things, and confusing them produces advice that works
+against this decision:
+
+| | |
+| --- | --- |
+| `lock_timeout_ms` (L) | the **per-conflict** limit — how long to wait for any one target |
+| `acquisition_timeout_ms` (A) | the **aggregate** budget for acquiring the complete lock set |
+
+With `n` existing targets, `k ≤ n` of them expected to contend
+sequentially, `M` the execution margin, and `P` the swap-and-commit
+critical section:
+
+```
+A ≥ k·L + M        subject to        A + P ≤ B
+```
+
+where `B` is the total reader blocking you have decided to accept.
+
+**`A` is not `B`.** Once the complete set is held, both timeouts are reset
+and the publisher performs `DROP`, `RENAME`, comments and commit with
+every lock still held. So for the earliest-acquired target:
+
+```
+reader blocking = acquisition + publication
+```
+
+`A` bounds only the waiting half. `P` is short — catalog operations — but
+this policy imposes no hard limit on it, so total reader blocking exceeds
+`A` by the critical section. An earlier version of this section called `A`
+"the ceiling on total reader impact", which was wrong by exactly `P`.
+
+`M` is not decoration. `k·L` exactly equal to `A` leaves nothing for
+statement execution, lock-manager work or driver latency — which is why
+the defaults cover a worst case of `(5000 − 50) // 500 = 9` sequentially
+contended targets, not ten.
+
+**The `A + P ≤ B` constraint is what makes this a rule rather than a
+licence.** Without it
+the inequality is satisfiable by growing `A` without limit as `k` grows,
+and an earlier version of this section said exactly that: widen
+`acquisition_timeout_ms` for tasks publishing several contended tables.
+**That advice was wrong**, in the specific way worth recording because it
+looks reasonable. `A` is precisely how long an already-acquired target
+keeps blocking its own readers while the statement waits for the next —
+confirmed above, where a reader arriving on `Alpha` blocked behind the
+publisher's acquired lock for the remainder of the acquisition. Raising
+`A` to accommodate a large `L` lengthens exactly the window this mechanism
+exists to shorten, and fits fewer attempts inside the horizon besides.
+
+**When the arithmetic does not fit, there are four legitimate outcomes**,
+and lowering `L` is not automatically the right one — it has its own cost.
+A short per-conflict limit can turn ordinary multi-second BI contention
+into a steady stream of `55P03`, making the retry loop the normal
+publication mechanism rather than a safety net:
+
+1. **Lower `L`** when short queue residence is the primary requirement.
+   For eight contended targets, `L = 250` gives the same retryable outcome
+   as doubling `A` to 10 s, while halving the window in which any reader
+   is blocked.
+2. **Publish fewer targets together**, reducing `k` directly.
+3. **Accept terminal `57014`**, or schedule publication when contention is
+   lower. The failure is clean: nothing partially published, source state
+   unadvanced, staging dropped, next run republishes.
+4. **Raise `A` — but only as an explicit decision to accept a larger `B`**,
+   never as a way to make the arithmetic fit.
+
+### What the warning does and does not claim
+
+`_lock_publication_targets()` warns when `A < n·L + M`. Three things about
+its wording are deliberate.
+
+**"Worst case", not "contended".** The publisher knows `n` and cannot know
+`k`. Claiming "mis-sized for `n` contended targets" would assert something
+it has not observed, and would fire on every publication for a task with
+many uncontended tables.
+
+**"May", not "will".** Even fully contended, the first individual wait can
+reach `L` and raise retryable `55P03` before the aggregate is exhausted.
+The inequality establishes only that the policy cannot *reserve* the full
+per-conflict budget for every target — so a sequence of waits each shorter
+than `L` may cumulatively exhaust `A` and produce terminal `57014` before
+any single wait produces `55P03`. An earlier wording said the aggregate
+"expires first", which overstated a possibility as a certainty.
+
+**No recommendation when none exists.** The suggested `L` is
+`(A − M) // n`, unclamped. When that is zero, no positive `lock_timeout_ms`
+satisfies `n·L + M ≤ A` at all, and the warning says so rather than
+recommending 1 ms — which would not fit either.
+
+Emitted once per run, since the method runs on every retry attempt and a
+repeated static warning would bury the contention messages that vary.
 
 ### Deadlock, confirmed
 

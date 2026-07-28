@@ -451,6 +451,47 @@ class PublicationLockPolicy:
     configures a sub-second delay.
     """
 
+    # Two different things, deliberately:
+    #
+    #   lock_timeout_ms       the PER-CONFLICT limit -- how long to wait
+    #                         for any one target
+    #   acquisition_timeout_ms the AGGREGATE multi-target budget: how long
+    #                         the statement may spend waiting for the
+    #                         complete lock set, and therefore how long an
+    #                         already-acquired target blocks its own
+    #                         readers while the statement waits for the
+    #                         next one
+    #
+    # acquisition_timeout_ms is NOT the total reader-impact ceiling.
+    # Acquired locks are held through the swap and commit that follow, and
+    # both timeouts are reset once the set is complete, so the earliest
+    # acquired target is blocked for acquisition + publication. The
+    # aggregate bounds the WAITING half only; the critical section is
+    # unbounded by this policy.
+    #
+    # Sizing, with:
+    #
+    #   L = per-conflict lock timeout
+    #   A = complete lock-acquisition timeout
+    #   M = execution and timeout-ordering margin
+    #   k = targets expected to contend sequentially
+    #   P = post-acquisition swap-and-commit duration
+    #   B = accepted total reader-blocking budget
+    #
+    # The acquisition policy should satisfy:
+    #
+    #     k * L + M <= A
+    #
+    # When total reader blocking is considered:
+    #
+    #     A + P <= B
+    #
+    # A bounds acquisition waiting only. Locks already acquired remain held
+    # through the short publication swap and commit critical section P.
+    #
+    # The defaults give a worst-case capacity of
+    # (5000 - 50) // 500 = 9 sequentially contended targets.
+    # _lock_publication_targets() warns when n exceeds that.
     lock_timeout_ms: int = 500
     acquisition_timeout_ms: int = 5_000
     retry_horizon_seconds: float = 60.0
@@ -868,6 +909,7 @@ class DbPublisher:
         # it statically; this is what turns 'impossible' into 'enforced'.
         self._generated_names = set()
         self._server_identifier_bytes = None
+        self._lock_policy_warning_emitted = False
         self._committed_tables = []
         self._table_rows = {}
         self._committed = False
@@ -1675,6 +1717,73 @@ class DbPublisher:
 
         conn.execute(sa.text(f'set local lock_timeout = {lock_ms}'))
         conn.execute(sa.text(f'set local statement_timeout = {statement_ms}'))
+
+        # WORST-CASE capacity check, not a contention measurement.
+        #
+        # PostgreSQL acquires the targets in sequence, so covering the case
+        # where every one of them contends needs n x lock_timeout plus
+        # margin. This code knows n -- existing targets -- and cannot know
+        # k, how many will actually contend. Claiming "mis-sized for n
+        # contended targets" would assert something it has not observed,
+        # and would fire on every publication for a task with many
+        # uncontended tables.
+        #
+        # The margin belongs in the requirement, not just in the ordering
+        # invariant: n x lock_timeout exactly equal to the aggregate leaves
+        # nothing for statement execution, lock-manager work or driver
+        # latency. With the defaults that makes the real worst-case
+        # capacity nine targets, not ten.
+        #
+        # Emitted once per run. This method runs on every retry attempt,
+        # and repeating a static configuration warning would bury the
+        # contention messages that actually vary.
+        worst_case_required_ms = (
+            len(existing) * policy.lock_timeout_ms + policy.TIMEOUT_MARGIN_MS
+        )
+        if (
+            policy.acquisition_timeout_ms < worst_case_required_ms
+            and not self._lock_policy_warning_emitted
+        ):
+            self._lock_policy_warning_emitted = True
+            # Integer division, NOT clamped to 1. When the aggregate cannot
+            # accommodate even a 1ms per-conflict wait across n targets, no
+            # positive lock_timeout satisfies n*L + M <= A -- and
+            # recommending 1ms would be recommending something that still
+            # does not fit.
+            recommended_lock_ms = (
+                policy.acquisition_timeout_ms - policy.TIMEOUT_MARGIN_MS
+            ) // len(existing)
+
+            # "may", not "will". Even with every target contended, the
+            # first individual wait can reach lock_timeout and raise
+            # retryable 55P03 before the aggregate is exhausted. What the
+            # inequality establishes is only that the policy cannot RESERVE
+            # the full per-conflict budget for every target, so a sequence
+            # of shorter waits may cumulatively exhaust the aggregate first.
+            advice = (
+                f'lower lock_timeout_ms to about {recommended_lock_ms}ms, '
+                if recommended_lock_ms >= 1 else
+                'no positive lock_timeout_ms can cover this worst case under the '
+                'current aggregate budget, so '
+            )
+            self.log.warning(
+                'publication lock policy cannot reserve the full per-conflict wait '
+                'budget for the worst case in which all %s existing target(s) '
+                'contend sequentially: that needs %sms (%s x lock_timeout_ms=%s + '
+                '%sms margin) but acquisition_timeout_ms is %s. Cumulative waits '
+                'may then exhaust the aggregate and produce terminal 57014 before '
+                'any individual wait reaches lock_timeout_ms and produces retryable '
+                '55P03. Options, in the order to consider them: %spublish fewer '
+                'targets together, accept the terminal failure -- or raise '
+                'acquisition_timeout_ms only as a deliberate decision to accept a '
+                'larger acquisition-phase reader-impact budget. Note that acquired '
+                'locks are held through the swap and commit that follow, so total '
+                'reader blocking exceeds acquisition_timeout_ms by that critical '
+                'section.',
+                len(existing), worst_case_required_ms, len(existing),
+                policy.lock_timeout_ms, policy.TIMEOUT_MARGIN_MS,
+                policy.acquisition_timeout_ms, advice,
+            )
 
         names = ', '.join(_quoted_name(schema, table) for schema, table in existing)
         self.log.info('locking %s publication target(s) for swap', len(existing))
