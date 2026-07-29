@@ -1,6 +1,6 @@
 # 0001 — Replace published tables instead of truncating them
 
-Status: accepted
+Status: accepted for inferred outputs; superseded for declared outputs by [0009](0009-add-fully-declared-output-schemas.md)
 
 ## Problem
 

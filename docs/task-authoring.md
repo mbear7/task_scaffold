@@ -141,9 +141,11 @@ class derived:
 | `db_table` | `None` | Target table name. Omit for no DB output. |
 | `db_output` | `None` | Declared column projection. **Declarative only** — see below. |
 | `db_contract` | `None` | `{source_column: target_column}`. Applied by the scaffold: renames and restricts. |
-| `db_type_overrides` | `None` | `{column: type}` pinning SQL types instead of inferring. |
+| `db_type_overrides` | `None` | Inferred mode only: `{column: type}` pinning selected SQL types. |
+| `db_not_null_columns` | `None` | Inferred mode only: columns that must be `NOT NULL`. |
+| `output_schema` | `None` | Complete declared schema. Supplying it disables inference. |
 | `db_table_id_pix` | `None` | Opaque identifier carried into `RunResult`. |
-| `db_updated_at` | `False` | `True` for a `db_updated_at` timestamp column, or a string for a custom name. |
+| `db_updated_at` | `False` | `True` for an `etl_updated_at TIMESTAMPTZ NOT NULL` column, or a string for a custom name. |
 | `publish_result` | `False` | Make the result available to later pipelines via `ctx.get_result()`. |
 | `debug_display` | `False` | Print the table during the run. |
 | `table_adapter` | `None` | `'petl'`, `'pandas'`, or `None` to infer. |
@@ -164,7 +166,77 @@ class mdm:
 ```
 
 Declaring `db_output` without cutting is not an error — you get the
-pipeline's own columns.
+pipeline's own columns. `db_output` is available only in inferred mode and
+cannot be combined with `output_schema`.
+
+### Inferred and declared database schemas
+
+The examples below use:
+
+```python
+import sqlalchemy as sa
+
+from task_core import OutputColumn, PipelineSpec
+```
+
+Without `output_schema`, the scaffold infers the complete column set and
+PostgreSQL types. `db_type_overrides` may pin selected types and
+`db_not_null_columns` may mark selected inferred columns `NOT NULL`:
+
+```python
+spec = PipelineSpec(
+    db_table='customers',
+    db_type_overrides={'revenue': sa.Numeric(18, 2)},
+    db_not_null_columns=('customer_id',),
+)
+```
+
+For a complete stable contract, declare every user column:
+
+```python
+spec = PipelineSpec(
+    db_table='customer_summary',
+    output_schema=(
+        OutputColumn('customer_id', sa.BigInteger(), nullable=False),
+        OutputColumn('revenue', sa.Numeric(18, 2)),
+        OutputColumn(
+            'created_at',
+            sa.DateTime(timezone=True),
+            nullable=False,
+        ),
+    ),
+)
+```
+
+Columns are nullable by default. Declared output must contain exactly the same
+column set; source order may differ and is reordered into declaration order.
+Missing or unexpected columns, normalized missing values in non-nullable
+columns and incompatible value families fail during staging preparation before
+publication.
+
+Declared validation performs no implicit parsing or lossy conversion. In
+particular, `float` is not converted to `NUMERIC`, `datetime` is not converted
+to `DATE`, and strings are not parsed into typed values. Python `Decimal` is
+supported for `NUMERIC` when precision and scale fit without rounding.
+Fixed-length `CHAR`, enums and other PostgreSQL-specific type families are not
+part of the initial declared-schema contract. Naive
+datetimes are required for `timestamp without time zone`; timezone-aware
+datetimes are required for `timestamp with time zone`.
+
+`output_schema` cannot be combined with `db_output`, `db_type_overrides`,
+`db_not_null_columns`, or `get_dynamic_db_contract()`. The dynamic hook conflict
+is rejected during structural pipeline validation, before resources are built. A static `db_contract`
+may still rename/project source columns before declared validation. The
+framework-generated `etl_updated_at` column is not listed in `output_schema`;
+it is always appended as `TIMESTAMPTZ NOT NULL`.
+
+On first publication, a declared target is created and filled atomically. On
+later publications the existing ordinary table must match the declared schema
+exactly and is refreshed with transactional `TRUNCATE` plus `INSERT FROM` the
+prepared staging table. The target OID, views, indexes, grants, ownership and
+triggers are preserved. Views, partitioned tables, foreign tables, materialized
+views, incompatible schemas and external incoming foreign keys are rejected.
+The table comment remains framework-owned publication provenance.
 
 ### `db_contract` is applied
 

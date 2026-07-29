@@ -1,0 +1,255 @@
+# 0009 — Add fully declared output schemas
+
+Status: accepted
+
+Implemented in 0.5.0.
+
+## Problem
+
+`task_core` originally had one PostgreSQL schema model: infer the complete
+output schema from the produced data, optionally overriding selected physical
+types.
+
+That remains useful for exploratory and adaptive outputs, but it is a poor
+contract for long-lived BI and integration tables:
+
+- an empty output cannot prove types from values;
+- all-`NULL` columns are ambiguous;
+- schema changes may be caused by data changes rather than code changes;
+- column nullability is implicit;
+- replacing the table on every run discards object identity, grants and
+  indexes, and prevents dependent views.
+
+A complete manual schema must therefore be a separate contract rather than a
+larger collection of inference overrides.
+
+## Decision
+
+Support two schema sources:
+
+```text
+output_schema is None
+→ infer the complete schema, with optional type and NOT NULL overrides
+
+output_schema is supplied
+→ use the fully declared schema and disable inference
+```
+
+There is no `schema_mode` field. The presence of `output_schema` is the mode
+selection and avoids contradictory configurations.
+
+Both paths produce the same internal `ResolvedSchema` / `ResolvedColumn`
+representation. Staging DDL, ordered row loading and publication consume that
+single representation and do not branch on the public configuration shape.
+
+## Public declaration
+
+```python
+OutputColumn(
+    name='customer_id',
+    type=sa.BigInteger(),
+    nullable=False,
+)
+```
+
+`nullable` defaults to `True`. Nullable columns are the common ETL case;
+`nullable=False` is the meaningful constraint and remains explicit.
+
+`output_schema` must:
+
+- contain at least one column;
+- contain unique portable lower-case names;
+- define the complete user-output column set and order;
+- use supported SQLAlchemy type instances, SQLAlchemy type classes or the
+  existing string type aliases.
+
+It is mutually exclusive with:
+
+- `db_output`;
+- `db_type_overrides`;
+- `db_not_null_columns`.
+
+`db_output` remains an inferred-mode-only, declarative convenience. A static
+`db_contract` may be used before declared validation because its target names
+are the final PostgreSQL names. `get_dynamic_db_contract()` is rejected with
+`output_schema`: a runtime-changing projection is incompatible with a static
+complete schema. That conflict is rejected during structural pipeline
+validation, before resources are built.
+
+## Inferred-mode nullability
+
+Inferred columns remain nullable by default. A task may mark selected inferred
+columns `NOT NULL`:
+
+```python
+PipelineSpec(
+    db_table='customers',
+    db_not_null_columns=('customer_id',),
+)
+```
+
+This does not create a hybrid declared mode. The framework still infers the
+column set and types; only the listed columns gain a nullability constraint.
+
+Framework-generated technical columns are framework-owned. The default
+`etl_updated_at` column is `TIMESTAMPTZ NOT NULL` regardless of schema mode and
+must not be repeated in `output_schema`, `db_type_overrides` or
+`db_not_null_columns`.
+
+## Strict row validation
+
+The existing `_normalize_value()` semantics run first. Scalar missing markers
+such as `None`, NaN, `pd.NA`, `pd.NaT` and NumPy `NaT` normalize to SQL `NULL`.
+A normalized `NULL` violates a non-nullable column during staging preparation;
+the live target is never touched.
+
+Declared validation is intentionally strict and performs no implicit
+cross-family parsing or lossy conversion. The initial supported families are:
+
+- Boolean;
+- `SMALLINT`, `INTEGER`, `BIGINT`;
+- floating point;
+- `NUMERIC` / `DECIMAL`;
+- text and bounded variable-length strings;
+- binary;
+- date;
+- timestamps with and without timezone.
+
+Examples:
+
+- Python `int` is valid for integer types and `NUMERIC` when it fits;
+- Python `Decimal` is valid for `NUMERIC` when precision and scale fit without
+  rounding;
+- Python `float` is not implicitly converted to `NUMERIC`;
+- `datetime` is not implicitly converted to `DATE`;
+- strings are not parsed into numeric, Boolean, date or timestamp values;
+- aware datetimes are required for `TIMESTAMP WITH TIME ZONE`;
+- naive datetimes are required for `TIMESTAMP WITHOUT TIME ZONE`.
+
+PostgreSQL remains the final authority for database constraints, triggers and
+backend-specific adaptation. A database rejection rolls back the complete
+staging preparation transaction.
+
+## Column matching and ordering
+
+A declared output may produce its columns in a different order. The framework:
+
+1. compares the complete produced and declared column sets;
+2. rejects missing or unexpected columns;
+3. reorders values into declaration order before staging.
+
+Empty outputs are valid because the schema comes from the declaration. An
+empty declaration is invalid.
+
+## Stable declared targets
+
+Inferred outputs retain the existing staged replacement publication from ADR
+0001.
+
+Declared outputs use a permanent ordinary logged target table.
+
+### First publication
+
+When the target is absent, the publication transaction:
+
+1. verifies the prepared staging artifact;
+2. creates the permanent target from the resolved declared schema;
+3. fills it from staging;
+4. applies the framework-owned publication comment;
+5. drops staging;
+6. commits.
+
+The target is never committed empty or partially filled. In a mixed
+publication, all absent declared targets are created and filled before the
+first existing live-target lock.
+
+### Existing target
+
+Before locking, the target must be an ordinary table and must exactly match the
+prepared staging table's PostgreSQL catalog metadata:
+
+- ordered column names;
+- type OIDs;
+- type modifiers such as numeric precision/scale and varchar length;
+- nullability;
+- relevant collation;
+- identity and generated-column metadata.
+
+No widening compatibility and no automatic migration are performed. Views,
+materialized views, foreign tables and partitioned tables are rejected
+explicitly.
+
+External incoming foreign keys are rejected before locking. The framework
+never uses `TRUNCATE ... CASCADE` and does not coordinate dependent-table
+refreshes in this release.
+
+The publication transaction then:
+
+```text
+complete source-state and preparatory work
+→ acquire every existing live-target lock in deterministic sorted order
+→ TRUNCATE declared target
+→ INSERT FROM staging
+→ update framework provenance comment
+→ drop staging
+→ commit
+```
+
+The target OID, views, indexes, grants, ownership, triggers and row-level
+security remain attached to the same object. The table comment remains
+framework-owned and is updated on publication.
+
+## Locking consequence
+
+`TRUNCATE` requires `ACCESS EXCLUSIVE`, and the lock remains held through the
+full refill, index maintenance, constraint checks and commit. There is no
+generic duration estimate: representative row width, indexes, storage,
+replication and server load must be measured.
+
+The formal locking model remains:
+
+```text
+k × L + M ≤ A
+A + P ≤ B
+```
+
+For declared outputs, `P` includes the locked `TRUNCATE`, refill, staging drop,
+comment and commit work. Partition swap may be considered later only if live
+measurements show that this critical section is unacceptable.
+
+## Validation
+
+The implementation passed the complete automated suite: 450 tests and 204
+subtests, with no failures, errors or skips. The suite covers configuration,
+normalization, strict compatibility, control-flow ordering and rollback
+invariants.
+
+Two separate PostgreSQL 16.11 acceptance campaigns also passed:
+
+- the existing live server verified atomic first publication, stable target
+  OIDs, preservation of views, indexes, grants, ownership and triggers,
+  strict staging-time rejection, physical-schema compatibility, incoming
+  foreign-key rejection, empty refreshes, multi-target rollback and cleanup;
+- a resource-constrained Ubuntu/Docker VPS verified `55P03` retry, observable
+  reader blocking during refill, backend termination, rollback of the live
+  refill, successor cleanup of abandoned staging artifacts and final cleanup.
+
+On the constrained VPS, a declared refresh of 50,000 rows measured 4.233
+seconds for the locked refill and commit and 2.429 seconds of concurrent reader
+blocking. The harness deliberately prolonged the refill to make the lock state
+observable, so these values are acceptance evidence rather than production
+performance estimates.
+
+Both campaigns used positively scoped temporary objects and verified cleanup.
+The prior 0.4.0 live acceptance results remain the empirical baseline for the
+unchanged inferred swap path.
+
+## Deferred
+
+- bounded-memory `COPY FROM STDIN`;
+- partition swap;
+- automatic schema migration;
+- incoming-foreign-key coordination;
+- configurable ownership of the target table comment;
+- defaults, generated expressions, identity declarations and broader
+  PostgreSQL-specific type families.

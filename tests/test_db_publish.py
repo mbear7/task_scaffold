@@ -1348,8 +1348,9 @@ class Test14ServerIdentifierLimitResolution(unittest.TestCase):
 
 
 class Test15StagedPublicationModel(unittest.TestCase):
-    """Preparation transactions commit per target; one short publication
-    transaction swaps everything.
+    """Preparation transactions commit per target; one atomic publication
+    transaction publishes everything. These tests cover the inferred swap path,
+    whose final transaction remains short.
 
     The single run-long transaction it replaces was atomic but unbounded:
     it stayed open across remote file reads, transformations and Excel

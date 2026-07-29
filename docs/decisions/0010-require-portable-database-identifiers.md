@@ -49,10 +49,14 @@ WHERE n.nspname = :schema
   AND c.relname = :table;
 ```
 
-The primitive has exactly two callers:
+At introduction in 0.4.1, the primitive had exactly two callers:
 
 - `_verify_prepared_artifacts()`;
 - `_lock_publication_targets()`.
+
+ADR 0009 later extends the same contained primitive to declared-target
+compatibility preflight. It remains a small exact catalog lookup rather than a
+resolver framework, factory or registry.
 
 It returns `(oid, relkind)` or `None`. Each caller owns its own missing-object
 policy. Both require `relkind = 'r'`: a view, materialized view, foreign table,

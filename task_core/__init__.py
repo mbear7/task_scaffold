@@ -18,7 +18,7 @@ resolves; this one behavior intentionally does not. See README
 message for the rationale.
 """
 
-__version__ = '0.4.1'
+__version__ = '0.5.0'
 
 from task_core.db_publish import (
     DbPublishError,
@@ -32,6 +32,7 @@ from task_core.types import (
     PipelineContractError,
     PipelineError,
     PipelineSpec,
+    OutputColumn,
     RunResult,
     SourceCheckError,
     get_pipeline_spec,

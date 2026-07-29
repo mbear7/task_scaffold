@@ -134,6 +134,40 @@ source-change checking.
 Then read [task-authoring.md](docs/task-authoring.md).
 
 
+## Inferred and declared output schemas
+
+Database schemas are inferred by default:
+
+```python
+import sqlalchemy as sa
+
+from task_core import OutputColumn, PipelineSpec
+
+PipelineSpec(db_table='customer_summary')
+```
+
+For a stable, strictly validated contract, provide the complete
+`output_schema`:
+
+```python
+PipelineSpec(
+    db_table='customer_summary',
+    output_schema=(
+        OutputColumn('customer_id', sa.BigInteger(), nullable=False),
+        OutputColumn('revenue', sa.Numeric(18, 2)),
+        OutputColumn('created_at', sa.DateTime(timezone=True), nullable=False),
+    ),
+)
+```
+
+Supplying `output_schema` disables inference. The declaration defines the
+complete column set, order, types and nullability. Columns are nullable by
+default. Missing or unexpected columns, incompatible values and `NULL` in a
+column declared with `nullable=False` fail during staging preparation before
+the live target is changed. Existing declared targets keep their table
+identity and are refreshed transactionally.
+
+
 ## Limitations
 
 Known constraints that will affect you, in rough order of how likely they
@@ -145,13 +179,16 @@ are to matter. Each is expanded in
   files may disagree with the database. Nothing downstream may read them
   programmatically; if something needs the data, it reads the published
   table.
-- **Published tables are dropped and recreated on every run.** Column
-  types are inferred from the data, so a table's schema can change between
-  runs. Grants are not preserved, and a dependent view makes the publish
-  fail.
+- **Inferred outputs replace the table on every run.** Their schema may
+  change with the data; grants are not preserved, and dependent views make
+  publication fail. Fully declared outputs instead keep a stable ordinary
+  table and use transactional `TRUNCATE` plus refill, preserving table-bound
+  objects but blocking readers for the complete refill critical section.
 - **Publication is atomic; preparation is not.** Each DB target is
-  prepared in its own committed transaction, and one short publication
-  transaction swaps them all. No transaction spans the run — but a failed
+  prepared in its own committed transaction, followed by one atomic
+  publication transaction. Inferred swaps are short; declared stable-target
+  refills may be materially longer because the target stays locked through
+  `TRUNCATE`, refill and commit. No transaction spans the run — but a failed
   run leaves committed staging tables, which the next run of the same task
   removes.
 - **Schema, table and column names published to PostgreSQL must be

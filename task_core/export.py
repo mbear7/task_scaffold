@@ -14,7 +14,8 @@ private, spec-aware helpers below with the PipelineSpec captured before
 task_cls.run(), not re-derived after. This preserves facade compatibility
 while preventing runtime cls.spec reassignment from changing output
 targets or any other static publish configuration -- db_table,
-excel_name, db_type_overrides, db_table_id_pix, and the resolved adapter
+excel_name, db_type_overrides, db_not_null_columns, output_schema,
+db_table_id_pix, and the resolved adapter
 are all governed exclusively by the spec captured before .run() executes,
 enforced structurally, not by convention. The one deliberately dynamic
 exception is db_contract, via the get_dynamic_db_contract hook below.
@@ -22,7 +23,7 @@ exception is db_contract, via the get_dynamic_db_contract hook below.
 
 from datetime import datetime, timezone
 
-from task_core.types import PipelineContractError, get_pipeline_spec
+from task_core.types import OutputColumn, PipelineContractError, get_pipeline_spec
 from task_core.table_adapters import get_table_adapter
 
 
@@ -55,9 +56,9 @@ def apply_db_updated_at(payload, spec, run_started_at=None):
     for row in payload.rows:
         row[column_name] = run_started_at
 
-    type_overrides = dict(payload.type_overrides or {})
-    type_overrides.setdefault(column_name, 'TIMESTAMPTZ')
-    payload.type_overrides = type_overrides
+    payload.framework_columns = tuple(payload.framework_columns) + (
+        OutputColumn(column_name, 'TIMESTAMPTZ', nullable=False),
+    )
 
 
 def _export_excel_with_spec(tbl, spec):
@@ -84,6 +85,11 @@ def _build_db_payload_with_spec(task_cls, tbl, spec, pg_schema, *, run_started_a
     # a full spec re-fetch that could pick up an unrelated cls.spec
     # reassignment.
     dynamic_contract_fn = getattr(task_cls, 'get_dynamic_db_contract', None)
+    if spec.output_schema is not None and callable(dynamic_contract_fn):
+        raise PipelineContractError(
+            f'{spec.db_table!r}: output_schema cannot be combined with '
+            'get_dynamic_db_contract(); declared schemas require a static final column contract'
+        )
     db_contract = dynamic_contract_fn(tbl) if callable(dynamic_contract_fn) else spec.db_contract
 
     payload = adapter.to_db_payload(
@@ -92,6 +98,8 @@ def _build_db_payload_with_spec(task_cls, tbl, spec, pg_schema, *, run_started_a
         schema=pg_schema,
         type_overrides=spec.db_type_overrides,
         db_contract=db_contract,
+        not_null_columns=spec.db_not_null_columns,
+        output_schema=spec.output_schema,
         db_table_id_pix=spec.db_table_id_pix,
     )
     apply_db_updated_at(payload, spec, run_started_at)

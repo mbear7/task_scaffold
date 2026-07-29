@@ -12,6 +12,52 @@ chronologically rather than by release.
 ## Unreleased
 
 
+## 0.5.0
+
+Adds a second database schema contract while preserving inferred publication
+as the default. See ADR 0009.
+
+### Added
+
+- `OutputColumn` and `PipelineSpec.output_schema` for a complete ordered
+  PostgreSQL output contract. Supplying `output_schema` disables inference;
+  missing or unexpected columns, incompatible values and non-null violations
+  fail during staging preparation.
+- `PipelineSpec.db_not_null_columns` for selected inferred columns. Inferred
+  types and column discovery remain unchanged; only listed columns gain a real
+  staging `NOT NULL` constraint.
+- Strict declared validation for Boolean, integer, floating-point,
+  `NUMERIC`/`Decimal`, text, binary, date and timezone-aware or naive timestamp
+  families. No implicit string parsing, float-to-`NUMERIC`, datetime-to-date or
+  timezone assumption is performed.
+
+### Changed
+
+- Declared outputs publish to a stable ordinary table. First publication
+  creates and fills the target atomically; later publications verify exact
+  PostgreSQL catalog compatibility and use transactional `TRUNCATE` plus
+  `INSERT FROM` staging. The target OID, views, indexes, grants, ownership and
+  triggers remain attached to the same object.
+- Existing inferred outputs retain the staged `DROP`/`RENAME` replacement path.
+- `db_output` remains inferred-mode only and is mutually exclusive with
+  `output_schema`. Declared output order comes solely from `output_schema`;
+  produced columns may arrive in another order and are reordered after exact
+  set validation.
+- `db_updated_at=True` continues to append `etl_updated_at`, now explicitly
+  represented as framework-owned `TIMESTAMPTZ NOT NULL` in both schema modes.
+
+### Safety
+
+- Declared stable targets reject views, materialized views, foreign tables,
+  partitioned tables, incompatible physical schemas and external incoming
+  foreign keys before live-target locking. `TRUNCATE CASCADE` and automatic
+  schema migration are not used.
+- All first-target creation, schema/dependency checks and source-state work
+  complete before the first existing live-target lock. The locked declared
+  critical section contains only `TRUNCATE`, refill, provenance comment,
+  staging drop and commit.
+
+
 ## 0.4.1
 
 A narrowly scoped publication-correctness patch. No COPY, declared-schema,

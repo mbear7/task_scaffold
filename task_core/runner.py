@@ -88,6 +88,15 @@ def validate_pipeline_class(task_cls, *, pipeline_name=None):
 
     spec = get_pipeline_spec(task_cls)
 
+    if spec.output_schema is not None and callable(
+        getattr(task_cls, 'get_dynamic_db_contract', None)
+    ):
+        raise PipelineContractError(
+            f'{name}: output_schema cannot be combined with '
+            f'get_dynamic_db_contract(); declared schemas require a static final '
+            f'column contract'
+        )
+
     if not callable(getattr(task_cls, 'run', None)):
         raise PipelineContractError(f'{name}: missing callable run(ctx) method')
 

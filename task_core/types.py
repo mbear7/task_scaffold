@@ -86,6 +86,28 @@ PORTABLE_IDENTIFIER_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
 
 
 @dataclass(frozen=True)
+class OutputColumn:
+    """One column in a fully declared database output schema.
+
+    ``type`` accepts the same SQLAlchemy type instance, SQLAlchemy type
+    class, or supported string alias as ``db_type_overrides``. Columns are
+    nullable by default; task authors opt into ``NOT NULL`` explicitly.
+    """
+
+    name: str
+    type: Any
+    nullable: bool = True
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name:
+            raise TypeError('OutputColumn.name must be a non-empty str')
+        if self.type is None:
+            raise TypeError('OutputColumn.type must not be None')
+        if type(self.nullable) is not bool:
+            raise TypeError('OutputColumn.nullable must be bool')
+
+
+@dataclass(frozen=True)
 class PipelineSpec:
     excel_name: str | None = None
     db_table: str | None = None
@@ -97,6 +119,10 @@ class PipelineSpec:
     publish_result: bool = False
     debug_display: bool = False
     table_adapter: str | None = None
+    # Added after every 0.4.1 field so existing positional construction keeps
+    # its meaning. New code should still use keyword arguments.
+    db_not_null_columns: list[str] | tuple[str, ...] | None = None
+    output_schema: list[OutputColumn] | tuple[OutputColumn, ...] | None = None
     def __post_init__(self):
         if self.excel_name is not None and not isinstance(self.excel_name, str):
             raise TypeError('excel_name must be str or None')
@@ -144,10 +170,75 @@ class PipelineSpec:
                 raise TypeError('db_type_overrides must be dict or None')
             object.__setattr__(self, 'db_type_overrides', MappingProxyType(dict(self.db_type_overrides)))
 
+        if self.db_not_null_columns is not None:
+            if not isinstance(self.db_not_null_columns, (list, tuple)):
+                raise TypeError(
+                    'db_not_null_columns must be a list or tuple of strings, or None'
+                )
+            if not all(isinstance(item, str) for item in self.db_not_null_columns):
+                raise TypeError('db_not_null_columns must contain only strings')
+            duplicates = find_duplicates(self.db_not_null_columns)
+            if duplicates:
+                raise PipelineContractError(
+                    f'db_not_null_columns contains duplicate column(s): {duplicates}'
+                )
+            object.__setattr__(
+                self, 'db_not_null_columns', tuple(self.db_not_null_columns)
+            )
+
+        if self.output_schema is not None:
+            if not isinstance(self.output_schema, (list, tuple)):
+                raise TypeError(
+                    'output_schema must be a list or tuple of OutputColumn values, or None'
+                )
+            if not self.output_schema:
+                raise PipelineContractError('output_schema must contain at least one column')
+            if not all(isinstance(item, OutputColumn) for item in self.output_schema):
+                raise TypeError('output_schema must contain only OutputColumn values')
+            duplicates = find_duplicates(column.name for column in self.output_schema)
+            if duplicates:
+                raise PipelineContractError(
+                    f'output_schema contains duplicate column name(s): {duplicates}'
+                )
+            object.__setattr__(self, 'output_schema', tuple(self.output_schema))
+
+        if self.output_schema is not None:
+            incompatible = []
+            if self.db_output is not None:
+                incompatible.append('db_output')
+            if self.db_type_overrides is not None:
+                incompatible.append('db_type_overrides')
+            if self.db_not_null_columns is not None:
+                incompatible.append('db_not_null_columns')
+            if incompatible:
+                raise PipelineContractError(
+                    'output_schema cannot be combined with ' + ', '.join(incompatible)
+                )
+
         if not isinstance(self.db_updated_at, (bool, str)):
             raise TypeError('db_updated_at must be bool or str')
         if isinstance(self.db_updated_at, str) and not self.db_updated_at:
             raise TypeError('db_updated_at must be a non-empty str when used as a column name')
+
+        updated_at_name = (
+            self.db_updated_at if isinstance(self.db_updated_at, str) else 'etl_updated_at'
+        )
+        if self.db_updated_at:
+            if self.output_schema is not None and any(
+                column.name == updated_at_name for column in self.output_schema
+            ):
+                raise PipelineContractError(
+                    f'output_schema must not declare framework column {updated_at_name!r}'
+                )
+            if self.db_not_null_columns and updated_at_name in self.db_not_null_columns:
+                raise PipelineContractError(
+                    f'db_not_null_columns must not include framework column {updated_at_name!r}; '
+                    'it is always NOT NULL'
+                )
+            if self.db_type_overrides and updated_at_name in self.db_type_overrides:
+                raise PipelineContractError(
+                    f'db_type_overrides must not override framework column {updated_at_name!r}'
+                )
 
         if not isinstance(self.publish_result, bool):
             raise TypeError('publish_result must be bool')

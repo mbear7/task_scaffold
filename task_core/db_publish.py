@@ -23,7 +23,7 @@ from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
-from task_core.types import PORTABLE_IDENTIFIER_RE, find_duplicates
+from task_core.types import OutputColumn, PORTABLE_IDENTIFIER_RE, find_duplicates
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,19 @@ class DbTableResult:
     db_table_id_pix: Any | None = None
 
 
+@dataclass(frozen=True)
+class ResolvedColumn:
+    name: str
+    type: sa.types.TypeEngine
+    nullable: bool = True
+
+
+@dataclass(frozen=True)
+class ResolvedSchema:
+    columns: tuple[ResolvedColumn, ...]
+    source: str
+
+
 @dataclass
 class DbPayload:
     table_name: str
@@ -43,6 +56,9 @@ class DbPayload:
     rows: list[dict[str, Any]]
     type_overrides: dict[str, Any] | None = None
     db_table_id_pix: Any | None = None
+    not_null_columns: tuple[str, ...] = ()
+    output_schema: tuple[OutputColumn, ...] | None = None
+    framework_columns: tuple[OutputColumn, ...] = ()
 
 
 class DbPublishError(RuntimeError):
@@ -176,7 +192,10 @@ def _apply_db_contract_columns(columns, rows, db_contract, *, table_name):
     ]
 
 
-def from_petl(tbl, *, table_name, schema, type_overrides=None, db_contract=None, db_table_id_pix=None):
+def from_petl(
+    tbl, *, table_name, schema, type_overrides=None, db_contract=None,
+    not_null_columns=(), output_schema=None, db_table_id_pix=None,
+):
     if isinstance(tbl, pd.DataFrame):
         raise DbPublishError(
             f'{table_name!r}: from_petl() received a pandas DataFrame, '
@@ -207,12 +226,17 @@ def from_petl(tbl, *, table_name, schema, type_overrides=None, db_contract=None,
         columns=columns,
         rows=rows,
         type_overrides=type_overrides,
+        not_null_columns=tuple(not_null_columns or ()),
+        output_schema=tuple(output_schema) if output_schema is not None else None,
         db_table_id_pix=db_table_id_pix,
     )
 
 
 
-def from_pandas(df: pd.DataFrame, *, table_name, schema, type_overrides=None, db_contract=None, db_table_id_pix=None):
+def from_pandas(
+    df: pd.DataFrame, *, table_name, schema, type_overrides=None, db_contract=None,
+    not_null_columns=(), output_schema=None, db_table_id_pix=None,
+):
     if not isinstance(df, pd.DataFrame):
         raise DbPublishError(
             f'{table_name!r}: from_pandas() received a {type(df).__name__!r}, '
@@ -239,6 +263,8 @@ def from_pandas(df: pd.DataFrame, *, table_name, schema, type_overrides=None, db
         columns=columns,
         rows=rows,
         type_overrides=type_overrides,
+        not_null_columns=tuple(not_null_columns or ()),
+        output_schema=tuple(output_schema) if output_schema is not None else None,
         db_table_id_pix=db_table_id_pix,
     )
 
@@ -383,6 +409,43 @@ def _find_relation(conn, schema, table):
     return int(row[0]), str(row[1])
 
 
+_RELATION_COLUMNS_SQL = sa.text(
+    "select a.attname, a.atttypid, a.atttypmod, a.attnotnull, "
+    "a.attcollation, a.attidentity, a.attgenerated "
+    "from pg_catalog.pg_attribute a "
+    "where a.attrelid = :oid and a.attnum > 0 and not a.attisdropped "
+    "order by a.attnum"
+)
+
+_EXTERNAL_INCOMING_FKS_SQL = sa.text(
+    "select n.nspname, c.relname, con.conname "
+    "from pg_catalog.pg_constraint con "
+    "join pg_catalog.pg_class c on c.oid = con.conrelid "
+    "join pg_catalog.pg_namespace n on n.oid = c.relnamespace "
+    "where con.contype = 'f' and con.confrelid = :oid "
+    "and con.conrelid <> con.confrelid "
+    "order by n.nspname, c.relname, con.conname"
+)
+
+
+def _relation_columns(conn, oid):
+    """Canonical PostgreSQL physical column metadata for one relation."""
+    return tuple(
+        (
+            str(row[0]), int(row[1]), int(row[2]), bool(row[3]),
+            int(row[4]), str(row[5]), str(row[6]),
+        )
+        for row in conn.execute(_RELATION_COLUMNS_SQL, {'oid': oid}).all()
+    )
+
+
+def _external_incoming_foreign_keys(conn, oid):
+    return tuple(
+        (str(row[0]), str(row[1]), str(row[2]))
+        for row in conn.execute(_EXTERNAL_INCOMING_FKS_SQL, {'oid': oid}).all()
+    )
+
+
 class PublicationPlan:
     """Work the runner needs performed inside the publication transaction.
 
@@ -504,7 +567,7 @@ class PublicationLockPolicy:
     #     A + P <= B
     #
     # A bounds acquisition waiting only. Locks already acquired remain held
-    # through the short publication swap and commit critical section P.
+    # through the publication swap-or-refill and commit critical section P.
     #
     # The defaults give a worst-case capacity of
     # (5000 - 50) // 500 = 9 sequentially contended targets.
@@ -920,6 +983,8 @@ class DbPublisher:
         self._locked_task_name = None
         self._written_tables = []
         self._pending_swaps = []
+        self._resolved_schemas = {}
+        self._declared_targets = set()
         self._run_token = new_run_token()
         # Final invariant enforcement. The naming rule already makes a
         # collision impossible by construction and preflight already proved
@@ -1279,6 +1344,15 @@ class DbPublisher:
                 validate_identifier(column, max_identifier_bytes, kind='column name', context=context)
                 validate_portable_identifier(column, kind='column name', context=context)
 
+            if spec.output_schema is not None:
+                for column in spec.output_schema:
+                    try:
+                        _resolve_declared_type(column.type)
+                    except DbPublishError as exc:
+                        raise DbPublishError(
+                            f'{context}output_schema column {column.name!r}: {exc}'
+                        ) from exc
+
     @staticmethod
     def _declared_column_targets(spec):
         """Column names knowable without running anything. Covers a static
@@ -1295,8 +1369,14 @@ class DbPublisher:
             targets += [str(value) for value in spec.db_contract.values()]
         if spec.db_output:
             targets += [str(value) for value in spec.db_output]
+        if spec.db_not_null_columns:
+            targets += [str(value) for value in spec.db_not_null_columns]
+        if spec.output_schema:
+            targets += [column.name for column in spec.output_schema]
         if isinstance(spec.db_updated_at, str):
             targets.append(spec.db_updated_at)
+        elif spec.db_updated_at:
+            targets.append('etl_updated_at')
         return targets
 
     def _effective_identifier_limit(self):
@@ -1333,8 +1413,8 @@ class DbPublisher:
         transaction. The live table is not touched.
 
         This is the preparation half of the staged model. Rows go into a
-        run-owned staging table with the freshly inferred schema; the
-        staging table is validated, marked with ownership metadata, and
+        run-owned staging table with the resolved inferred or declared
+        schema; the staging table is validated, marked with ownership metadata, and
         committed. The live table stays readable and unlocked until
         commit() swaps everything at once.
 
@@ -1389,19 +1469,24 @@ class DbPublisher:
                 f'{payload.schema}.{staging_name} (target {payload.table_name!r})'
             )
 
-        # Built BEFORE the transaction opens. _build_table() runs type
-        # inference, which scans the payload and may be O(rows) -- work
-        # that needs no database transaction and would otherwise sit inside
-        # one, against the whole point of bounding preparation to actual
-        # database work.
-        staging_table = self._build_table(payload, table_name=staging_name)
+        # Resolve and validate the complete schema before the transaction
+        # opens. Inferred mode may scan rows; declared mode validates every
+        # normalized value against the explicit contract. Neither needs a
+        # database transaction.
+        resolved_schema = _resolve_payload_schema(
+            payload, sample_size=self.type_infer_sample_size,
+        )
+        staging_table = self._build_table(
+            payload, resolved_schema=resolved_schema, table_name=staging_name,
+        )
 
         conn = self.ensure_connection()
         self._ensure_transaction()
 
         self.log.info(
-            'preparing %s.%s as %s rows=%s',
+            'preparing %s.%s as %s rows=%s schema=%s',
             payload.schema, payload.table_name, staging_name, len(payload.rows),
+            resolved_schema.source,
         )
 
         # NO drop-first. `drop(checkfirst=True)` bypassed the cleanup safety
@@ -1447,6 +1532,10 @@ class DbPublisher:
         self._generated_names.add(key)
         self._written_tables.append(table_result)
         self._table_rows[full_name] = table_result.rows
+        target_key = (payload.schema, payload.table_name)
+        self._resolved_schemas[target_key] = resolved_schema
+        if resolved_schema.source == 'declared':
+            self._declared_targets.add(target_key)
         self._pending_swaps.append((payload.schema, payload.table_name, staging_name, len(payload.rows)))
 
     def _verify_prepared_table(self, payload, staging_name, loaded):
@@ -1628,7 +1717,167 @@ class DbPublisher:
     def _sqlstate(exc):
         return getattr(getattr(exc, 'orig', None), 'pgcode', None)
 
-    def _lock_publication_targets(self, deadline):
+    @staticmethod
+    def _relation_kind_name(relkind):
+        return {
+            'r': 'ordinary table',
+            'p': 'partitioned table',
+            'v': 'view',
+            'm': 'materialized view',
+            'f': 'foreign table',
+        }.get(relkind, f'relation kind {relkind!r}')
+
+    def _resolved_schema_for(self, schema, table_name):
+        try:
+            return self._resolved_schemas[(schema, table_name)]
+        except KeyError as exc:
+            raise DbPublishInvariantError(
+                f'internal invariant violated -- no resolved schema recorded for '
+                f'{schema}.{table_name}'
+            ) from exc
+
+    def _verify_declared_target_compatibility(
+        self, *, schema, table_name, staging_name, target_oid, staging_oid,
+    ):
+        conn = self.ensure_connection()
+        target_columns = _relation_columns(conn, target_oid)
+        staging_columns = _relation_columns(conn, staging_oid)
+        if target_columns != staging_columns:
+            raise DbPublishError(
+                f'declared publication target {schema}.{table_name} does not match '
+                f'output_schema. The existing table must have the exact same ordered '
+                f'column names, PostgreSQL types and modifiers, nullability, collation, '
+                f'identity, and generated-column metadata as prepared staging table '
+                f'{staging_name}. Migrate or recreate the target explicitly before rerunning.'
+            )
+
+        incoming = _external_incoming_foreign_keys(conn, target_oid)
+        if incoming:
+            described = ', '.join(
+                f'{fk_schema}.{fk_table} ({constraint})'
+                for fk_schema, fk_table, constraint in incoming
+            )
+            raise DbPublishError(
+                f'declared publication target {schema}.{table_name} has incoming '
+                f'foreign-key references from {described}. Stable publication uses '
+                f'TRUNCATE without CASCADE, so external incoming references require '
+                f'explicit handling outside task_core.'
+            )
+
+    def _create_and_fill_declared_target(
+        self, *, schema, table_name, staging_name, rows,
+    ):
+        conn = self.ensure_connection()
+        resolved = self._resolved_schema_for(schema, table_name)
+        metadata = sa.MetaData()
+        target_table = sa.Table(
+            table_name,
+            metadata,
+            *[
+                sa.Column(column.name, column.type, nullable=column.nullable)
+                for column in resolved.columns
+            ],
+            schema=schema,
+        )
+        target_table.create(conn)
+
+        target_qualified = _quoted_name(schema, table_name)
+        staging_qualified = _quoted_name(schema, staging_name)
+        columns = ', '.join(_quote_identifier(column.name) for column in resolved.columns)
+        conn.execute(sa.text(
+            f'insert into {target_qualified} ({columns}) '
+            f'select {columns} from {staging_qualified}'
+        ))
+        self._set_comment(schema, table_name, build_published_comment(
+            task_name=self.task_name, run_token=self._run_token, rows=rows,
+        ))
+        conn.execute(sa.text(f'drop table {staging_qualified}'))
+
+    def _prepare_declared_targets_before_lock(self):
+        """Validate existing stable targets and build absent ones before locks.
+
+        This phase is deliberately before source-state work and before the
+        first live-target lock. A new target is invisible until commit, so its
+        complete create-and-fill work does not block readers of an existing
+        object. Existing targets are only inspected here; their rows remain
+        untouched until every live lock is held.
+        """
+        conn = self.ensure_connection()
+        if not self._declared_targets:
+            return set()
+        if conn.dialect.name != 'postgresql':
+            raise DbPublishError(
+                'fully declared stable-target publication requires PostgreSQL'
+            )
+
+        created = set()
+        for schema, table_name, staging_name, rows in sorted(
+            self._pending_swaps, key=lambda item: (item[0] or '', item[1])
+        ):
+            key = (schema, table_name)
+            if key not in self._declared_targets:
+                continue
+
+            staging_relation = _find_relation(conn, schema, staging_name)
+            if staging_relation is None:
+                raise DbPublishError(
+                    f'prepared staging table {schema}.{staging_name} is missing'
+                )
+            staging_oid, staging_kind = staging_relation
+            if staging_kind != 'r':
+                raise DbPublishError(
+                    f'prepared staging relation {schema}.{staging_name} is '
+                    f'{self._relation_kind_name(staging_kind)}, not an ordinary table'
+                )
+
+            target_relation = _find_relation(conn, schema, table_name)
+            if target_relation is None:
+                self.log.info(
+                    'creating first declared target %s.%s from %s',
+                    schema, table_name, staging_name,
+                )
+                self._create_and_fill_declared_target(
+                    schema=schema, table_name=table_name,
+                    staging_name=staging_name, rows=rows,
+                )
+                created.add(key)
+                continue
+
+            target_oid, target_kind = target_relation
+            if target_kind != 'r':
+                raise DbPublishError(
+                    f'declared publication target {schema}.{table_name} is '
+                    f'{self._relation_kind_name(target_kind)}, not an ordinary table. '
+                    f'Stable publication requires an ordinary table target.'
+                )
+            self._verify_declared_target_compatibility(
+                schema=schema,
+                table_name=table_name,
+                staging_name=staging_name,
+                target_oid=target_oid,
+                staging_oid=staging_oid,
+            )
+        return created
+
+    def _refill_declared_target(self, *, schema, table_name, staging_name, rows):
+        conn = self.ensure_connection()
+        resolved = self._resolved_schema_for(schema, table_name)
+        target_qualified = _quoted_name(schema, table_name)
+        staging_qualified = _quoted_name(schema, staging_name)
+        columns = ', '.join(_quote_identifier(column.name) for column in resolved.columns)
+
+        self.log.info('refilling stable declared target %s from %s', target_qualified, staging_qualified)
+        conn.execute(sa.text(f'truncate table {target_qualified}'))
+        conn.execute(sa.text(
+            f'insert into {target_qualified} ({columns}) '
+            f'select {columns} from {staging_qualified}'
+        ))
+        self._set_comment(schema, table_name, build_published_comment(
+            task_name=self.task_name, run_token=self._run_token, rows=rows,
+        ))
+        conn.execute(sa.text(f'drop table {staging_qualified}'))
+
+    def _lock_publication_targets(self, deadline, *, exclude_targets=()):
         """Take ACCESS EXCLUSIVE on every existing target, in one statement.
 
         One statement rather than letting each DROP acquire its own,
@@ -1650,8 +1899,13 @@ class DbPublisher:
         if conn.dialect.name != 'postgresql':
             return []
 
+        excluded = set(exclude_targets)
         targets = sorted(
-            {(schema, table) for schema, table, _staging, _rows in self._pending_swaps}
+            {
+                (schema, table)
+                for schema, table, _staging, _rows in self._pending_swaps
+                if (schema, table) not in excluded
+            }
         )
         existing = []
         for schema, table in targets:
@@ -1881,10 +2135,16 @@ class DbPublisher:
 
         self._verify_prepared_artifacts()
 
+        # Declared targets are checked before any live lock. Absent targets
+        # are created and completely filled inside this transaction while
+        # still invisible to other sessions. Existing targets are only
+        # validated here; their rows remain untouched until all locks exist.
+        created_declared_targets = self._prepare_declared_targets_before_lock()
+
         if len(self.publication_plan):
             self.publication_plan.run(self.log)
 
-        # Locks taken LAST, immediately before the swaps. The publication
+        # Locks taken LAST, immediately before the swaps/refills. The publication
         # plan is not harmless catalog work: on the standard runner path it
         # runs create-if-not-exists, a DELETE and an upsert against the
         # source-state table. With the locks already held -- and both
@@ -1897,7 +2157,12 @@ class DbPublisher:
         # source-state write with everything else and the whole attempt is
         # retried. The exclusive window now contains only swaps and
         # comments.
-        self._lock_publication_targets(deadline)
+        if created_declared_targets:
+            self._lock_publication_targets(
+                deadline, exclude_targets=created_declared_targets,
+            )
+        else:
+            self._lock_publication_targets(deadline)
 
         swapped = []
         # Sorted by final name. Two tasks publishing an overlapping set of
@@ -1909,6 +2174,16 @@ class DbPublisher:
         ):
             qualified = _quoted_name(schema, table_name)
             staging_qualified = _quoted_name(schema, staging_name)
+
+            key = (schema, table_name)
+            if key in self._declared_targets:
+                if key not in created_declared_targets:
+                    self._refill_declared_target(
+                        schema=schema, table_name=table_name,
+                        staging_name=staging_name, rows=rows,
+                    )
+                swapped.append(f'{schema}.{table_name}' if schema else table_name)
+                continue
 
             self.log.info('publishing %s from %s', qualified, staging_qualified)
             conn.execute(sa.text(f'drop table if exists {qualified}'))
@@ -1929,6 +2204,8 @@ class DbPublisher:
 
         self._commit_transaction()
         self._pending_swaps = []
+        self._resolved_schemas = {}
+        self._declared_targets = set()
         self.publication_plan.clear()
 
         self._committed = True
@@ -1952,6 +2229,8 @@ class DbPublisher:
         dropping tables it believes it owns.
         """
         self._pending_swaps = []
+        self._resolved_schemas = {}
+        self._declared_targets = set()
         self.publication_plan.clear()
         self._committed = False
         self._committed_tables = []
@@ -2130,18 +2409,15 @@ class DbPublisher:
             describe=lambda item: f'while closing DbPublisher {item[0]}',
         )
 
-    def _build_table(self, payload: DbPayload, *, table_name=None):
+    def _build_table(self, payload: DbPayload, *, resolved_schema, table_name=None):
         metadata = sa.MetaData()
-
-        def _column_type(col_name):
-            type_obj = _resolve_override((payload.type_overrides or {}).get(col_name))
-            if type_obj is not None:
-                return type_obj
-            return _infer_column_type(payload.rows, col_name, sample_size=self.type_infer_sample_size)
-
-        columns = [sa.Column(col_name, _column_type(col_name)) for col_name in payload.columns]
-
-        return sa.Table(table_name or payload.table_name, metadata, *columns, schema=payload.schema)
+        columns = [
+            sa.Column(column.name, column.type, nullable=column.nullable)
+            for column in resolved_schema.columns
+        ]
+        return sa.Table(
+            table_name or payload.table_name, metadata, *columns, schema=payload.schema
+        )
 
 
 def _chunked(rows: list[dict[str, Any]], chunk_size: int) -> Iterator[list[dict[str, Any]]]:
@@ -2300,6 +2576,357 @@ def _resolve_override(value):
                 raise DbPublishError(f'unsupported db type override: {value!r}') from e
         case _:
             raise DbPublishError(f'unsupported db type override: {value!r}')
+
+
+_INTEGER_RANGES = {
+    sa.SmallInteger: (-(2 ** 15), 2 ** 15 - 1),
+    sa.Integer: (-(2 ** 31), 2 ** 31 - 1),
+    sa.BigInteger: (-(2 ** 63), 2 ** 63 - 1),
+}
+
+
+def _declared_type_family(type_obj):
+    """Return the supported declared scalar family, or raise clearly."""
+    if isinstance(type_obj, sa.DateTime):
+        return 'datetime'
+    if isinstance(type_obj, sa.Date):
+        return 'date'
+    if isinstance(type_obj, sa.Boolean):
+        return 'bool'
+    if isinstance(type_obj, sa.SmallInteger):
+        return 'smallint'
+    if isinstance(type_obj, sa.BigInteger):
+        return 'bigint'
+    if isinstance(type_obj, sa.Integer):
+        return 'integer'
+    if isinstance(type_obj, sa.Float):
+        return 'float'
+    if isinstance(type_obj, sa.Numeric):
+        precision = type_obj.precision
+        scale = type_obj.scale
+        if precision is not None and precision < 1:
+            raise DbPublishError(
+                f'NUMERIC precision must be positive in output_schema: {type_obj}'
+            )
+        if scale is not None and scale < 0:
+            raise DbPublishError(
+                f'negative NUMERIC scale is not supported in output_schema: {type_obj}'
+            )
+        if precision is not None and scale is not None and scale > precision:
+            raise DbPublishError(
+                f'NUMERIC scale greater than precision is outside the supported '
+                f'output_schema subset: {type_obj}'
+            )
+        return 'numeric'
+    if isinstance(type_obj, sa.LargeBinary):
+        return 'bytes'
+    if isinstance(type_obj, sa.Enum):
+        raise DbPublishError(
+            f'Enum is not supported in output_schema: {type_obj!r}'
+        )
+    if isinstance(type_obj, sa.CHAR):
+        raise DbPublishError(
+            f'fixed-length CHAR is not supported in output_schema: {type_obj!r}'
+        )
+    if isinstance(type_obj, sa.String):
+        return 'text'
+    raise DbPublishError(
+        f'unsupported output_schema type {type_obj!r}; supported families are '
+        'boolean, integer, floating point, numeric, text, binary, date, and timestamp'
+    )
+
+
+def _resolve_declared_type(value):
+    resolved = _resolve_override(value)
+    if resolved is None:
+        raise DbPublishError('output_schema column type must not be None')
+    _declared_type_family(resolved)
+    return resolved
+
+
+def _is_aware_datetime(value):
+    return value.tzinfo is not None and value.utcoffset() is not None
+
+
+def _declared_value_error(payload, column, row_number, detail):
+    raise DbPublishError(
+        f'{payload.table_name!r}: output row {row_number} column {column.name!r} '
+        f'is incompatible with declared type {column.type}: {detail}'
+    )
+
+
+def _validate_numeric_value(payload, column, row_number, value):
+    if type(value) is int:
+        decimal_value = Decimal(value)
+    elif isinstance(value, Decimal):
+        decimal_value = value
+    else:
+        _declared_value_error(
+            payload, column, row_number,
+            'expected int or Decimal; float-to-NUMERIC conversion is not implicit',
+        )
+
+    if not decimal_value.is_finite():
+        _declared_value_error(payload, column, row_number, 'non-finite Decimal is not supported')
+
+    precision = column.type.precision
+    declared_scale = column.type.scale
+    effective_scale = declared_scale if declared_scale is not None else (0 if precision is not None else None)
+
+    if decimal_value.is_zero():
+        fractional_digits = 0
+        integer_digits = 0
+    else:
+        parts = decimal_value.as_tuple()
+        digits = list(parts.digits)
+        exponent = parts.exponent
+
+        # Trailing fractional zeroes do not require rounding. For example,
+        # Decimal('1.2300') is exactly representable at scale 2.
+        while exponent < 0 and digits and digits[-1] == 0:
+            digits.pop()
+            exponent += 1
+
+        fractional_digits = max(-exponent, 0)
+        integer_digits = max(len(digits) + exponent, 0)
+
+    if effective_scale is not None and fractional_digits > effective_scale:
+        _declared_value_error(
+            payload, column, row_number,
+            f'value requires rounding to fit scale {effective_scale}',
+        )
+
+    if precision is not None:
+        scale = effective_scale or 0
+        max_integer_digits = precision - scale
+        if integer_digits > max_integer_digits:
+            _declared_value_error(
+                payload, column, row_number,
+                f'value exceeds NUMERIC({precision}, {scale}) integer-digit capacity',
+            )
+
+
+def _validate_declared_value(payload, column, row_number, value):
+    if value is None:
+        if column.nullable:
+            return
+        raise DbPublishError(
+            f'{payload.table_name!r}: output row {row_number} contains NULL in '
+            f'non-nullable column {column.name!r}'
+        )
+
+    family = _declared_type_family(column.type)
+
+    if family == 'bool':
+        if type(value) is not bool:
+            _declared_value_error(payload, column, row_number, 'expected bool')
+        return
+
+    if family in {'smallint', 'integer', 'bigint'}:
+        if type(value) is not int:
+            _declared_value_error(payload, column, row_number, 'expected int, not bool or another numeric family')
+        range_type = {
+            'smallint': sa.SmallInteger,
+            'integer': sa.Integer,
+            'bigint': sa.BigInteger,
+        }[family]
+        lower, upper = _INTEGER_RANGES[range_type]
+        if not lower <= value <= upper:
+            _declared_value_error(payload, column, row_number, f'value is outside {family} range')
+        return
+
+    if family == 'numeric':
+        _validate_numeric_value(payload, column, row_number, value)
+        return
+
+    if family == 'float':
+        if type(value) is not float:
+            _declared_value_error(payload, column, row_number, 'expected float')
+        return
+
+    if family == 'text':
+        if not isinstance(value, str):
+            _declared_value_error(payload, column, row_number, 'expected str')
+        if column.type.length is not None and len(value) > column.type.length:
+            _declared_value_error(
+                payload, column, row_number,
+                f'text length exceeds VARCHAR({column.type.length})',
+            )
+        return
+
+    if family == 'bytes':
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            _declared_value_error(payload, column, row_number, 'expected bytes-like value')
+        return
+
+    if family == 'date':
+        if type(value) is not date:
+            _declared_value_error(payload, column, row_number, 'expected date; datetime-to-DATE conversion is not implicit')
+        return
+
+    if family == 'datetime':
+        if not isinstance(value, datetime):
+            _declared_value_error(payload, column, row_number, 'expected datetime')
+        aware = _is_aware_datetime(value)
+        wants_timezone = bool(column.type.timezone)
+        if wants_timezone and not aware:
+            _declared_value_error(payload, column, row_number, 'timezone-aware datetime required')
+        if not wants_timezone and aware:
+            _declared_value_error(
+                payload, column, row_number,
+                'timezone-aware datetime cannot be published to timestamp without time zone',
+            )
+        return
+
+    raise DbPublishInvariantError(
+        f'internal invariant violated -- unsupported declared family {family!r}'
+    )
+
+
+def _resolve_payload_schema(payload, *, sample_size):
+    """Resolve one schema model and validate all schema-owned row rules."""
+    _validate_unique_columns(payload.columns, table_name=payload.table_name)
+
+    if payload.output_schema is not None:
+        if not isinstance(payload.output_schema, (list, tuple)):
+            raise DbPublishError(
+                f'{payload.table_name!r}: output_schema must be a list or tuple of OutputColumn values'
+            )
+        if not payload.output_schema:
+            raise DbPublishError(
+                f'{payload.table_name!r}: output_schema must contain at least one column'
+            )
+        if not all(isinstance(column, OutputColumn) for column in payload.output_schema):
+            raise DbPublishError(
+                f'{payload.table_name!r}: output_schema must contain only OutputColumn values'
+            )
+        duplicates = find_duplicates(column.name for column in payload.output_schema)
+        if duplicates:
+            raise DbPublishError(
+                f'{payload.table_name!r}: output_schema contains duplicate column name(s): {duplicates}'
+            )
+        incompatible = []
+        if payload.type_overrides is not None:
+            incompatible.append('type_overrides')
+        if payload.not_null_columns:
+            incompatible.append('not_null_columns')
+        if incompatible:
+            raise DbPublishError(
+                f'{payload.table_name!r}: output_schema cannot be combined with '
+                + ', '.join(incompatible)
+            )
+
+    if not isinstance(payload.not_null_columns, (list, tuple)):
+        raise DbPublishError(
+            f'{payload.table_name!r}: not_null_columns must be a list or tuple of strings'
+        )
+    if not all(isinstance(name, str) for name in payload.not_null_columns):
+        raise DbPublishError(
+            f'{payload.table_name!r}: not_null_columns must contain only strings'
+        )
+    not_null_duplicates = find_duplicates(payload.not_null_columns)
+    if not_null_duplicates:
+        raise DbPublishError(
+            f'{payload.table_name!r}: not_null_columns contains duplicate column(s): '
+            f'{not_null_duplicates}'
+        )
+
+    framework_names = [column.name for column in payload.framework_columns]
+    if len(framework_names) != len(set(framework_names)):
+        raise DbPublishInvariantError(
+            f'internal invariant violated -- duplicate framework columns for {payload.table_name!r}'
+        )
+
+    if payload.output_schema is not None:
+        declared_names = [column.name for column in payload.output_schema]
+        collisions = [name for name in framework_names if name in set(declared_names)]
+        if collisions:
+            raise DbPublishError(
+                f'{payload.table_name!r}: output_schema must not declare framework '
+                f'column(s): {collisions!r}'
+            )
+        expected_names = declared_names + framework_names
+        actual_names = list(payload.columns)
+        missing = [name for name in expected_names if name not in actual_names]
+        unexpected = [name for name in actual_names if name not in expected_names]
+        if missing or unexpected:
+            parts = []
+            if missing:
+                parts.append(f'missing columns: {missing!r}')
+            if unexpected:
+                parts.append(f'unexpected columns: {unexpected!r}')
+            raise DbPublishError(
+                f'{payload.table_name!r}: output columns do not match output_schema; '
+                + '; '.join(parts)
+            )
+
+        resolved_columns = [
+            ResolvedColumn(column.name, _resolve_declared_type(column.type), column.nullable)
+            for column in payload.output_schema
+        ]
+        resolved_columns.extend(
+            ResolvedColumn(column.name, _resolve_declared_type(column.type), column.nullable)
+            for column in payload.framework_columns
+        )
+        resolved = ResolvedSchema(tuple(resolved_columns), 'declared')
+        expected_set = set(expected_names)
+
+        for row_number, row in enumerate(payload.rows, start=1):
+            if not isinstance(row, Mapping):
+                raise DbPublishError(
+                    f'{payload.table_name!r}: output row {row_number} is not a mapping'
+                )
+            row_keys = set(row)
+            if row_keys != expected_set:
+                missing_row = [name for name in expected_names if name not in row]
+                unexpected_row = [name for name in row if name not in expected_set]
+                raise DbPublishError(
+                    f'{payload.table_name!r}: output row {row_number} does not match '
+                    f'output_schema; missing={missing_row!r}, unexpected={unexpected_row!r}'
+                )
+            for column in resolved.columns:
+                normalized = _normalize_value(row[column.name])
+                row[column.name] = normalized
+                _validate_declared_value(payload, column, row_number, normalized)
+
+        payload.columns = expected_names
+        return resolved
+
+    not_null = tuple(payload.not_null_columns or ())
+    missing_constraints = [name for name in not_null if name not in payload.columns]
+    if missing_constraints:
+        raise DbPublishError(
+            f'{payload.table_name!r}: db_not_null_columns contains column(s) not present '
+            f'in the output: {missing_constraints!r}'
+        )
+
+    framework_by_name = {column.name: column for column in payload.framework_columns}
+    resolved_columns = []
+    for name in payload.columns:
+        framework = framework_by_name.get(name)
+        if framework is not None:
+            type_obj = _resolve_declared_type(framework.type)
+            nullable = framework.nullable
+        else:
+            type_obj = _resolve_override((payload.type_overrides or {}).get(name))
+            if type_obj is None:
+                type_obj = _infer_column_type(payload.rows, name, sample_size=sample_size)
+            nullable = name not in not_null
+        resolved_columns.append(ResolvedColumn(name, type_obj, nullable))
+
+    resolved = ResolvedSchema(tuple(resolved_columns), 'inferred')
+    constrained = {column.name: column for column in resolved.columns if not column.nullable}
+    if constrained:
+        for row_number, row in enumerate(payload.rows, start=1):
+            for name, column in constrained.items():
+                normalized = _normalize_value(row.get(name))
+                row[name] = normalized
+                if normalized is None:
+                    raise DbPublishError(
+                        f'{payload.table_name!r}: output row {row_number} contains NULL in '
+                        f'non-nullable column {column.name!r}'
+                    )
+    return resolved
 
 
 

@@ -5,7 +5,7 @@ Status: accepted
 ## Problem
 
 The scaffold writes two kinds of output: PostgreSQL tables and Excel
-workbooks. The DB path has been given staging tables, a short publication
+workbooks. The DB path has been given staging tables, an atomic publication
 transaction, ownership metadata, predecessor cleanup and an advisory lock.
 
 The Excel path has none of that. Workbooks are written immediately inside

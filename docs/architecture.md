@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.4.1. This describes the present system, not
+How `task_core` works as of 0.5.0. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -259,7 +259,22 @@ Containers are left alone — a one-element list is a value, not a scalar.
 ### Type inference
 
 Column types are inferred from the data unless pinned with
-`db_type_overrides`. The first 5000 rows are sampled; if the sampled
+`db_type_overrides`. Inferred columns may also be marked `NOT NULL` with
+`db_not_null_columns`.
+
+A pipeline that supplies `output_schema` uses the second schema resolver. It
+validates the complete produced column set, normalizes and validates every
+value against the declared type/nullability contract, reorders into declaration
+order, and produces the same internal `ResolvedSchema` used by inference.
+
+Inferred targets keep the staged `DROP`/`RENAME` replacement path. Declared
+targets are stable ordinary tables: the first publication creates and fills the
+target atomically; later publications verify exact catalog compatibility, lock
+the existing target, `TRUNCATE` it and refill it from staging. All new-target
+creation, compatibility checks and source-state work complete before the first
+live-target lock.
+
+The first 5000 rows are sampled; if the sampled
 answer is one that PostgreSQL could silently widen — `BigInteger` or
 `Date` — the remaining rows are swept with a cheap exact-type check, and
 the column is re-inferred over everything if the sample turns out too
@@ -270,17 +285,19 @@ See [decisions/0001](decisions/0001-replace-tables-instead-of-truncating.md)
 for why inference is viable at all, and its limitations for tables with
 downstream consumers.
 
-### Staging and swap
+### Staging and publication
 
-`publish()` prepares one output in its own committed transaction: it
-creates a staging table with the freshly inferred schema, loads it,
-verifies it, attaches ownership metadata, and commits. The live table is
-untouched.
+`publish()` prepares one output in its own committed transaction: it creates a
+staging table from the resolved inferred or declared schema, loads it, verifies
+it, attaches ownership metadata, and commits. The live table is untouched.
 
-`commit()` is the publication phase — verify, run queued work, drop each
-live table and rename its staging table into place, replace comments,
-commit. Sorted by final name, so two tasks publishing an overlapping set
-in different orders cannot deadlock on the swap locks.
+`commit()` is the publication phase. It verifies every prepared artifact,
+preflights declared targets, creates and fills absent declared targets, runs
+queued source-state work, then locks all existing targets in deterministic
+sorted order. Inferred targets are replaced by `DROP`/`RENAME`; existing
+declared targets keep their identity and are refreshed by `TRUNCATE` plus
+`INSERT FROM` staging. Comments are replaced with framework provenance and the
+whole multi-table publication commits atomically.
 
 Staging names are
 `<shortened readable prefix>__stg_<target_token>_<run_token>`. Only the
@@ -303,8 +320,8 @@ source-state table as its own target.
 **Runtime**, when publishing *and* when source-change checking builds its
 store: reads the server's own `max_identifier_length` and uses the lower
 of that and the configured limit — configuration can only tighten. It
-validates the payload's table name and columns under `portable` mode, its
-schema under either mode, and does so after all renaming has happened. It
+validates the payload's schema, table and final column names under the one
+portable lower-case contract, after all renaming has happened. It
 asserts generated staging names and guards against collisions.
 
 The source-state table gets the same treatment before its own DDL runs,
@@ -322,8 +339,9 @@ See [decisions/0010](decisions/0010-require-portable-database-identifiers.md).
 
 ## Transactions
 
-Many committed preparation transactions, then one short publication
-transaction. See
+Many committed preparation transactions, then one atomic publication
+transaction. The final transaction is normally short for inferred swaps, but a
+declared stable-target refill remains open while rows and indexes are rebuilt. See
 [decisions/0005](decisions/0005-prepare-staging-outside-the-publication-transaction.md)
 for why, and what it costs.
 
@@ -335,17 +353,20 @@ source-state ensure/read   implicit transaction, autobegun
 
 for each pipeline with a DB target:
     BEGIN
-      create staging table with the freshly inferred schema
-      load rows
+      resolve inferred or declared schema
+      create and load a staging table
       verify exact ordered column names and the row count
       attach ownership metadata
     COMMIT                 <- the live table is still untouched
 
-BEGIN                      <- the short publication transaction
+BEGIN                      <- the atomic publication transaction
   verify every prepared artifact still exists and is still ours
+  validate existing declared targets; create/fill absent declared targets
   run queued work (the source-state write)
-  drop each live table, rename its staging table into place
-  replace staging comments with provenance
+  lock all existing targets in deterministic sorted order
+  inferred: DROP live target, RENAME staging into place
+  declared: TRUNCATE stable target, refill from staging, DROP staging
+  replace comments with provenance
 COMMIT
 
 release the task lock, close
@@ -364,8 +385,8 @@ publisher waiting on one long reader blocks every reader arriving
 afterwards. See
 [decisions/0008](decisions/0008-bound-the-publication-lock-wait.md).
 
-**Atomicity.** Publication is all-or-nothing: every swap and the
-source-state write land in one transaction, so a failed publication does
+**Atomicity.** Publication is all-or-nothing: every inferred swap,
+declared refill and source-state write land in one transaction, so a failed publication does
 not advance the stored fingerprints and a retry sees the same sources as
 changed. Preparation is deliberately *not* part of that guarantee — a
 prepared staging table is committed and visible, and is cleaned up rather
