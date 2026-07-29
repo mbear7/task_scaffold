@@ -143,9 +143,9 @@ class derived:
 | `db_contract` | `None` | `{source_column: target_column}`. Applied by the scaffold: renames and restricts. |
 | `db_type_overrides` | `None` | Inferred mode only: `{column: type}` pinning selected SQL types. |
 | `db_not_null_columns` | `None` | Inferred mode only: columns that must be `NOT NULL`. |
-| `output_schema` | `None` | Complete declared schema. Supplying it disables inference. |
+| `output_schema` | `None` | Complete ordered schema of user-owned columns. Supplying it disables inference. |
 | `db_table_id_pix` | `None` | Opaque identifier carried into `RunResult`. |
-| `db_updated_at` | `False` | `True` for an `etl_updated_at TIMESTAMPTZ NOT NULL` column, or a string for a custom name. |
+| `db_updated_at` | `False` | Framework-owned timestamp column in either schema mode: `True` uses `etl_updated_at`; a string supplies a custom portable lower-case name. The column is `TIMESTAMPTZ NOT NULL`. |
 | `publish_result` | `False` | Make the result available to later pipelines via `ctx.get_result()`. |
 | `debug_display` | `False` | Print the table during the run. |
 | `table_adapter` | `None` | `'petl'`, `'pandas'`, or `None` to infer. |
@@ -191,7 +191,7 @@ spec = PipelineSpec(
 )
 ```
 
-For a complete stable contract, declare every user column:
+For a complete stable user-column contract, declare every user column:
 
 ```python
 spec = PipelineSpec(
@@ -225,10 +225,29 @@ datetimes are required for `timestamp with time zone`.
 
 `output_schema` cannot be combined with `db_output`, `db_type_overrides`,
 `db_not_null_columns`, or `get_dynamic_db_contract()`. The dynamic hook conflict
-is rejected during structural pipeline validation, before resources are built. A static `db_contract`
-may still rename/project source columns before declared validation. The
-framework-generated `etl_updated_at` column is not listed in `output_schema`;
-it is always appended as `TIMESTAMPTZ NOT NULL`.
+is rejected during structural pipeline validation, before resources are built.
+A static `db_contract` may still rename/project source columns before declared
+validation.
+
+`output_schema` contains user-owned columns only. When `db_updated_at=True`,
+the framework appends the default `etl_updated_at` column. When
+`db_updated_at` is a string, that value is the custom column name instead:
+
+```python
+spec = PipelineSpec(
+    db_table='customer_summary',
+    db_updated_at='loaded_at',
+    output_schema=(
+        OutputColumn('customer_id', sa.BigInteger(), nullable=False),
+        OutputColumn('revenue', sa.Numeric(18, 2)),
+    ),
+)
+```
+
+The framework-owned timestamp column is appended after the declared user
+columns as `TIMESTAMPTZ NOT NULL`. Its name must be a portable lower-case
+identifier and must not appear in `output_schema`, `db_type_overrides`,
+`db_not_null_columns`, or the produced user columns.
 
 On first publication, a declared target is created and filled atomically. On
 later publications the existing ordinary table must match the declared schema

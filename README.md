@@ -146,7 +146,7 @@ from task_core import OutputColumn, PipelineSpec
 PipelineSpec(db_table='customer_summary')
 ```
 
-For a stable, strictly validated contract, provide the complete
+For a stable, strictly validated contract, provide the complete user-owned
 `output_schema`:
 
 ```python
@@ -161,11 +161,15 @@ PipelineSpec(
 ```
 
 Supplying `output_schema` disables inference. The declaration defines the
-complete column set, order, types and nullability. Columns are nullable by
-default. Missing or unexpected columns, incompatible values and `NULL` in a
-column declared with `nullable=False` fail during staging preparation before
-the live target is changed. Existing declared targets keep their table
-identity and are refreshed transactionally.
+complete user-owned column set, order, types and nullability. Columns are
+nullable by default. Enabled framework-owned columns are appended afterward:
+`db_updated_at=True` adds `etl_updated_at`, while a string such as
+`db_updated_at='loaded_at'` supplies a custom portable lower-case name. The
+timestamp column is always `TIMESTAMPTZ NOT NULL` and is not repeated in
+`output_schema`. Missing or unexpected user columns, incompatible values and
+`NULL` in a column declared with `nullable=False` fail during staging
+preparation before the live target is changed. Existing declared targets keep
+their table identity and are refreshed transactionally.
 
 
 ## Limitations

@@ -474,6 +474,7 @@ class funnel_closed:
     spec = PipelineSpec(
         excel_name='funn_closed.xlsx',
         db_table='hr_funnel_closed',
+        db_updated_at=True,
         db_contract={
             'Месяц': 'month',
             '№': 'n',
@@ -793,6 +794,7 @@ class declined_close:
     spec = PipelineSpec(
         excel_name='declined_closed.xlsx',
         db_table='hr_declined_close',
+        db_updated_at=True,
         db_contract={
             'ФИО': 'fio',
             'Ответственный за кандидата': 'holder',
@@ -928,6 +930,7 @@ class declined_open:
     spec = PipelineSpec(
         excel_name='declined_open.xlsx',
         db_table='hr_declined_open',
+        db_updated_at=True,
         db_contract={
             'Месяц': 'month',
             'Дата': 'date',
@@ -1119,6 +1122,7 @@ class funnel_open:
     spec = PipelineSpec(
         excel_name='funn_open.xlsx',
         db_table='hr_funnel_open',
+        db_updated_at=True,
         db_contract={
             'Месяц': 'month',
             '№': 'n',
@@ -1456,6 +1460,7 @@ class staff:
     spec = PipelineSpec(
         excel_name='staff.xlsx',
         db_table='hr_staff',
+        db_updated_at=True,
         db_contract={
             'Блок': 'block',
             'Подразделение': 'unit',
@@ -1629,6 +1634,7 @@ class recruiters:
     spec = PipelineSpec(
         excel_name='recruiters.xlsx',
         db_table='hr_recruiters',
+        db_updated_at=True,
         db_contract={
             'Id': 'id',
             'Название вакансии': 'vacancy',
@@ -1791,6 +1797,7 @@ class ssch:
     spec = PipelineSpec(
         excel_name='ssch.xlsx',
         db_table='hr_ssch',
+        db_updated_at=True,
         # lev.* columns vary by hierarchy depth, discovered only after
         # processing -- added via get_dynamic_db_contract below, not by
         # mutating this (frozen) spec.

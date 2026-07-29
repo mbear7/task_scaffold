@@ -244,7 +244,9 @@ why the asymmetry is the design rather than an unfinished half of it.
 column names, rows as a list of dicts, and optional type overrides.
 `db_contract` renames source columns to target names and restricts the
 column set, and is applied by the scaffold. `db_updated_at` appends a
-timestamp column afterwards.
+framework-owned `TIMESTAMPTZ NOT NULL` column afterwards: `True` uses the
+default name `etl_updated_at`, while a string supplies a custom portable
+lower-case name.
 
 `db_output` is **declarative only**. The scaffold validates it and reads
 it during preflight, but does not apply it — the pipeline projects its own
@@ -263,9 +265,11 @@ Column types are inferred from the data unless pinned with
 `db_not_null_columns`.
 
 A pipeline that supplies `output_schema` uses the second schema resolver. It
-validates the complete produced column set, normalizes and validates every
+validates the complete produced user-column set, normalizes and validates every
 value against the declared type/nullability contract, reorders into declaration
-order, and produces the same internal `ResolvedSchema` used by inference.
+order, appends enabled framework-owned columns, and produces the same internal
+`ResolvedSchema` used by inference. The timestamp column configured by
+`db_updated_at` is therefore not repeated in `output_schema`.
 
 Inferred targets keep the staged `DROP`/`RENAME` replacement path. Declared
 targets are stable ordinary tables: the first publication creates and fills the

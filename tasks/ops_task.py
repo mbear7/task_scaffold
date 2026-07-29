@@ -138,6 +138,7 @@ class nsi_911:
     spec = PipelineSpec(
         excel_name='nsi_911.xlsx',
         db_table='ops_nsi_911',
+        db_updated_at=True,
         db_table_id_pix=280,
         table_adapter='petl',
         db_output=[
@@ -197,6 +198,7 @@ class mdm:
     spec = PipelineSpec(
         excel_name='mdm.xlsx',
         db_table='ops_mdm',
+        db_updated_at=True,
         db_table_id_pix=281,
         table_adapter='petl',
         db_output=['type', 'id', 'created_by', 'be', 'status', 'date_start', 'date_end', 'date', 'total_days', 'dur_amend', 'proc_days', 'sla', 'metric', 'block'],
@@ -245,6 +247,7 @@ class tickets_1c:
     spec = PipelineSpec(
         excel_name='tickets_1c.xlsx',
         db_table='ops_tickets_1c',
+        db_updated_at=True,
         db_table_id_pix=282,
         table_adapter='petl',
         db_output=[
@@ -297,6 +300,7 @@ class ca:
     spec = PipelineSpec(
         excel_name='ca.xlsx',
         db_table='ops_ca',
+        db_updated_at=True,
         db_table_id_pix=283,
         table_adapter='petl',
     )
@@ -331,6 +335,7 @@ class db_strat:
     spec = PipelineSpec(
         excel_name='db_strat.xlsx',
         db_table='ops_db_strat',
+        db_updated_at=True,
         table_adapter='petl',
     )
 
@@ -346,6 +351,7 @@ class cal:
     spec = PipelineSpec(
         excel_name='cal.xlsx',
         db_table='ops_cal',
+        db_updated_at=True,
         db_table_id_pix=284,
         table_adapter='petl',
     )

@@ -175,7 +175,9 @@ declared schema + copy
 
 `db_output` remains inferred-mode only. `output_schema`,
 `db_not_null_columns`, `db_type_overrides`, static `db_contract` and the
-framework-owned `etl_updated_at` column keep their 0.5.0 meanings.
+framework-owned timestamp configured by `db_updated_at` keep their 0.5.0
+meanings. `True` uses `etl_updated_at`; a string supplies a custom portable
+lower-case name.
 
 The first COPY implementation rejects `get_dynamic_db_contract()`. That hook is
 arbitrary task code and may traverse a lazy table while deciding its mapping;
@@ -347,7 +349,7 @@ loader=copy   → rows is absent, row_source is present
 Any other combination is a configuration error before source execution or
 staging DDL.
 
-`db_contract` projection/renaming and `etl_updated_at` application must be
+`db_contract` projection/renaming and framework timestamp application must be
 implemented as row-source transformations for COPY. They must not force the
 source into dictionaries first.
 
@@ -1103,7 +1105,8 @@ Required coverage:
 - late integer-to-numeric and date-to-datetime widening;
 - explicit type overrides;
 - `db_not_null_columns`;
-- framework `etl_updated_at`;
+- the framework timestamp configured by `db_updated_at` (default
+  `etl_updated_at` or a custom name);
 - declaration-order mapping;
 - `NULL`, empty string and literal `\\N`;
 - tabs, newlines, carriage returns and backslashes;

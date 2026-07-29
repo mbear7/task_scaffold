@@ -32,7 +32,8 @@ output_schema is None
 → infer the complete schema, with optional type and NOT NULL overrides
 
 output_schema is supplied
-→ use the fully declared schema and disable inference
+→ use the fully declared user schema, append enabled framework columns,
+  and disable inference
 ```
 
 There is no `schema_mode` field. The presence of `output_schema` is the mode
@@ -91,10 +92,14 @@ PipelineSpec(
 This does not create a hybrid declared mode. The framework still infers the
 column set and types; only the listed columns gain a nullability constraint.
 
-Framework-generated technical columns are framework-owned. The default
-`etl_updated_at` column is `TIMESTAMPTZ NOT NULL` regardless of schema mode and
-must not be repeated in `output_schema`, `db_type_overrides` or
-`db_not_null_columns`.
+Framework-generated technical columns are framework-owned and sit outside the
+user declaration. `db_updated_at=False` adds no timestamp column.
+`db_updated_at=True` appends the default `etl_updated_at` column, while a string
+supplies a custom portable lower-case column name. In either schema mode the
+column is appended after user columns as `TIMESTAMPTZ NOT NULL` and must not be
+repeated in `output_schema`, `db_type_overrides`, `db_not_null_columns`, or the
+produced user columns. Therefore the final physical schema is the resolved user
+schema plus enabled framework-owned columns.
 
 ## Strict row validation
 
