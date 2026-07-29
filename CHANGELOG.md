@@ -11,10 +11,6 @@ chronologically rather than by release.
 
 ## Unreleased
 
-### Changed
-
-- All PostgreSQL-publishing pipelines in `tasks/hr_task.py` and `tasks/ops_task.py` now enable `db_updated_at=True`, so their published tables include the framework-owned `etl_updated_at TIMESTAMPTZ NOT NULL` batch timestamp.
-
 
 ## 0.5.0
 

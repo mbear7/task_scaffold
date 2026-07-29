@@ -23,12 +23,12 @@ A task file declares its resources and pipelines and calls one function.
 `task_core` owns the lifecycle.
 
 ```python
-RESOURCES = {'ssch_files': xlsx_file_set('ssch', pattern='*.xlsx', tracker=True)}
-PIPELINES = {'ssch2': bind(ssch2, source=RESOURCES['ssch_files'])}
-RUN_SEQUENCE = ['ssch2']
+RESOURCES = {'source_files': xlsx_file_set('source', pattern='*.xlsx', tracker=True)}
+PIPELINES = {'summary': bind(summary, source=RESOURCES['source_files'])}
+RUN_SEQUENCE = ['summary']
 
 run_pipelines(
-    task_name='hr_petl_task',
+    task_name='reporting_task',
     build_context=build_context,
     pipelines=PIPELINES,
     run_sequence=RUN_SEQUENCE,
@@ -54,10 +54,6 @@ and prints the workbooks it wrote. Read
 [examples/local_task.py](examples/local_task.py) alongside the output; it
 is short, and every part of it is part of the shape a real task takes.
 
-`tasks/hr_petl_task.py` is the realistic counterpart: SMB paths, database
-output, source-change checking. It cannot run outside the production
-environment.
-
 
 ## Documentation
 
@@ -76,12 +72,9 @@ verified on 3.12.3 and 3.13.5. Your production task environment may be
 narrower.
 
 `task_core` itself needs `pandas`, `numpy`, `openpyxl`, `sqlalchemy`,
-`psycopg2`, `petl`, `lxml` and `smbclient`. The reference tasks in
-`tasks/` additionally need `babel`. See `requirements.txt`.
-
-`task_core` depends on nothing beyond that list. The reference tasks in
-`tasks/` import a shared in-house helper module that is not part of this
-project and not shipped with it; `examples/` does not.
+`psycopg2`, `petl`, `lxml` and `smbclient`. See `requirements.txt`.
+Project-specific task modules may require additional dependencies, but they
+are outside the scaffold's runtime contract.
 
 
 ## Running
@@ -89,8 +82,7 @@ project and not shipped with it; `examples/` does not.
 A task is a normal Python module with a `main()`:
 
 ```
-python -m examples.local_task      # self-contained
-python -m tasks.hr_task            # needs share access and DB credentials
+python -m examples.local_task
 ```
 
 `run_pipelines()` returns a `RunResult`, which is what a scheduler or
@@ -126,12 +118,9 @@ Tests cover `task_core` only. `tasks/` is deliberately not covered — see
 ## Adding a task
 
 Start from [examples/local_task.py](examples/local_task.py) — it runs, so
-you can change one thing at a time and see the effect. When you need real
-inputs and database output, `tasks/hr_petl_task.py` is the smallest
-realistic task: one resource, one pipeline, Excel and DB output,
-source-change checking.
-
-Then read [task-authoring.md](docs/task-authoring.md).
+you can change one thing at a time and see the effect. Then read
+[task-authoring.md](docs/task-authoring.md) for database publication,
+source-change checking, remote resources and the full API reference.
 
 
 ## Inferred and declared output schemas
