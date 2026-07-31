@@ -165,7 +165,8 @@ and its attached database objects is worth the extra write and longer lock.
 
 
 Existing 0.5.0 scripts using `output_schema` should read the concise
-[0.5.1 migration note](docs/migrating-to-0.5.1.md).
+[0.5.1 migration note](docs/migrating-to-0.5.1.md). Scripts using declared
+type parameters should also review the [0.5.2 migration note](docs/migrating-to-0.5.2.md).
 
 
 ## Limitations

@@ -2594,8 +2594,25 @@ _INTEGER_RANGES = {
 }
 
 
+def _declared_int_parameter(value, *, name, type_obj):
+    """Validate an integer SQL type parameter without accepting bool or float."""
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise DbPublishError(
+            f'{name} must be an integer in output_schema: {type_obj}'
+        )
+    return value
+
+
 def _declared_type_family(type_obj):
-    """Return the supported declared scalar family, or raise clearly."""
+    """Return the supported declared scalar family, or raise clearly.
+
+    The PostgreSQL dialect silently drops several ambiguous SQLAlchemy type
+    parameters (for example ``Float(0)``, ``String(0)`` and
+    ``Numeric(scale=2)``). Declared schemas are a physical contract, so reject
+    shapes whose rendered PostgreSQL type would not preserve the declaration.
+    """
     if isinstance(type_obj, sa.DateTime):
         return 'datetime'
     if isinstance(type_obj, sa.Date):
@@ -2609,13 +2626,28 @@ def _declared_type_family(type_obj):
     if isinstance(type_obj, sa.Integer):
         return 'integer'
     if isinstance(type_obj, sa.Float):
+        precision = _declared_int_parameter(
+            type_obj.precision, name='FLOAT precision', type_obj=type_obj,
+        )
+        if precision is not None and not 1 <= precision <= 53:
+            raise DbPublishError(
+                f'FLOAT precision must be between 1 and 53 in output_schema: {type_obj}'
+            )
         return 'float'
     if isinstance(type_obj, sa.Numeric):
-        precision = type_obj.precision
-        scale = type_obj.scale
-        if precision is not None and precision < 1:
+        precision = _declared_int_parameter(
+            type_obj.precision, name='NUMERIC precision', type_obj=type_obj,
+        )
+        scale = _declared_int_parameter(
+            type_obj.scale, name='NUMERIC scale', type_obj=type_obj,
+        )
+        if scale is not None and precision is None:
             raise DbPublishError(
-                f'NUMERIC precision must be positive in output_schema: {type_obj}'
+                f'NUMERIC scale requires precision in output_schema: {type_obj}'
+            )
+        if precision is not None and not 1 <= precision <= 1000:
+            raise DbPublishError(
+                f'NUMERIC precision must be between 1 and 1000 in output_schema: {type_obj}'
             )
         if scale is not None and scale < 0:
             raise DbPublishError(
@@ -2628,6 +2660,14 @@ def _declared_type_family(type_obj):
             )
         return 'numeric'
     if isinstance(type_obj, sa.LargeBinary):
+        length = _declared_int_parameter(
+            type_obj.length, name='LargeBinary length', type_obj=type_obj,
+        )
+        if length is not None:
+            raise DbPublishError(
+                f'bounded LargeBinary is not supported in output_schema because '
+                f'PostgreSQL BYTEA does not preserve its length: {type_obj}'
+            )
         return 'bytes'
     if isinstance(type_obj, sa.Enum):
         raise DbPublishError(
@@ -2638,6 +2678,17 @@ def _declared_type_family(type_obj):
             f'fixed-length CHAR is not supported in output_schema: {type_obj!r}'
         )
     if isinstance(type_obj, sa.String):
+        length = _declared_int_parameter(
+            type_obj.length, name='VARCHAR length', type_obj=type_obj,
+        )
+        if length is not None and length < 1:
+            raise DbPublishError(
+                f'VARCHAR length must be positive in output_schema: {type_obj}'
+            )
+        if type_obj.collation is not None:
+            raise DbPublishError(
+                f'text collation is not supported in output_schema: {type_obj}'
+            )
         return 'text'
     raise DbPublishError(
         f'unsupported output_schema type {type_obj!r}; supported families are '
@@ -2756,6 +2807,11 @@ def _validate_declared_value(payload, column, row_number, value):
     if family == 'text':
         if not isinstance(value, str):
             _declared_value_error(payload, column, row_number, 'expected str')
+        if '\x00' in value:
+            _declared_value_error(
+                payload, column, row_number,
+                'NUL character is not supported in PostgreSQL text',
+            )
         if column.type.length is not None and len(value) > column.type.length:
             _declared_value_error(
                 payload, column, row_number,

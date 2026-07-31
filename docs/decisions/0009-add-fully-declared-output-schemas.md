@@ -136,6 +136,16 @@ backend-specific adaptation. A rejection by constraints present on staging
 rolls back the complete preparation transaction; target-only constraints and
 triggers on explicit refill are handled later as described below.
 
+### 0.5.2 type-shape clarification
+
+Declared type parameters are validated before DDL so SQLAlchemy cannot silently
+render a different PostgreSQL type. Supported parameterized shapes are
+`Float(p)` with integer `1..53`, `String(n)` with positive integer length, and
+`Numeric(p[, s])` with integer precision `1..1000` and the deliberately narrow
+subset `0 <= s <= p`. Scale without precision, bounded `LargeBinary`, text
+collation and non-integer parameters are rejected. NUL text is rejected during
+row validation with framework context rather than leaking a driver error.
+
 ## Column matching and ordering
 
 A declared output may produce its columns in a different order. The framework:

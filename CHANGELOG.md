@@ -12,6 +12,27 @@ chronologically rather than by release.
 ## Unreleased
 
 
+## 0.5.2
+
+### Fixed
+- Rejected declared SQLAlchemy type shapes that PostgreSQL rendering would
+  silently change or reject late: `Float` precision must be integer `1..53`,
+  `String` length must be a positive integer, and `Numeric` precision must be
+  integer `1..1000` with the supported subset `0 <= scale <= precision`.
+- Rejected `Numeric(scale=...)` without precision instead of validating an
+  apparent scale that PostgreSQL would not store.
+- Rejected bounded `LargeBinary` and text collation because the current
+  PostgreSQL declared/refill contract does not preserve or compare those
+  parameters.
+- Rejected NUL text during declared row validation with a contextual
+  `DbPublishError` instead of leaking a lower-level driver `ValueError`.
+
+### Migration
+- Review external scripts containing `output_schema=`. Valid declarations need
+  no change; see `docs/migrating-to-0.5.2.md` for the rejected ambiguous shapes.
+  The bundled HR and OPS tasks use inferred schemas and require no edits.
+
+
 ## 0.5.1
 
 ### Added
