@@ -149,6 +149,7 @@ class derived:
 | `publish_result` | `False` | Make the result available to later pipelines via `ctx.get_result()`. |
 | `debug_display` | `False` | Print the table during the run. |
 | `table_adapter` | `None` | `'petl'`, `'pandas'`, or `None` to infer. |
+| `db_publication_strategy` | `None` | `'replace'` (default) or `'refill'`. See below. |
 
 ### `db_output` is declarative
 
@@ -158,7 +159,7 @@ pipeline's own job:
 
 ```python
 class mdm:
-    spec = PipelineSpec(db_table='ops_mdm', db_output=['id', 'name', 'status'])
+    spec = PipelineSpec(db_table='customer_master', db_output=['id', 'name', 'status'])
 
     @classmethod
     def run(cls, ctx, *, source):
@@ -191,7 +192,7 @@ spec = PipelineSpec(
 )
 ```
 
-For a complete stable user-column contract, declare every user column:
+For a complete declared user-column contract, declare every user column:
 
 ```python
 spec = PipelineSpec(
@@ -249,13 +250,15 @@ columns as `TIMESTAMPTZ NOT NULL`. Its name must be a portable lower-case
 identifier and must not appear in `output_schema`, `db_type_overrides`,
 `db_not_null_columns`, or the produced user columns.
 
-On first publication, a declared target is created and filled atomically. On
-later publications the existing ordinary table must match the declared schema
-exactly and is refreshed with transactional `TRUNCATE` plus `INSERT FROM` the
-prepared staging table. The target OID, views, indexes, grants, ownership and
-triggers are preserved. Views, partitioned tables, foreign tables, materialized
-views, incompatible schemas and external incoming foreign keys are rejected.
-The table comment remains framework-owned publication provenance.
+Declaration does not select publication mechanics. By default, the prepared
+declared staging table replaces the live target with the same staged
+`DROP`/`RENAME` path used by inferred outputs. When explicit `refill` is
+selected, first publication creates and fills a permanent ordinary target;
+later publications require an exact physical match and use transactional
+`TRUNCATE` plus `INSERT FROM` staging. That explicit path preserves the target
+OID and attached objects, rejects unsupported relation kinds, incompatible
+schemas and external incoming foreign keys, and keeps the table comment under
+framework ownership. See **Publication strategy** below.
 
 ### `db_contract` is applied
 
@@ -373,6 +376,60 @@ Widen the horizon for tables under constant BI load; leave it alone
 otherwise. Nothing about a normal task changes.
 
 
+## Publication strategy
+
+Two independent choices. `output_schema` decides where the table's shape
+comes from; `db_publication_strategy` decides how new data replaces old.
+
+| schema | `replace` (default) | `refill` |
+| --- | --- | --- |
+| inferred | yes | rejected |
+| declared | yes | optional |
+
+**`replace`** drops the live table and renames staging into its place. One
+database write, and the lock is held only for catalog operations. The
+target is a new relation each run, so views, grants, indexes, ownership
+and triggers **do not survive** — and `DROP` fails outright if a view
+depends on the table.
+
+**`refill`** truncates the live table and inserts from staging. The OID is
+stable, so everything attached to the table survives. It costs a second
+database write and holds the lock for a window **proportional to row
+count**, which blocks readers for that whole window.
+
+Choose `refill` when something is attached to the table that must survive
+— a view, a grant, an index, a trigger. Otherwise leave it alone: refill's
+cost is a pure loss when nothing depends on the target.
+
+```python
+spec = PipelineSpec(
+    db_table='customer_summary',
+    output_schema=(OutputColumn('id', sa.BigInteger(), nullable=False),),
+    db_publication_strategy='refill',   # a BI view depends on this table
+)
+```
+
+`refill` requires `output_schema`: it truncates and inserts into the
+existing table, so the target's physical schema must be stable across
+runs, and only a declaration can promise that. An inferred schema changes
+whenever the data does, so the combination is rejected at spec
+construction rather than failing on the first drift.
+
+Changing a declared schema is only possible under `replace`. Under
+`refill` the compatibility check refuses a target whose physical shape no
+longer matches, and asks you to migrate or recreate it explicitly.
+
+### Migrating existing 0.5.0 scripts
+
+Search every running script for `output_schema=`. In 0.5.0 that implied stable
+refill; in 0.5.1 it defaults to replacement. Add
+`db_publication_strategy='refill'` only where the target must preserve its OID,
+views, grants, indexes, ownership, triggers or RLS. Otherwise no source change
+is required. Direct callers of `DbPayload`, `from_petl()` or `from_pandas()`
+must also use only `replace`, or `refill` together with `output_schema`. See
+[migrating-to-0.5.1.md](migrating-to-0.5.1.md).
+
+
 ## Source-change checking
 
 ```python
@@ -420,28 +477,27 @@ Two pipelines still may not declare the same `excel_name` — that check is
 about a task declaring something incoherent, not about publication
 guarantees.
 
-### Published tables are dropped and recreated
+### Replacement publication recreates the table
 
-Every run drops the live table and replaces it. Consequences:
+`replace` is the default for both inferred and declared schemas. Consequences:
 
-- **Schema can change between runs.** Types are inferred from the data, so
-  a column that gains its first decimal changes from `bigint` to
-  `numeric`. Pin types with `db_type_overrides` for any table with
-  downstream consumers.
-- **Grants are not preserved.** Use `ALTER DEFAULT PRIVILEGES` on the
-  schema.
-- **A dependent view breaks the publish.** `DROP TABLE` fails when a view
-  depends on the table. Views and inferred schemas are mutually
-  exclusive — see
-  [decisions/0001](decisions/0001-replace-tables-instead-of-truncating.md).
+- **Schema can change between runs in inferred mode.** Pin types with
+  `db_type_overrides` when a consumer requires stability, or declare the full
+  schema with `output_schema`.
+- **Grants, ownership, indexes and triggers are not preserved.** Use schema
+  default privileges and recreate target-owned objects where replacement is
+  appropriate.
+- **A dependent view blocks publication.** `DROP TABLE` fails when a view
+  depends on the target. Use explicit declared `refill` only when preserving
+  the ordinary table object is worth the extra write and row-dependent lock.
 
-### One transaction spans the run
+### Publication is staged, not run-long
 
-Atomic, but long: it holds catalog locks, delays vacuum and accumulates
-WAL for the duration. The staging swap keeps live tables readable until
-the end, but the transaction itself lasts as long as the run.
-
-Nothing prevents two runs of the same task from overlapping.
+Each target is prepared in its own committed transaction. One final
+transaction publishes all targets and source state atomically. Replacement
+keeps that transaction short; explicit refill holds the target lock through
+`TRUNCATE`, the second full-row write, index/constraint maintenance and commit.
+A session advisory lock prevents two runs of the same task from overlapping.
 
 ### Identifier rules
 

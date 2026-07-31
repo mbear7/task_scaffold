@@ -76,7 +76,8 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
             {f.name for f in dataclasses.fields(tc.PipelineSpec)},
             {'excel_name', 'db_table', 'db_output', 'db_contract', 'db_type_overrides',
              'db_not_null_columns', 'output_schema', 'db_table_id_pix',
-             'db_updated_at', 'publish_result', 'debug_display', 'table_adapter'},
+             'db_updated_at', 'publish_result', 'debug_display', 'table_adapter',
+             'db_publication_strategy'},
         )
 
     def test_result_shapes_are_as_documented(self):

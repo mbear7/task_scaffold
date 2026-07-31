@@ -18,7 +18,7 @@ resolves; this one behavior intentionally does not. See README
 message for the rationale.
 """
 
-__version__ = '0.5.0'
+__version__ = '0.5.1'
 
 from task_core.db_publish import (
     DbPublishError,

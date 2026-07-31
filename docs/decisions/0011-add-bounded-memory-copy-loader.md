@@ -2,11 +2,15 @@
 
 Status: proposed
 
-Not implemented in 0.5.0.
+Not implemented in 0.5.1.
+
+Amended before implementation by ADR 0012: schema source and publication
+strategy are independent. COPY changes staging transport only and must work
+with every legal schema/publication combination.
 
 ## Problem
 
-`task_core` 0.5.0 prepares PostgreSQL staging tables through chunked
+`task_core` 0.5.1 prepares PostgreSQL staging tables through chunked
 SQLAlchemy inserts. The path is proven and remains the compatibility baseline,
 but it has two costs that become dominant for large or wide outputs:
 
@@ -19,7 +23,7 @@ the `O(rows)` Python object graph or the per-row binding work.
 
 PostgreSQL provides `COPY FROM STDIN` for bulk ingestion. Adding it is useful
 only if it changes the staging transport without weakening the guarantees that
-already exist in 0.5.0:
+already exist in 0.5.1:
 
 - one session-scoped task advisory lock;
 - ordinary logged staging tables;
@@ -28,8 +32,8 @@ already exist in 0.5.0:
 - fatal connection-loss behavior with no transparent reconnect;
 - atomic multi-table publication and source-state advancement;
 - bounded and deterministically ordered live-target locking;
-- inferred `DROP`/`RENAME` publication;
-- declared stable-target creation or `TRUNCATE` plus refill;
+- replacement publication for inferred or declared schemas;
+- explicit declared stable-target creation or `TRUNCATE` plus refill;
 - whole-publication rollback and retry;
 - portable lower-case identifiers;
 - deterministic predecessor cleanup.
@@ -48,10 +52,10 @@ provide an end-to-end bounded-memory path.
 COPY therefore requires a small lifecycle change above the transport layer as
 well as a responsibility-based module split below it.
 
-## Current 0.5.0 baseline
+## Current 0.5.1 baseline
 
-The decision is based on the actual 0.5.0 scaffold, not the earlier single-mode
-publisher.
+The decision is based on the actual 0.5.1 scaffold, not the earlier coupled
+schema/publication design.
 
 ### Two schema sources, one resolved representation
 
@@ -72,9 +76,9 @@ scalar validation before the preparation transaction opens.
 Inferred mode resolves the complete schema from materialized rows, including
 the existing late-value protection for sampled `BIGINT` and `DATE` results.
 
-### Two publication mechanisms
+### Two publication strategies
 
-Inferred outputs retain staged replacement:
+Replacement is the default for both schema sources:
 
 ```text
 prepare staging
@@ -84,7 +88,7 @@ prepare staging
 → commit
 ```
 
-Declared outputs retain stable identity:
+A declared output may explicitly request stable refill:
 
 ```text
 first publication:
@@ -101,8 +105,24 @@ prepare staging
 → commit
 ```
 
-COPY does not select or alter either publication mechanism. Schema mode still
-determines publication behavior.
+COPY does not select or alter publication strategy. Schema source, loader and
+publication strategy remain separate, subject to the legal matrix from ADR
+0012: inferred supports replacement only; declared supports replacement or
+explicit refill.
+
+The 0.5.1 external acceptance campaigns have now verified this separation on
+PostgreSQL 16.11. The live-server campaign passed all 9 cases, including
+declared replacement, explicit refill, mixed replace/refill rollback, exact
+default-metadata rejection and hard multi-target timeout enforcement. The VPS
+campaign passed all 10 concurrency and recovery cases, including `55P03`
+retry, stable OID, deliberate backend termination, rollback and successor
+cleanup.
+
+The VPS campaign also measured the existing cost boundary of stable refill:
+50,000 rows committed in 4.433 seconds while a concurrent reader was blocked
+for 2.415 seconds. These measurements are release evidence, not universal
+performance expectations, but they prove that explicit refill has a
+row-proportional live-target critical section.
 
 ### Current payload shape
 
@@ -163,19 +183,18 @@ The loader is a deliberate task-design choice. Insert remains the proven
 compatibility path. COPY is selected for outputs whose expected row count,
 width or serialized volume makes insert binding material.
 
-Both schema modes support both loaders:
+Both schema modes support both loaders. Loader choice does not broaden the
+publication matrix:
 
 ```text
-inferred schema + insert
-inferred schema + copy
-
-declared schema + insert
-declared schema + copy
+inferred + insert/copy + replace
+declared + insert/copy + replace
+declared + insert/copy + explicit refill
 ```
 
 `db_output` remains inferred-mode only. `output_schema`,
 `db_not_null_columns`, `db_type_overrides`, static `db_contract` and the
-framework-owned timestamp configured by `db_updated_at` keep their 0.5.0
+framework-owned timestamp configured by `db_updated_at` keep their 0.5.1
 meanings. `True` uses `etl_updated_at`; a string supplies a custom portable
 lower-case name.
 
@@ -187,9 +206,9 @@ separate replayability contract rather than an undocumented convention.
 
 ## Public configuration
 
-`db_loader` is appended after every field that exists in `PipelineSpec` 0.5.0
-so old positional construction retains its meaning. New code should continue
-to use keyword arguments.
+`db_loader` is appended after every field that exists in `PipelineSpec` 0.5.1
+so existing positional construction retains its meaning. New code should
+continue to use keyword arguments.
 
 ```python
 @dataclass(frozen=True)
@@ -197,6 +216,7 @@ class PipelineSpec:
     ...
     db_not_null_columns: ... = None
     output_schema: ... = None
+    db_publication_strategy: ... = None
     db_loader: str = "insert"
 ```
 
@@ -334,7 +354,7 @@ class DbPayload:
     schema: str
     columns: list[str]
     rows: list[dict[str, Any]] | None
-    ...                         # every 0.5.0 field, unchanged
+    ...                         # every 0.5.1 field, unchanged
     loader: str = "insert"
     row_source: DbRowSource | None = None
 ```
@@ -387,9 +407,9 @@ It owns:
 - staging ownership comments;
 - prepared-artifact verification;
 - pending-publication registration;
-- inferred replacement publication;
-- declared first-target creation;
-- declared compatibility preflight and stable refill;
+- replacement publication for either schema source;
+- explicit declared first-target creation;
+- explicit declared compatibility preflight and stable refill;
 - deterministic target locking;
 - publication retry and SQLSTATE policy;
 - source-state publication;
@@ -447,7 +467,7 @@ It owns the behavior currently concentrated in `db_publish.py`:
 - framework-column integration;
 - shared compatibility rules used before either transport.
 
-It must preserve the 0.5.0 meanings of:
+It must preserve the 0.5.1 meanings of:
 
 - scalar NaN and `NaT` normalizing to SQL `NULL`;
 - containers not being collapsed into scalar `NULL`;
@@ -480,7 +500,7 @@ not changed merely to make COPY easier.
 - insert-specific errors.
 
 Its initial extraction is mechanical. Chunking, SQL shape, row counts and
-failure semantics remain equivalent to 0.5.0.
+failure semantics remain equivalent to 0.5.1.
 
 It does not create or finish transactions, create tables, manage locks, attach
 comments or publish targets.
@@ -698,7 +718,7 @@ missing value fails before the database transaction opens.
 
 ## Declared-schema COPY
 
-Declared COPY uses the exact 0.5.0 contract:
+Declared COPY uses the exact 0.5.1 schema contract:
 
 - `output_schema` is the sole complete user schema;
 - produced and declared column sets must match exactly;
@@ -713,10 +733,11 @@ Declared COPY uses the exact 0.5.0 contract:
 
 The final COPY spool is not considered ready until every row has passed this
 validation. Therefore a declared validation failure creates no staging table,
-acquires no live-target lock and leaves the existing stable target untouched.
+acquires no live-target lock and leaves the current target untouched.
 
-COPY does not change declared target compatibility, incoming foreign-key
-preflight, first-target creation or stable refill behavior.
+COPY does not change replacement behavior. For a declared payload explicitly
+configured for refill, it also does not change target compatibility, incoming
+foreign-key preflight, first-target creation or stable-refill behavior.
 
 ## Database integration
 
@@ -811,26 +832,35 @@ No ready flag or registry table is introduced.
 A prepared staging table does not record or require its loading transport for
 publication correctness.
 
-After preparation commits, the existing 0.5.0 state machine remains:
+After preparation commits, the existing 0.5.1 state machine remains:
 
 ```text
 verify every owned staging artifact
-→ preflight declared targets
-→ create/fill absent declared targets
+→ preflight only explicit refill targets
+→ create/fill absent refill targets
 → run source-state publication work
+→ enforce A >= n * L + M for the actual existing lock set
 → lock every existing target in sorted order
-→ inferred: DROP/RENAME
-→ declared: TRUNCATE/refill/drop staging
+→ replace: DROP/RENAME
+→ refill: TRUNCATE/refill/drop staging
 → replace framework provenance comments
 → commit atomically
 ```
 
-A task may prepare some tables with insert and others with COPY. It may also mix
-inferred replacement targets and declared stable targets. The final publication
-is still one all-or-nothing transaction.
+A task may prepare some tables with insert and others with COPY, and may mix
+replacement targets with explicit declared refill targets. The final
+publication is still one all-or-nothing transaction.
 
 A retryable `55P03` publication attempt reuses the already committed staging
 tables. It does not consume the source again or rebuild COPY spools.
+
+COPY can reduce source preparation and staging-load time. It cannot shorten the
+row-proportional part of explicit stable refill. That publication strategy
+still executes `TRUNCATE` plus `INSERT FROM staging` while the live target is
+locked, including target index and constraint maintenance. A faster staging
+transport therefore does not imply a shorter refill reader-blocking interval.
+Replacement and refill publication must be measured separately from loader
+performance.
 
 ## Spool ownership and cleanup
 
@@ -1009,7 +1039,7 @@ No loader selection or insert behavior change is introduced.
 
 ### Phase 3 - add configuration and row-source representation
 
-Add `PipelineSpec.db_loader` after all 0.5.0 fields, payload validation and the
+Add `PipelineSpec.db_loader` after all 0.5.1 fields, payload validation and the
 one-shot row-source adapters.
 
 Insert remains the default and current tasks remain unchanged.
@@ -1055,11 +1085,11 @@ Run the complete unit suite and both live PostgreSQL campaigns before release.
 
 ### Baseline regression
 
-The accepted 0.5.0 baseline must remain green:
+The accepted local 0.5.1 baseline must remain green:
 
-- 450 automated tests and 204 subtests;
-- the existing-server PostgreSQL 16.11 declared-schema campaign;
-- the constrained PostgreSQL 16.11 VPS concurrency and recovery campaign.
+- 464 automated tests;
+- the external 0.5.1 real-server publication-strategy campaign;
+- the external 0.5.1 VPS explicit-refill concurrency and recovery campaign.
 
 The exact count may grow during implementation; the requirement is no lost
 coverage or weakened assertion.
@@ -1081,7 +1111,7 @@ Required coverage:
 
 - omitted `db_loader` resolves to insert;
 - invalid values fail during structural validation;
-- old positional `PipelineSpec` construction retains 0.5.0 meanings;
+- old positional `PipelineSpec` construction retains 0.5.1 meanings;
 - direct payload callers cannot bypass loader validation;
 - COPY plus `get_dynamic_db_contract()` fails during structural validation;
 - static `db_contract` remains supported in both schema modes;
@@ -1137,11 +1167,11 @@ prefixed objects. It must verify:
 5. Unicode, multiline text, `NULL`, empty string and literal `\\N`;
 6. decimals, Boolean, date, naive timestamp and aware timestamp values;
 7. binary values;
-8. atomic first declared publication through COPY;
-9. stable declared OID and dependent-object preservation after COPY-loaded
-   refresh;
+8. atomic first declared replacement publication through COPY;
+9. stable declared OID and dependent-object preservation after an explicit
+   COPY-loaded refill refresh;
 10. inferred COPY replacement publication;
-11. mixed insert/COPY and inferred/declared multi-table atomicity;
+11. mixed insert/COPY, inferred/declared and replace/refill multi-table atomicity;
 12. type or value error after many source rows with no committed staging table;
 13. source error before the database transaction;
 14. connection termination during COPY;
@@ -1157,10 +1187,10 @@ The controlled VPS campaign must rerun the publication risks with at least one
 COPY-loaded staging table:
 
 - `55P03` lock retry;
-- observable reader blocking during declared stable refill;
+- observable reader blocking during explicit declared stable refill;
 - stable target OID;
 - backend termination during COPY preparation;
-- backend termination during declared live refill;
+- backend termination during explicit declared live refill;
 - rollback of live contents;
 - successor cleanup of abandoned staging tables and spools;
 - final residual-artifact verification.
@@ -1194,20 +1224,36 @@ Benchmark insert and COPY under the same conditions:
 
 - identical rows and schema;
 - identical PostgreSQL server and network path;
-- identical staging and publication mechanism;
 - identical logging level;
-- same source representation where practical.
+- same source representation where practical;
+- the same publication strategy for each direct loader comparison.
 
-Record:
+Run replacement and explicit refill as separate publication profiles. Do not
+combine loader and publication effects into one undifferentiated result.
 
-- source/spool preparation time;
-- database load time;
+Record each phase separately:
+
+- source normalization and type-neutral spooling;
+- final COPY serialization;
+- staging database load;
+- staging preparation commit;
+- publication lock acquisition;
+- publication critical-section duration;
 - total preparation wall time;
-- rows per second;
+- total publication wall time;
+- total end-to-end wall time;
+- rows per second for preparation and end to end;
 - peak process memory;
-- scratch-disk bytes;
+- raw and final scratch-disk bytes;
 - PostgreSQL WAL bytes where practical;
-- client and server CPU.
+- client and server CPU;
+- reader blocking duration for explicit refill.
+
+The loader comparison is INSERT versus COPY with publication held constant.
+The publication comparison is replacement versus explicit refill with loader
+held constant. This separation is mandatory because COPY may materially
+improve staging preparation while leaving refill's locked `TRUNCATE` plus
+`INSERT FROM staging` interval unchanged.
 
 COPY must demonstrate a material throughput improvement on million-row or
 comparably wide workloads before documentation recommends it broadly. One
@@ -1236,7 +1282,7 @@ Before switching its live configuration:
 3. measure memory, scratch disk and throughput;
 4. induce a COPY failure and a connection loss;
 5. confirm staging and spool cleanup;
-6. verify the correct inferred replacement or declared stable-target behavior;
+6. verify the configured replacement or explicit declared-refill behavior;
 7. select `db_loader="copy"` explicitly and rerun.
 
 Rollback is a task configuration change back to `"insert"` followed by a new
@@ -1352,7 +1398,7 @@ for small outputs.
 
 ## Consequences
 
-- Loader selection becomes an explicit part of task design.
+- Loader selection remains an explicit part of task design and independent of schema source and publication strategy.
 - `PipelineSpec` gains one backward-compatible field.
 - Database-only lazy PETL COPY can avoid both the current cache and the
   whole-table list of dictionaries.
@@ -1369,6 +1415,8 @@ for small outputs.
 - Insert remains the compatibility baseline.
 - Preparation remains restartable rather than resumable.
 - Publication retry stays cheap because it reuses committed staging tables.
+- COPY can improve staging preparation but cannot remove explicit refill's
+  row-proportional locked write or its reader-blocking cost.
 - A future loader can be added without embedding transport internals in the
   publisher, but no plugin system is created in advance.
 
@@ -1376,12 +1424,23 @@ for small outputs.
 
 No COPY implementation exists yet.
 
-The 0.5.0 baseline that this decision must preserve has passed:
+`task_core` 0.5.1 is the accepted implementation baseline for this ADR:
 
-- the complete automated suite;
-- the existing-server PostgreSQL 16.11 declared-schema acceptance campaign;
-- the constrained PostgreSQL 16.11 VPS lock, termination, rollback and cleanup
-  campaign.
+- the complete automated suite passes: 464 tests;
+- the PostgreSQL 16.11 live-server publication-strategy campaign passes: 9/9;
+- the PostgreSQL 16.11 VPS concurrency and recovery campaign passes: 10/10;
+- both campaigns completed with no owned staging artifacts left behind.
+
+The live-server campaign verified direct strategy validation, declared
+replacement and OID change, explicit refill and dependent-object preservation,
+exact target-default rejection, hard `A >= n * L + M` enforcement and mixed
+replace/refill atomic rollback.
+
+The VPS campaign verified `55P03` retry, stable OID, observable reader blocking,
+backend-termination rollback and successor cleanup. Its 50,000-row refill
+measurement was 4.433 seconds to commit with 2.415 seconds of concurrent reader
+blocking. These values document the baseline behavior of explicit refill; they
+are not performance targets for COPY.
 
 ADR 0011 is complete as a decision only when the implementation demonstrates:
 

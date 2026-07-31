@@ -1,6 +1,6 @@
 # 0009 — Add fully declared output schemas
 
-Status: accepted
+Status: accepted (publication-strategy coupling reversed by 0012)
 
 Implemented in 0.5.0.
 
@@ -131,9 +131,10 @@ Examples:
 - aware datetimes are required for `TIMESTAMP WITH TIME ZONE`;
 - naive datetimes are required for `TIMESTAMP WITHOUT TIME ZONE`.
 
-PostgreSQL remains the final authority for database constraints, triggers and
-backend-specific adaptation. A database rejection rolls back the complete
-staging preparation transaction.
+PostgreSQL remains the final authority for database constraints and
+backend-specific adaptation. A rejection by constraints present on staging
+rolls back the complete preparation transaction; target-only constraints and
+triggers on explicit refill are handled later as described below.
 
 ## Column matching and ordering
 
@@ -146,12 +147,23 @@ A declared output may produce its columns in a different order. The framework:
 Empty outputs are valid because the schema comes from the declaration. An
 empty declaration is invalid.
 
-## Stable declared targets
+## Publication-strategy amendment
 
-Inferred outputs retain the existing staged replacement publication from ADR
-0001.
+ADR 0012 changed the default in 0.5.1. `output_schema` now selects only the
+schema source; both schema modes use replacement by default. The stable-target
+mechanism below remains available only through explicit
+`db_publication_strategy='refill'`.
 
-Declared outputs use a permanent ordinary logged target table.
+Stable refill deliberately trades the inferred/replacement path's short,
+row-independent swap window for the identity of the same ordinary table and
+its attached database objects. Its reader-blocking window scales with rows,
+indexes and database-side enforcement.
+
+## Explicit stable refill for declared targets
+
+Both schema sources use the existing staged replacement publication from ADR
+0001 by default. When a declared output explicitly selects `refill`, it uses a
+permanent ordinary logged target table as described in this section.
 
 ### First publication
 
@@ -164,9 +176,7 @@ When the target is absent, the publication transaction:
 5. drops staging;
 6. commits.
 
-The target is never committed empty or partially filled. In a mixed
-publication, all absent declared targets are created and filled before the
-first existing live-target lock.
+The target is never committed empty or partially filled. In a mixed publication, all absent explicit-refill targets are created and filled before the first existing live-target lock.
 
 ### Existing target
 
@@ -178,7 +188,10 @@ prepared staging table's PostgreSQL catalog metadata:
 - type modifiers such as numeric precision/scale and varchar length;
 - nullability;
 - relevant collation;
-- identity and generated-column metadata.
+- identity and generated-column metadata;
+- presence of a column default (`atthasdef`). Defaults are not declared in
+  this release, so a target default is incompatible rather than silently
+  ignored.
 
 No widening compatibility and no automatic migration are performed. Views,
 materialized views, foreign tables and partitioned tables are rejected
@@ -187,6 +200,21 @@ explicitly.
 External incoming foreign keys are rejected before locking. The framework
 never uses `TRUNCATE ... CASCADE` and does not coordinate dependent-table
 refreshes in this release.
+
+Stable refill deliberately writes every row twice: first into the committed
+logged staging table and then into the stable target. This consumes additional
+storage, WAL and I/O, but moves source processing, normalization, declared
+validation and the first database load before the live lock, preserves the
+target object, and lets publication retries reuse the prepared artifact. Peak
+storage is at least the existing target plus staging; indexes, WAL and
+transactional state can make the transient peak higher.
+
+Target-owned indexes do not create semantic validation errors, but they extend
+refill time. Primary/unique/check/exclusion constraints and triggers that exist
+only on the live target are not reimplemented during staging validation; they
+may reject the second insert inside the publication transaction. Such a failure
+is later and less specific, but remains atomic and restores the old live
+contents.
 
 The publication transaction then:
 
@@ -211,14 +239,18 @@ full refill, index maintenance, constraint checks and commit. There is no
 generic duration estimate: representative row width, indexes, storage,
 replication and server load must be measured.
 
-The formal locking model remains:
+The formal locking model is:
 
 ```text
-k × L + M ≤ A
-A + P ≤ B
+A >= n * L + M
+A + P <= B
 ```
 
-For declared outputs, `P` includes the locked `TRUNCATE`, refill, staging drop,
+The first inequality is enforced for the actual existing lock set so ordinary
+multi-target contention reaches retryable `55P03` rather than aggregate
+`57014`. The second is the independent reader-impact budget.
+
+For explicit declared refill, `P` includes the locked `TRUNCATE`, refill, staging drop,
 comment and commit work. Partition swap may be considered later only if live
 measurements show that this critical section is unacceptable.
 

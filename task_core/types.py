@@ -83,6 +83,57 @@ VALID_TABLE_ADAPTERS = frozenset({None, 'petl', 'pandas'})
 # previous [A-Za-z_] form broke nothing.
 PORTABLE_IDENTIFIER_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
 
+# How new data replaces old in a published table. Engine-neutral
+# vocabulary, like PORTABLE_IDENTIFIER_RE above; the mechanics live in
+# db_publish.py.
+#
+#   replace   drop the live table, rename staging into its place. One
+#             database write, catalog-time lock. The target is a new
+#             relation each run, so views, grants, indexes, ownership and
+#             triggers do not survive.
+#   refill    truncate the live table and insert from staging. Two database
+#             writes and a lock held for a window proportional to row
+#             count, in exchange for a stable OID -- so everything attached
+#             to the table survives.
+#
+# 'partition' is deliberately absent rather than reserved-and-rejected: an
+# accepted vocabulary value that raises NotImplementedError is its own
+# small lie. It is added when it is built.
+PUBLICATION_STRATEGIES = ('replace', 'refill')
+
+
+def validate_publication_strategy(
+    value, *, output_schema, allow_none=False,
+    field_name='publication_strategy', error_type=ValueError,
+):
+    """Validate one publication-strategy value at any public boundary.
+
+    ``PipelineSpec`` and direct ``DbPayload`` callers must enforce the same
+    legal matrix. Keeping the rule here prevents the spec path and the direct
+    publisher path from drifting apart.
+    """
+    if value is None:
+        if allow_none:
+            return None
+        raise error_type(
+            f'{field_name} must be one of {PUBLICATION_STRATEGIES}, got None'
+        )
+
+    if not isinstance(value, str) or value not in PUBLICATION_STRATEGIES:
+        raise error_type(
+            f'{field_name} must be one of {PUBLICATION_STRATEGIES}'
+            f'{" or None" if allow_none else ""}, got {value!r}'
+        )
+
+    if value == 'refill' and output_schema is None:
+        raise error_type(
+            f"{field_name}='refill' requires output_schema. Refill truncates "
+            "the live table and inserts into it, so the target's physical "
+            "schema must be stable across runs; inferred schemas may change "
+            "with the data."
+        )
+
+    return value
 
 
 @dataclass(frozen=True)
@@ -123,12 +174,27 @@ class PipelineSpec:
     # its meaning. New code should still use keyword arguments.
     db_not_null_columns: list[str] | tuple[str, ...] | None = None
     output_schema: list[OutputColumn] | tuple[OutputColumn, ...] | None = None
+    # None resolves to 'replace' for BOTH schema modes. Kept after every
+    # 0.5.0 field as API hygiene: adding an optional field must not silently
+    # reinterpret existing positional construction.
+    #
+    # 'refill' requires output_schema: it needs the target's physical schema
+    # to remain stable across runs, and only a declaration can promise that.
+    db_publication_strategy: str | None = None
+
     def __post_init__(self):
         if self.excel_name is not None and not isinstance(self.excel_name, str):
             raise TypeError('excel_name must be str or None')
 
         if self.db_table is not None and not isinstance(self.db_table, str):
             raise TypeError('db_table must be str or None')
+
+        validate_publication_strategy(
+            self.db_publication_strategy,
+            output_schema=self.output_schema,
+            allow_none=True,
+            field_name='db_publication_strategy',
+        )
 
         if self.db_output is not None:
             # Require the declared contract (list[str] | tuple[str, ...] |

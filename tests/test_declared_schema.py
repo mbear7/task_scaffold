@@ -42,6 +42,16 @@ class Test1OutputSchemaConfiguration(unittest.TestCase):
         self.assertIsNone(spec.db_not_null_columns)
         self.assertIsNone(spec.output_schema)
 
+    def test_existing_positional_pipeline_spec_fields_keep_their_050_meaning(self):
+        schema = (tc.OutputColumn('id', sa.BigInteger(), nullable=False),)
+        spec = tc.PipelineSpec(
+            'x.xlsx', 'target', None, None, None, None, False, False, False,
+            'petl', None, schema,
+        )
+        self.assertIs(spec.output_schema, schema)
+        self.assertIsNone(spec.db_not_null_columns)
+        self.assertIsNone(spec.db_publication_strategy)
+
     def test_schema_is_immutable_and_non_empty(self):
         columns = [tc.OutputColumn('id', sa.BigInteger(), nullable=False)]
         spec = tc.PipelineSpec(db_table='target', output_schema=columns)
@@ -358,7 +368,7 @@ class Test4DeclaredPublicationControlFlow(unittest.TestCase):
         publisher._conn = _Connection()
         publisher._verify_prepared_artifacts = lambda: publisher._conn.events.append('verify')
         publisher._pending_swaps = [('bsr', 'target', 'target__stg_x', 1)]
-        publisher._declared_targets = {('bsr', 'target')}
+        publisher._refill_targets = {('bsr', 'target')}
         publisher._resolved_schemas = {
             ('bsr', 'target'): ResolvedSchema(
                 (ResolvedColumn('id', sa.BigInteger(), False),), 'declared'
@@ -405,10 +415,24 @@ class Test4DeclaredPublicationControlFlow(unittest.TestCase):
                     target_oid=1, staging_oid=2,
                 )
 
-        columns = (('id', 20, -1, True, 0, '', ''),)
+        columns = (('id', 20, -1, True, 0, '', '', False),)
         with mock.patch('task_core.db_publish._relation_columns', side_effect=[columns, columns]), \
              mock.patch('task_core.db_publish._external_incoming_foreign_keys', return_value=(('x', 'child', 'fk'),)):
             with self.assertRaisesRegex(DbPublishError, 'incoming'):
+                publisher._verify_declared_target_compatibility(
+                    schema='bsr', table_name='target', staging_name='stg',
+                    target_oid=1, staging_oid=2,
+                )
+
+    def test_target_defaults_are_part_of_exact_refill_compatibility(self):
+        publisher = self._publisher()
+        target = (('id', 20, -1, True, 0, '', '', True),)
+        staging = (('id', 20, -1, True, 0, '', '', False),)
+        with mock.patch(
+            'task_core.db_publish._relation_columns',
+            side_effect=[target, staging],
+        ):
+            with self.assertRaisesRegex(DbPublishError, 'default metadata'):
                 publisher._verify_declared_target_compatibility(
                     schema='bsr', table_name='target', staging_name='stg',
                     target_oid=1, staging_oid=2,
@@ -425,6 +449,172 @@ class Test4DeclaredPublicationControlFlow(unittest.TestCase):
         self.assertIn('insert into "bsr"."target"', sql.lower())
         self.assertIn('drop table "bsr"."target__stg_x"', sql.lower())
         self.assertLess(publisher._conn.events.index('comment'), len(publisher._conn.events))
+
+
+class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
+    """Schema source and publication strategy are orthogonal: one says
+    where the shape comes from, the other how new data replaces old.
+
+    Until 0.5.1 they were one setting -- declaring output_schema forced
+    refill -- which made the fastest combination unreachable. Declared +
+    replace does one database write instead of two and holds a
+    catalog-time lock instead of one proportional to row count, because
+    _build_table() already builds staging from the same ResolvedSchema in
+    both modes, so a rename produces a correctly-shaped target with no
+    extra work.
+    """
+
+    COLUMNS = (tc.OutputColumn('v', sa.BigInteger()),)
+
+    def _publisher(self, *, existing=True):
+        import sqlalchemy as real_sa
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='strategy_test')
+        publisher._engine = real_sa.create_engine('sqlite://')
+        self.addCleanup(publisher.close)
+        conn = publisher.ensure_connection()
+        if existing:
+            conn.execute(real_sa.text('create table t (v bigint)'))
+            conn.execute(real_sa.text('insert into t values (1)'))
+            publisher._commit_transaction()
+        publisher._lock_held = True
+        publisher._locked_task_name = 'strategy_test'
+        return publisher
+
+    def _publish(self, publisher, strategy):
+        import petl as etl
+        from task_core.db_publish import from_petl
+        publisher.publish(from_petl(
+            etl.wrap([['v'], [9]]), table_name='t', schema=None,
+            output_schema=self.COLUMNS, publication_strategy=strategy,
+        ))
+
+    def test_declared_defaults_to_replace_not_refill(self):
+        # The default is resolved from the spec, so this asserts the spec
+        # side; the publisher side is asserted below.
+        spec = tc.PipelineSpec(db_table='t', output_schema=self.COLUMNS)
+        self.assertIsNone(spec.db_publication_strategy)
+
+        from task_core.export import _build_db_payload_with_spec
+
+        class pipeline:
+            pass
+
+        payload = _build_db_payload_with_spec(
+            pipeline, __import__('petl').wrap([['v'], [9]]), spec, None,
+        )
+        self.assertEqual(payload.publication_strategy, 'replace')
+
+    def test_declared_plus_replace_does_not_take_the_refill_path(self):
+        publisher = self._publisher()
+        self._publish(publisher, 'replace')
+        self.assertEqual(
+            publisher._refill_targets, set(),
+            'a declared target was registered for refill despite strategy=replace',
+        )
+
+    def test_declared_plus_refill_still_takes_the_refill_path(self):
+        publisher = self._publisher()
+        self._publish(publisher, 'refill')
+        self.assertEqual(publisher._refill_targets, {(None, 't')})
+
+    def test_the_strategy_is_carried_on_the_payload(self):
+        import petl as etl
+        from task_core.db_publish import from_petl
+        for strategy in ('replace', 'refill'):
+            with self.subTest(strategy=strategy):
+                payload = from_petl(
+                    etl.wrap([['v'], [9]]), table_name='t', schema=None,
+                    output_schema=self.COLUMNS, publication_strategy=strategy,
+                )
+                self.assertEqual(payload.publication_strategy, strategy)
+
+    def test_direct_payload_rejects_unknown_strategy(self):
+        with self.assertRaisesRegex(DbPublishError, 'publication_strategy'):
+            DbPayload('t', 'bsr', ['v'], [{'v': 1}], publication_strategy='banana')
+
+    def test_direct_payload_rejects_inferred_refill(self):
+        with self.assertRaisesRegex(DbPublishError, 'requires output_schema'):
+            DbPayload('t', 'bsr', ['v'], [{'v': 1}], publication_strategy='refill')
+
+    def test_adapter_constructors_apply_the_same_strategy_validation(self):
+        import petl as etl
+        from task_core.db_publish import from_pandas, from_petl
+
+        with self.assertRaisesRegex(DbPublishError, 'publication_strategy'):
+            from_petl(
+                etl.wrap([['v'], [1]]), table_name='t', schema='bsr',
+                publication_strategy='banana',
+            )
+        with self.assertRaisesRegex(DbPublishError, 'requires output_schema'):
+            from_pandas(
+                pd.DataFrame({'v': [1]}), table_name='t', schema='bsr',
+                publication_strategy='refill',
+            )
+
+    def test_declared_replace_commits_through_drop_and_rename(self):
+        import sqlalchemy as real_sa
+        publisher = self._publisher()
+        self._publish(publisher, 'replace')
+        publisher.commit()
+        value = publisher.ensure_connection().execute(
+            real_sa.text('select v from t')
+        ).scalar_one()
+        self.assertEqual(value, 9)
+        self.assertEqual(publisher._refill_targets, set())
+
+    def test_first_declared_replace_creates_the_target_by_rename(self):
+        import sqlalchemy as real_sa
+        publisher = self._publisher(existing=False)
+        self._publish(publisher, 'replace')
+        publisher.commit()
+        value = publisher.ensure_connection().execute(
+            real_sa.text('select v from t')
+        ).scalar_one()
+        self.assertEqual(value, 9)
+
+    def test_mutated_payload_strategy_is_revalidated_at_publish_boundary(self):
+        import petl as etl
+        from task_core.db_publish import from_petl
+        payload = from_petl(
+            etl.wrap([['v'], [9]]), table_name='t', schema=None,
+            output_schema=self.COLUMNS, publication_strategy='replace',
+        )
+        payload.publication_strategy = 'banana'
+        publisher = self._publisher()
+        with self.assertRaisesRegex(DbPublishError, 'publication_strategy'):
+            publisher.publish(payload)
+
+    def test_refill_requires_a_declared_schema(self):
+        """Refill truncates the live table and inserts into it, so the
+        target's physical schema must be stable across runs -- and only a
+        declaration can promise that. Inferred + refill is rejected at
+        construction rather than permitted and documented, so the
+        incoherent combination stays unrepresentable rather than becoming
+        a job that works until a column widens.
+        """
+        with self.assertRaises(ValueError) as caught:
+            tc.PipelineSpec(db_table='t', db_publication_strategy='refill')
+        message = str(caught.exception)
+        self.assertIn('requires output_schema', message)
+        self.assertIn('stable across runs', message)
+
+    def test_inferred_plus_replace_is_the_ordinary_case(self):
+        spec = tc.PipelineSpec(db_table='t', db_publication_strategy='replace')
+        self.assertEqual(spec.db_publication_strategy, 'replace')
+
+    def test_partition_is_absent_from_the_vocabulary(self):
+        """Absent rather than reserved-and-rejected. An accepted vocabulary
+        value that raises NotImplementedError is its own small lie; it is
+        added when it is built.
+        """
+        from task_core.types import PUBLICATION_STRATEGIES
+        self.assertEqual(PUBLICATION_STRATEGIES, ('replace', 'refill'))
+        with self.assertRaises(ValueError):
+            tc.PipelineSpec(
+                db_table='t', output_schema=self.COLUMNS,
+                db_publication_strategy='partition',
+            )
+
 
 
 if __name__ == '__main__':

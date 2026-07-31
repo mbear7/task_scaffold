@@ -1,6 +1,6 @@
 # 0008 — Bound the publication lock wait
 
-Status: accepted
+Status: accepted (multi-target timeout invariant strengthened in 0.5.1)
 
 ## Problem
 
@@ -34,19 +34,32 @@ SET LOCAL statement_timeout = 0;
 
 Configured through `PublicationLockPolicy`, a field of `PublisherConfig`.
 
-### 0.4.1 clarification
+### 0.5.1 clarification
 
-The 50 ms relationship enforced between `lock_timeout_ms` and
-`acquisition_timeout_ms` is only the minimum timeout-ordering guarantee: it
-lets retryable `55P03` occur before terminal `57014`. It is not a reader-impact
-budget. Real sizing remains `k × L + M ≤ A`, while total reader blocking must
-satisfy `A + P ≤ B`.
+The original 50 ms relationship, `A >= L + M`, orders one lock wait only. It
+does not guarantee retryable `55P03` for a multi-target statement because
+PostgreSQL applies `lock_timeout` to each sequential acquisition while
+`statement_timeout` covers the whole statement. After resolving the actual
+existing target set, the publisher therefore enforces the hard invariant:
 
-All source-state `DELETE`/upsert and other preparatory database work completes
-before the first live-target lock. Existing targets are deduplicated and
-locked in deterministic `(schema, table)` order immediately before the swap.
-After the first target lock, only `DROP`, `RENAME`, required comments and
-commit remain.
+```text
+A >= n * L + M
+```
+
+where `n` is the number of relations in the single `LOCK TABLE` statement. A
+policy that does not fit is rejected before any target lock is requested. On a
+short final attempt, the effective per-target timeout is reduced so the actual
+budgets still satisfy the same inequality. `57014` remains terminal and is
+never classified by parsing message text.
+
+This is separate from the reader-impact budget `A + P <= B`. All source-state
+`DELETE`/upsert and other preparatory database work completes before the first
+live-target lock. Existing targets are deduplicated and locked in deterministic
+`(schema, table)` order immediately before publication. Replacement leaves only
+`DROP`, `RENAME`, comments and commit after acquisition. Explicit stable refill
+adds `TRUNCATE`, a row-proportional second write, index/constraint maintenance,
+staging drop and commit; the acquisition policy bounds `A`, not that critical
+section `P`.
 
 Retry timing uses one absolute monotonic deadline. The existing minimum sleep
 is preserved, but jitter is sampled only inside the remaining usable horizon;
@@ -80,18 +93,19 @@ are derived as `min(configured, time remaining)`: the configured values are
 ceilings, and a final attempt may legitimately run with far less.
 
 **Both timeouts, not one.** `lock_timeout` bounds each individual wait;
-`statement_timeout` bounds the whole acquisition. Neither subsumes the
-other once `n` is large: at 500 ms across eight tables, `lock_timeout`
-alone permits four seconds, and the 5 s aggregate cap is the tighter
-bound. **Consequence worth stating: a task publishing more than about ten
-tables is aggregate-bound, not per-wait-bound**, and someone reading only
-`lock_timeout_ms` will predict the wrong thing.
+`statement_timeout` bounds the whole acquisition. With the hard invariant,
+`statement_timeout` must leave enough aggregate room for every sequential
+per-target wait plus `M`; it is therefore a terminal safety ceiling, not a
+smaller competing lock-contention budget. Someone reading only
+`lock_timeout_ms` will still predict the wrong total because the worst-case
+acquisition budget scales with the actual target count.
 
-**Budgets lifted once the locks are held.** The horizon bounds the *wait*,
-not the work. Verify, plan, swap and comment are catalog operations
-measured in milliseconds, and cancelling them halfway would be strictly
-worse than letting them finish. Worst case becomes `horizon + swap`, with
-no term you cannot name.
+**Budgets lifted once the locks are held.** The horizon bounds acquisition,
+not the work after acquisition. Replacement is normally catalog-time work.
+Explicit stable refill is not: its `TRUNCATE`, full-row insert, target index and
+constraint maintenance, and commit scale with the target. Cancelling either
+publication mechanism halfway would be worse than allowing the transaction to
+finish, but refill's reader impact must be sized independently.
 
 **Locks taken last, after the publication plan.** The plan is not
 harmless catalog work: on the standard runner path it runs
@@ -231,7 +245,7 @@ Also confirmed in the same run:
   of any transaction, dropped its staging artifact, and left the live
   table unchanged.
 
-### Multi-table, confirmed — with a consequence
+### Multi-table finding that motivated the 0.5.1 invariant
 
 Two targets, readers on each:
 
@@ -247,13 +261,10 @@ One sorted statement carrying both targets, exactly as designed.
 But note **which** timeout fired: the aggregate `statement_timeout`, which
 raises `57014` — and `57014` is terminal here by the decision above.
 
-So multi-table publication under contention is **more likely to fail
-terminally than to retry**, because the aggregate budget is the one it
-tends to exhaust while `lock_timeout` bounds only each individual wait.
-That is a real consequence of choosing conservative `57014` handling, not
-a defect. A run that fails this way is clean — nothing partially
-published, source state unadvanced, staging dropped — and the next
-scheduled run republishes.
+This was clean but violated the intended retry classification: ordinary
+lock contention could surface as terminal `57014`. In 0.5.1 the publisher
+rejects `A < n*L+M` before issuing the statement, so this configuration is no
+longer executable.
 
 ### Sizing the two budgets
 
@@ -265,15 +276,18 @@ against this decision:
 | `lock_timeout_ms` (L) | the **per-conflict** limit — how long to wait for any one target |
 | `acquisition_timeout_ms` (A) | the **aggregate** budget for acquiring the complete lock set |
 
-With `n` existing targets, `k ≤ n` of them expected to contend
-sequentially, `M` the execution margin, and `P` the swap-and-commit
-critical section:
+With `n` existing targets, `M` the execution margin, and `P` the
+post-acquisition publication critical section, the hard classification
+invariant and separate reader-impact budget are:
 
 ```
-A ≥ k·L + M        subject to        A + P ≤ B
+A >= n*L + M        subject to        A + P <= B
 ```
 
-where `B` is the total reader blocking you have decided to accept.
+Expected contention `k <= n` is useful for operational estimates, but it cannot
+provide the SQLSTATE guarantee because the publisher cannot know in advance
+which targets will wait. `B` is the total reader blocking you have decided to
+accept.
 
 **`A` is not `B`.** Once the complete set is held, both timeouts are reset
 and the publisher performs `DROP`, `RENAME`, comments and commit with
@@ -283,19 +297,19 @@ every lock still held. So for the earliest-acquired target:
 reader blocking = acquisition + publication
 ```
 
-`A` bounds only the waiting half. `P` is short — catalog operations — but
-this policy imposes no hard limit on it, so total reader blocking exceeds
-`A` by the critical section. An earlier version of this section called `A`
-"the ceiling on total reader impact", which was wrong by exactly `P`.
+`A` bounds only acquisition. Under replacement, `P` is normally short
+catalog work. Under explicit stable refill, `P` is row- and index-dependent.
+This policy imposes no hard limit on either, so total reader blocking exceeds
+`A` by the chosen publication strategy's critical section.
 
-`M` is not decoration. `k·L` exactly equal to `A` leaves nothing for
+`M` is not decoration. `n·L` exactly equal to `A` leaves nothing for
 statement execution, lock-manager work or driver latency — which is why
 the defaults cover a worst case of `(5000 − 50) // 500 = 9` sequentially
 contended targets, not ten.
 
 **The `A + P ≤ B` constraint is what makes this a rule rather than a
 licence.** Without it
-the inequality is satisfiable by growing `A` without limit as `k` grows,
+the inequality is satisfiable by growing `A` without limit as `n` grows,
 and an earlier version of this section said exactly that: widen
 `acquisition_timeout_ms` for tasks publishing several contended tables.
 **That advice was wrong**, in the specific way worth recording because it
@@ -306,48 +320,34 @@ publisher's acquired lock for the remainder of the acquisition. Raising
 `A` to accommodate a large `L` lengthens exactly the window this mechanism
 exists to shorten, and fits fewer attempts inside the horizon besides.
 
-**When the arithmetic does not fit, there are four legitimate outcomes**,
-and lowering `L` is not automatically the right one — it has its own cost.
-A short per-conflict limit can turn ordinary multi-second BI contention
-into a steady stream of `55P03`, making the retry loop the normal
-publication mechanism rather than a safety net:
+**When the arithmetic does not fit, the configuration is rejected before
+locking.** There are three legitimate corrections, and lowering `L` is not
+automatically the right one — it has its own cost. A short per-conflict limit
+can turn ordinary multi-second BI contention into a steady stream of `55P03`,
+making the retry loop the normal publication mechanism rather than a safety
+net:
 
 1. **Lower `L`** when short queue residence is the primary requirement.
-   For eight contended targets, `L = 250` gives the same retryable outcome
-   as doubling `A` to 10 s, while halving the window in which any reader
-   is blocked.
-2. **Publish fewer targets together**, reducing `k` directly.
-3. **Accept terminal `57014`**, or schedule publication when contention is
-   lower. The failure is clean: nothing partially published, source state
-   unadvanced, staging dropped, next run republishes.
-4. **Raise `A` — but only as an explicit decision to accept a larger `B`**,
-   never as a way to make the arithmetic fit.
+   For eight targets, `L = 250` fits under a much smaller aggregate budget
+   than `L = 500`, while reducing the window in which a partially acquired
+   lock set can block readers.
+2. **Publish fewer targets together**, reducing `n` directly.
+3. **Raise `A` — but only as an explicit decision to accept a larger `B`**,
+   never as a hidden attempt to make the arithmetic disappear.
 
-### What the warning does and does not claim
+Scheduling the task for a quieter period may reduce observed contention, but
+it does not make an invalid timeout policy executable.
 
-`_lock_publication_targets()` warns when `A < n·L + M`. Three things about
-its wording are deliberate.
+### What enforcement does
 
-**"Worst case", not "contended".** The publisher knows `n` and cannot know
-`k`. Claiming "mis-sized for `n` contended targets" would assert something
-it has not observed, and would fire on every publication for a task with
-many uncontended tables.
+`_lock_publication_targets()` knows the actual number of existing targets after
+missing first-publication targets are excluded, so it enforces `A >= n*L+M` at
+the only point where `n` is known. The check happens before `SET LOCAL` and
+before `LOCK TABLE`; failure leaves `lock_attempts == 0`.
 
-**"May", not "will".** Even fully contended, the first individual wait can
-reach `L` and raise retryable `55P03` before the aggregate is exhausted.
-The inequality establishes only that the policy cannot *reserve* the full
-per-conflict budget for every target — so a sequence of waits each shorter
-than `L` may cumulatively exhaust `A` and produce terminal `57014` before
-any single wait produces `55P03`. An earlier wording said the aggregate
-"expires first", which overstated a possibility as a certainty.
-
-**No recommendation when none exists.** The suggested `L` is
-`(A − M) // n`, unclamped. When that is zero, no positive `lock_timeout_ms`
-satisfies `n·L + M ≤ A` at all, and the warning says so rather than
-recommending 1 ms — which would not fit either.
-
-Emitted once per run, since the method runs on every retry attempt and a
-repeated static warning would bury the contention messages that vary.
+The error recommends lowering `L`, splitting the publication, or deliberately
+raising `A`. It never parses a `57014` message to guess whether PostgreSQL meant
+statement timeout or operator cancellation.
 
 ### Deadlock, confirmed
 

@@ -23,7 +23,10 @@ from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
-from task_core.types import OutputColumn, PORTABLE_IDENTIFIER_RE, find_duplicates
+from task_core.types import (
+    OutputColumn, PORTABLE_IDENTIFIER_RE, find_duplicates,
+    validate_publication_strategy,
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,17 @@ class DbPayload:
     not_null_columns: tuple[str, ...] = ()
     output_schema: tuple[OutputColumn, ...] | None = None
     framework_columns: tuple[OutputColumn, ...] = ()
+    # 'replace' or 'refill'. Carried from PipelineSpec so publication can
+    # select the mechanism without re-deriving it from the schema source.
+    publication_strategy: str = 'replace'
+
+    def __post_init__(self):
+        validate_publication_strategy(
+            self.publication_strategy,
+            output_schema=self.output_schema,
+            field_name='publication_strategy',
+            error_type=DbPublishError,
+        )
 
 
 class DbPublishError(RuntimeError):
@@ -195,6 +209,7 @@ def _apply_db_contract_columns(columns, rows, db_contract, *, table_name):
 def from_petl(
     tbl, *, table_name, schema, type_overrides=None, db_contract=None,
     not_null_columns=(), output_schema=None, db_table_id_pix=None,
+    publication_strategy='replace',
 ):
     if isinstance(tbl, pd.DataFrame):
         raise DbPublishError(
@@ -228,6 +243,7 @@ def from_petl(
         type_overrides=type_overrides,
         not_null_columns=tuple(not_null_columns or ()),
         output_schema=tuple(output_schema) if output_schema is not None else None,
+        publication_strategy=publication_strategy,
         db_table_id_pix=db_table_id_pix,
     )
 
@@ -236,6 +252,7 @@ def from_petl(
 def from_pandas(
     df: pd.DataFrame, *, table_name, schema, type_overrides=None, db_contract=None,
     not_null_columns=(), output_schema=None, db_table_id_pix=None,
+    publication_strategy='replace',
 ):
     if not isinstance(df, pd.DataFrame):
         raise DbPublishError(
@@ -265,6 +282,7 @@ def from_pandas(
         type_overrides=type_overrides,
         not_null_columns=tuple(not_null_columns or ()),
         output_schema=tuple(output_schema) if output_schema is not None else None,
+        publication_strategy=publication_strategy,
         db_table_id_pix=db_table_id_pix,
     )
 
@@ -411,7 +429,7 @@ def _find_relation(conn, schema, table):
 
 _RELATION_COLUMNS_SQL = sa.text(
     "select a.attname, a.atttypid, a.atttypmod, a.attnotnull, "
-    "a.attcollation, a.attidentity, a.attgenerated "
+    "a.attcollation, a.attidentity, a.attgenerated, a.atthasdef "
     "from pg_catalog.pg_attribute a "
     "where a.attrelid = :oid and a.attnum > 0 and not a.attisdropped "
     "order by a.attnum"
@@ -433,7 +451,7 @@ def _relation_columns(conn, oid):
     return tuple(
         (
             str(row[0]), int(row[1]), int(row[2]), bool(row[3]),
-            int(row[4]), str(row[5]), str(row[6]),
+            int(row[4]), str(row[5]), str(row[6]), bool(row[7]),
         )
         for row in conn.execute(_RELATION_COLUMNS_SQL, {'oid': oid}).all()
     )
@@ -554,24 +572,25 @@ class PublicationLockPolicy:
     #   L = per-conflict lock timeout
     #   A = complete lock-acquisition timeout
     #   M = execution and timeout-ordering margin
-    #   k = targets expected to contend sequentially
-    #   P = post-acquisition swap-and-commit duration
+    #   n = actual existing targets in the LOCK TABLE statement
+    #   P = post-acquisition publication duration
     #   B = accepted total reader-blocking budget
     #
-    # The acquisition policy should satisfy:
+    # Retry classification requires the hard runtime invariant:
     #
-    #     k * L + M <= A
+    #     n * L + M <= A
     #
-    # When total reader blocking is considered:
+    # Total reader blocking must separately satisfy:
     #
     #     A + P <= B
     #
     # A bounds acquisition waiting only. Locks already acquired remain held
-    # through the publication swap-or-refill and commit critical section P.
+    # through replacement or refill and commit. Replacement P is normally
+    # catalog-time; explicit refill P is row- and index-dependent.
     #
-    # The defaults give a worst-case capacity of
-    # (5000 - 50) // 500 = 9 sequentially contended targets.
-    # _lock_publication_targets() warns when n exceeds that.
+    # The defaults support at most (5000 - 50) // 500 = 9 existing targets
+    # in one publication. _lock_publication_targets() rejects a larger actual
+    # lock set before requesting any live-target lock.
     lock_timeout_ms: int = 500
     acquisition_timeout_ms: int = 5_000
     retry_horizon_seconds: float = 60.0
@@ -579,8 +598,9 @@ class PublicationLockPolicy:
     retry_delay_max_seconds: float = 5.0
     max_attempts: int = 100
 
-    # Margin by which lock_timeout must stay below statement_timeout, so a
-    # lock wait always expires first.
+    # Engineering margin reserved after the sum of all possible sequential
+    # per-target waits. A single-wait ordering check alone is insufficient for
+    # one LOCK TABLE statement containing multiple relations.
     TIMEOUT_MARGIN_MS = 50
 
     def __post_init__(self):
@@ -619,23 +639,29 @@ class PublicationLockPolicy:
                 f'cancellation (57014).'
             )
 
-    def attempt_budgets_ms(self, remaining_seconds):
-        """(statement_timeout_ms, lock_timeout_ms) for an attempt with this
-        much of the horizon left, or None if there is not enough left to
-        run a well-formed one.
+    def attempt_budgets_ms(self, remaining_seconds, *, target_count=1):
+        """Return ``(statement_timeout_ms, lock_timeout_ms)`` for one attempt.
 
-        Clamping both to the same remaining budget would make them equal on
-        a short final attempt, which is exactly the inversion rejected
-        above -- so the statement budget is derived from the horizon first
-        and the lock budget is then held below it by the margin. If no
-        positive margin remains, there is no attempt worth starting.
+        ``statement_timeout`` covers the complete multi-target statement while
+        ``lock_timeout`` applies to each sequential acquisition. On a shortened
+        final attempt the effective per-target timeout is reduced so the actual
+        budgets still satisfy ``A >= n * L + M``.
         """
+        if type(target_count) is not int or target_count < 1:
+            raise DbPublishError(
+                f'target_count must be a positive integer, got {target_count!r}'
+            )
+
         remaining_ms = int(remaining_seconds * 1000)
         if remaining_ms <= 0:
             return None
 
         statement_ms = min(self.acquisition_timeout_ms, remaining_ms)
-        lock_ms = min(self.lock_timeout_ms, statement_ms - self.TIMEOUT_MARGIN_MS)
+        available_for_waits = statement_ms - self.TIMEOUT_MARGIN_MS
+        if available_for_waits < target_count:
+            return None
+
+        lock_ms = min(self.lock_timeout_ms, available_for_waits // target_count)
         if lock_ms < 1:
             return None
         return statement_ms, lock_ms
@@ -984,14 +1010,13 @@ class DbPublisher:
         self._written_tables = []
         self._pending_swaps = []
         self._resolved_schemas = {}
-        self._declared_targets = set()
+        self._refill_targets = set()
         self._run_token = new_run_token()
         # Final invariant enforcement. The naming rule already makes a
         # collision impossible by construction and preflight already proved
         # it statically; this is what turns 'impossible' into 'enforced'.
         self._generated_names = set()
         self._server_identifier_bytes = None
-        self._lock_policy_warning_emitted = False
         self._committed_tables = []
         self._table_rows = {}
         self._committed = False
@@ -1416,12 +1441,13 @@ class DbPublisher:
         run-owned staging table with the resolved inferred or declared
         schema; the staging table is validated, marked with ownership metadata, and
         committed. The live table stays readable and unlocked until
-        commit() swaps everything at once.
+        commit() publishes every prepared target atomically.
 
         Preparation can afford O(n) work -- it is already O(n) inserting --
         which is why validation lives here rather than in the publication
-        phase, where anything O(rows) would defeat the point of a short
-        transaction.
+        phase. Replacement then remains row-independent catalog work. Explicit
+        refill is the deliberate exception: it performs a second O(rows) write
+        while the live target is locked.
 
         Committing here rather than holding one transaction for the whole
         run is what bounds transaction duration: WAL accumulation, vacuum
@@ -1433,6 +1459,17 @@ class DbPublisher:
         rollback() and docs/decisions/0005.
         """
         self._require_task_lock('publish')
+
+        # DbPayload is mutable because framework columns are appended after
+        # adapter construction. Revalidate here so a direct caller cannot
+        # construct a valid payload and then mutate the strategy into an
+        # unsupported or incoherent value before publication.
+        validate_publication_strategy(
+            payload.publication_strategy,
+            output_schema=payload.output_schema,
+            field_name='publication_strategy',
+            error_type=DbPublishError,
+        )
 
         # Startup cleanup scans exactly one schema -- the publisher's. A
         # payload prepared into a different one would leave an orphan that
@@ -1534,8 +1571,14 @@ class DbPublisher:
         self._table_rows[full_name] = table_result.rows
         target_key = (payload.schema, payload.table_name)
         self._resolved_schemas[target_key] = resolved_schema
-        if resolved_schema.source == 'declared':
-            self._declared_targets.add(target_key)
+        # THE reversal (0.5.1). This was `if resolved_schema.source ==
+        # 'declared'`, which made refill mandatory for every declared
+        # output and the fastest combination -- declared + replace --
+        # unreachable. Schema source and publication strategy are
+        # orthogonal: one says where the shape comes from, the other how
+        # new data replaces old.
+        if payload.publication_strategy == 'refill':
+            self._refill_targets.add(target_key)
         self._pending_swaps.append((payload.schema, payload.table_name, staging_name, len(payload.rows)))
 
     def _verify_prepared_table(self, payload, staging_name, loaded):
@@ -1747,7 +1790,7 @@ class DbPublisher:
                 f'declared publication target {schema}.{table_name} does not match '
                 f'output_schema. The existing table must have the exact same ordered '
                 f'column names, PostgreSQL types and modifiers, nullability, collation, '
-                f'identity, and generated-column metadata as prepared staging table '
+                f'identity, generated-column, and default metadata as prepared staging table '
                 f'{staging_name}. Migrate or recreate the target explicitly before rerunning.'
             )
 
@@ -1803,7 +1846,7 @@ class DbPublisher:
         untouched until every live lock is held.
         """
         conn = self.ensure_connection()
-        if not self._declared_targets:
+        if not self._refill_targets:
             return set()
         if conn.dialect.name != 'postgresql':
             raise DbPublishError(
@@ -1815,7 +1858,7 @@ class DbPublisher:
             self._pending_swaps, key=lambda item: (item[0] or '', item[1])
         ):
             key = (schema, table_name)
-            if key not in self._declared_targets:
+            if key not in self._refill_targets:
                 continue
 
             staging_relation = _find_relation(conn, schema, staging_name)
@@ -1833,7 +1876,7 @@ class DbPublisher:
             target_relation = _find_relation(conn, schema, table_name)
             if target_relation is None:
                 self.log.info(
-                    'creating first declared target %s.%s from %s',
+                    'creating first explicit-refill target %s.%s from %s',
                     schema, table_name, staging_name,
                 )
                 self._create_and_fill_declared_target(
@@ -1866,7 +1909,7 @@ class DbPublisher:
         staging_qualified = _quoted_name(schema, staging_name)
         columns = ', '.join(_quote_identifier(column.name) for column in resolved.columns)
 
-        self.log.info('refilling stable declared target %s from %s', target_qualified, staging_qualified)
+        self.log.info('refilling explicit stable target %s from %s', target_qualified, staging_qualified)
         conn.execute(sa.text(f'truncate table {target_qualified}'))
         conn.execute(sa.text(
             f'insert into {target_qualified} ({columns}) '
@@ -1925,107 +1968,72 @@ class DbPublisher:
             return []
 
         policy = self.publication_lock_policy
-        budgets = policy.attempt_budgets_ms(deadline - time.monotonic())
+        target_count = len(existing)
+        required_ms = (
+            target_count * policy.lock_timeout_ms + policy.TIMEOUT_MARGIN_MS
+        )
+        if policy.acquisition_timeout_ms < required_ms:
+            max_lock_ms = (
+                policy.acquisition_timeout_ms - policy.TIMEOUT_MARGIN_MS
+            ) // target_count
+            if max_lock_ms >= 1:
+                advice = (
+                    f'Lower lock_timeout_ms to at most {max_lock_ms}ms, raise '
+                    'acquisition_timeout_ms deliberately, or split the publication.'
+                )
+            else:
+                advice = (
+                    'No positive lock_timeout_ms fits this target count under the '
+                    'current aggregate budget; publish fewer targets together or '
+                    'raise acquisition_timeout_ms deliberately.'
+                )
+            raise DbPublishError(
+                'publication lock policy cannot preserve retry classification for '
+                f'{target_count} existing target(s): acquisition_timeout_ms must be '
+                f'at least n * lock_timeout_ms + margin = {required_ms}ms '
+                f'({target_count} * {policy.lock_timeout_ms} + '
+                f'{policy.TIMEOUT_MARGIN_MS}), got '
+                f'{policy.acquisition_timeout_ms}ms. Otherwise cumulative waits may '
+                'raise terminal 57014 before an individual wait reaches retryable '
+                f'55P03. {advice}'
+            )
+
+        budgets = policy.attempt_budgets_ms(
+            deadline - time.monotonic(), target_count=target_count,
+        )
         if budgets is None:
             raise DbPublishError(
                 'publication horizon exhausted before its target locks could be '
-                'requested with a usable timeout budget'
+                'requested with a usable timeout budget for multiple targets'
             )
         statement_ms, lock_ms = budgets
 
         conn.execute(sa.text(f'set local lock_timeout = {lock_ms}'))
         conn.execute(sa.text(f'set local statement_timeout = {statement_ms}'))
 
-        # WORST-CASE capacity check, not a contention measurement.
-        #
-        # PostgreSQL acquires the targets in sequence, so covering the case
-        # where every one of them contends needs n x lock_timeout plus
-        # margin. This code knows n -- existing targets -- and cannot know
-        # k, how many will actually contend. Claiming "mis-sized for n
-        # contended targets" would assert something it has not observed,
-        # and would fire on every publication for a task with many
-        # uncontended tables.
-        #
-        # The margin belongs in the requirement, not just in the ordering
-        # invariant: n x lock_timeout exactly equal to the aggregate leaves
-        # nothing for statement execution, lock-manager work or driver
-        # latency. With the defaults that makes the real worst-case
-        # capacity nine targets, not ten.
-        #
-        # Emitted once per run. This method runs on every retry attempt,
-        # and repeating a static configuration warning would bury the
-        # contention messages that actually vary.
-        worst_case_required_ms = (
-            len(existing) * policy.lock_timeout_ms + policy.TIMEOUT_MARGIN_MS
-        )
-        if (
-            policy.acquisition_timeout_ms < worst_case_required_ms
-            and not self._lock_policy_warning_emitted
-        ):
-            self._lock_policy_warning_emitted = True
-            # Integer division, NOT clamped to 1. When the aggregate cannot
-            # accommodate even a 1ms per-conflict wait across n targets, no
-            # positive lock_timeout satisfies n*L + M <= A -- and
-            # recommending 1ms would be recommending something that still
-            # does not fit.
-            recommended_lock_ms = (
-                policy.acquisition_timeout_ms - policy.TIMEOUT_MARGIN_MS
-            ) // len(existing)
-
-            # "may", not "will". Even with every target contended, the
-            # first individual wait can reach lock_timeout and raise
-            # retryable 55P03 before the aggregate is exhausted. What the
-            # inequality establishes is only that the policy cannot RESERVE
-            # the full per-conflict budget for every target, so a sequence
-            # of shorter waits may cumulatively exhaust the aggregate first.
-            advice = (
-                f'lower lock_timeout_ms to about {recommended_lock_ms}ms, '
-                if recommended_lock_ms >= 1 else
-                'no positive lock_timeout_ms can cover this worst case under the '
-                'current aggregate budget, so '
-            )
-            self.log.warning(
-                'publication lock policy cannot reserve the full per-conflict wait '
-                'budget for the worst case in which all %s existing target(s) '
-                'contend sequentially: that needs %sms (%s x lock_timeout_ms=%s + '
-                '%sms margin) but acquisition_timeout_ms is %s. Cumulative waits '
-                'may then exhaust the aggregate and produce terminal 57014 before '
-                'any individual wait reaches lock_timeout_ms and produces retryable '
-                '55P03. Options, in the order to consider them: %spublish fewer '
-                'targets together, accept the terminal failure -- or raise '
-                'acquisition_timeout_ms only as a deliberate decision to accept a '
-                'larger acquisition-phase reader-impact budget. Note that acquired '
-                'locks are held through the swap and commit that follow, so total '
-                'reader blocking exceeds acquisition_timeout_ms by that critical '
-                'section.',
-                len(existing), worst_case_required_ms, len(existing),
-                policy.lock_timeout_ms, policy.TIMEOUT_MARGIN_MS,
-                policy.acquisition_timeout_ms, advice,
-            )
-
         names = ', '.join(_quoted_name(schema, table) for schema, table in existing)
         self.log.info('locking %s publication target(s) for swap', len(existing))
         conn.execute(sa.text(f'lock table {names} in access exclusive mode'))
 
-        # Budgets lifted once the locks are held. The horizon bounds the
-        # WAIT, not the work: verify/plan/swap/comment are catalog
-        # operations measured in milliseconds, and cancelling them halfway
-        # would be strictly worse than letting them finish.
+        # Budgets lifted once the locks are held. The horizon bounds lock
+        # ACQUISITION, not the publication critical section. Replacement is
+        # normally catalog-time work; explicit stable refill includes
+        # TRUNCATE, row-proportional INSERT, index/constraint maintenance and
+        # commit, so its post-acquisition duration is not bounded here.
         conn.execute(sa.text('set local lock_timeout = 0'))
         conn.execute(sa.text('set local statement_timeout = 0'))
         return existing
 
     def commit(self):
-        """The publication phase: one short transaction that verifies the
-        prepared artifacts, performs the queued source-state write, swaps
-        every staging table into place, and commits.
+        """Publish every prepared target and queued source-state change atomically.
 
-        The source-state write goes BEFORE the swaps deliberately. It
-        touches a different table entirely, and the swaps are what take
-        ACCESS EXCLUSIVE -- so doing it first keeps it out of the exclusive
-        window without changing atomicity at all, since both are in the
-        same transaction either way. Comments must follow the swaps,
-        because they are set on the renamed relations.
+        Replacement targets use the short DROP/RENAME path. Explicit refill
+        targets preserve their ordinary-table identity with TRUNCATE plus a
+        second row write, so this transaction is not necessarily short.
+
+        Source-state work and refill preflight run before the first live-target
+        lock. Publication comments follow each replacement or refill because
+        they belong to the final live relation.
         """
         # Queued work counts. A publication plan holding only the
         # source-state update writes to the database just as a swap does,
@@ -2135,11 +2143,12 @@ class DbPublisher:
 
         self._verify_prepared_artifacts()
 
-        # Declared targets are checked before any live lock. Absent targets
-        # are created and completely filled inside this transaction while
-        # still invisible to other sessions. Existing targets are only
-        # validated here; their rows remain untouched until all locks exist.
-        created_declared_targets = self._prepare_declared_targets_before_lock()
+        # Only explicit-refill targets need stable-target preflight. Absent
+        # refill targets are created and completely filled inside this
+        # transaction while still invisible to other sessions. Existing refill
+        # targets are only validated here; their rows remain untouched until
+        # all locks exist. Replacement targets need no compatibility preflight.
+        created_refill_targets = self._prepare_declared_targets_before_lock()
 
         if len(self.publication_plan):
             self.publication_plan.run(self.log)
@@ -2155,11 +2164,11 @@ class DbPublisher:
         #
         # Atomicity is unchanged: a 55P03 here still rolls back the
         # source-state write with everything else and the whole attempt is
-        # retried. The exclusive window now contains only swaps and
-        # comments.
-        if created_declared_targets:
+        # retried. The exclusive window now contains replacement catalog work
+        # and any explicitly selected row-dependent refills.
+        if created_refill_targets:
             self._lock_publication_targets(
-                deadline, exclude_targets=created_declared_targets,
+                deadline, exclude_targets=created_refill_targets,
             )
         else:
             self._lock_publication_targets(deadline)
@@ -2176,8 +2185,8 @@ class DbPublisher:
             staging_qualified = _quoted_name(schema, staging_name)
 
             key = (schema, table_name)
-            if key in self._declared_targets:
-                if key not in created_declared_targets:
+            if key in self._refill_targets:
+                if key not in created_refill_targets:
                     self._refill_declared_target(
                         schema=schema, table_name=table_name,
                         staging_name=staging_name, rows=rows,
@@ -2205,7 +2214,7 @@ class DbPublisher:
         self._commit_transaction()
         self._pending_swaps = []
         self._resolved_schemas = {}
-        self._declared_targets = set()
+        self._refill_targets = set()
         self.publication_plan.clear()
 
         self._committed = True
@@ -2230,7 +2239,7 @@ class DbPublisher:
         """
         self._pending_swaps = []
         self._resolved_schemas = {}
-        self._declared_targets = set()
+        self._refill_targets = set()
         self.publication_plan.clear()
         self._committed = False
         self._committed_tables = []

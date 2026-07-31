@@ -1,6 +1,6 @@
 # 0005 — Prepare staging tables outside the publication transaction
 
-Status: accepted
+Status: accepted; publication-duration wording amended by 0009 and 0012
 
 ## Problem
 
@@ -22,8 +22,9 @@ visible symptom. It did not shorten the transaction.
 
 ## Decision
 
-Split the run into many committed preparation transactions and one short
-publication transaction.
+Split the run into many committed preparation transactions and one atomic
+publication transaction. That final transaction is normally short for
+replacement; explicit stable refill is the deliberate row-dependent exception.
 
 ```
 for each pipeline:
@@ -36,7 +37,7 @@ for each pipeline:
 BEGIN
   verify every prepared artifact
   perform queued work (source state)
-  swap every staging table into place
+  publish every staging table by replacement or explicit refill
   replace staging comments with provenance
 COMMIT
 ```
@@ -48,9 +49,12 @@ staging table is incomplete.
 
 ## Why the split lands where it does
 
-Preparation can afford O(n) work: it is already O(n) inserting. Publication
-must be O(number of tables) or the short transaction is not short. Every
-check sits on the side of that line where it can be paid for.
+Preparation can afford O(rows) work: it is already loading the dataset. For
+replacement, publication remains O(number of tables), which is what keeps the
+transaction short. Explicit refill deliberately performs a second O(rows)
+write after locking; ADR 0009 documents that trade and ADR 0012 makes it
+opt-in rather than a consequence of declaration. Every validation check still
+sits before the first live-target lock where possible.
 
 Preparation verifies exact ordered column names, and that the number of
 rows loaded equals the number in the payload. Publication verifies only

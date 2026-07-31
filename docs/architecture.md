@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.5.0. This describes the present system, not
+How `task_core` works as of 0.5.1. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -271,11 +271,11 @@ order, appends enabled framework-owned columns, and produces the same internal
 `ResolvedSchema` used by inference. The timestamp column configured by
 `db_updated_at` is therefore not repeated in `output_schema`.
 
-Inferred targets keep the staged `DROP`/`RENAME` replacement path. Declared
-targets are stable ordinary tables: the first publication creates and fills the
-target atomically; later publications verify exact catalog compatibility, lock
-the existing target, `TRUNCATE` it and refill it from staging. All new-target
-creation, compatibility checks and source-state work complete before the first
+Schema source and publication strategy are independent. Both inferred and
+declared outputs use staged `DROP`/`RENAME` replacement by default. A declared
+payload may explicitly request stable refill; only that path verifies exact
+catalog compatibility and later uses `TRUNCATE` plus `INSERT FROM` staging.
+All source-state work and all refill preflight complete before the first
 live-target lock.
 
 The first 5000 rows are sampled; if the sampled
@@ -296,12 +296,13 @@ staging table from the resolved inferred or declared schema, loads it, verifies
 it, attaches ownership metadata, and commits. The live table is untouched.
 
 `commit()` is the publication phase. It verifies every prepared artifact,
-preflights declared targets, creates and fills absent declared targets, runs
-queued source-state work, then locks all existing targets in deterministic
-sorted order. Inferred targets are replaced by `DROP`/`RENAME`; existing
-declared targets keep their identity and are refreshed by `TRUNCATE` plus
-`INSERT FROM` staging. Comments are replaced with framework provenance and the
-whole multi-table publication commits atomically.
+preflights only targets explicitly configured for refill, creates and fills an
+absent refill target when necessary, runs queued source-state work, then locks
+all existing targets in deterministic sorted order. Replacement targets,
+inferred or declared, use `DROP`/`RENAME`; explicit refill targets retain their
+identity and use `TRUNCATE` plus `INSERT FROM` staging. Comments are replaced
+with framework provenance and the whole multi-table publication commits
+atomically.
 
 Staging names are
 `<shortened readable prefix>__stg_<target_token>_<run_token>`. Only the
@@ -344,8 +345,9 @@ See [decisions/0010](decisions/0010-require-portable-database-identifiers.md).
 ## Transactions
 
 Many committed preparation transactions, then one atomic publication
-transaction. The final transaction is normally short for inferred swaps, but a
-declared stable-target refill remains open while rows and indexes are rebuilt. See
+transaction. The final transaction is normally short for replacement,
+regardless of schema source. An explicit stable refill remains open while rows,
+indexes and database-side constraints are rebuilt. See
 [decisions/0005](decisions/0005-prepare-staging-outside-the-publication-transaction.md)
 for why, and what it costs.
 
@@ -365,11 +367,12 @@ for each pipeline with a DB target:
 
 BEGIN                      <- the atomic publication transaction
   verify every prepared artifact still exists and is still ours
-  validate existing declared targets; create/fill absent declared targets
+  validate existing explicit-refill targets; create/fill absent refill targets
   run queued work (the source-state write)
+  enforce A >= n * L + M for the actual existing lock set
   lock all existing targets in deterministic sorted order
-  inferred: DROP live target, RENAME staging into place
-  declared: TRUNCATE stable target, refill from staging, DROP staging
+  replace: DROP live target, RENAME staging into place
+  refill: TRUNCATE stable target, refill from staging, DROP staging
   replace comments with provenance
 COMMIT
 
@@ -383,23 +386,25 @@ or one whose first DB output came late, was the whole run. `no transaction
 spans the run` only holds because the store closes its own phase.
 
 **Lock bounding.** All targets are locked in one sorted statement under a
-bounded wait before anything is swapped, and the whole publication is
-retried on lock unavailability within a wall-clock horizon. Without it, a
-publisher waiting on one long reader blocks every reader arriving
-afterwards. See
+bounded wait before anything is published. For the actual existing lock set,
+the publisher enforces `acquisition_timeout_ms >= n * lock_timeout_ms + M`;
+otherwise cumulative per-target waits could surface as terminal `57014` rather
+than retryable `55P03`. The whole publication is retried on lock unavailability
+within a wall-clock horizon. Without it, a publisher waiting on one long reader
+blocks every reader arriving afterwards. See
 [decisions/0008](decisions/0008-bound-the-publication-lock-wait.md).
 
-**Atomicity.** Publication is all-or-nothing: every inferred swap,
-declared refill and source-state write land in one transaction, so a failed publication does
+**Atomicity.** Publication is all-or-nothing: every replacement, explicit
+refill and source-state write lands in one transaction, so a failed publication does
 not advance the stored fingerprints and a retry sees the same sources as
 changed. Preparation is deliberately *not* part of that guarantee — a
 prepared staging table is committed and visible, and is cleaned up rather
 than rolled back.
 
-**Duration.** No transaction now spans the run. Each preparation
-transaction is bounded by one table's load; the publication transaction is
-bounded by the number of tables, not their size. Live tables are locked
-only for the swap.
+**Duration.** No transaction spans the run. Each preparation transaction
+is bounded by one table's load. Replacement publication is normally
+row-independent catalog work; explicit refill is row- and index-dependent and
+holds the live-table lock for that full critical section.
 
 **Concurrency.** A session-scoped advisory lock, claimed before
 fingerprinting, means two runs of the same task cannot overlap — the

@@ -12,6 +12,66 @@ chronologically rather than by release.
 ## Unreleased
 
 
+## 0.5.1
+
+### Added
+- **`PipelineSpec.db_publication_strategy`** — `'replace'` (the default
+  for both schema sources) or `'refill'`. Publication strategy and schema
+  source are now independent: one says where the table's shape comes
+  from, the other how new data replaces old.
+
+### Changed
+- **Declaring `output_schema` no longer forces refill.** It selected both
+  at once, which made the fastest combination — declared + replace —
+  unreachable: one database write instead of two, and a catalog-time lock
+  instead of one proportional to row count. It also meant a
+  reader-blocking window scaled to row count was imposed by a schema
+  preference that has nothing to do with reader impact, and that an
+  edited declaration could not take effect without manual migration.
+
+  A declared output now publishes by replace unless it asks for refill.
+  **Views fail loudly** — `DROP` errors on dependents — but grants,
+  ownership and triggers are lost silently, so any declared target with
+  dependencies attached needs `db_publication_strategy='refill'`.
+  Nothing in this repository used `output_schema`.
+
+- `refill` requires `output_schema` and is rejected at spec construction
+  without it. Refill truncates and inserts into the existing table, so the
+  target's physical schema must be stable across runs; an inferred schema
+  changes whenever the data does. Rejecting the combination keeps it
+  unrepresentable rather than turning it into a job that works until a
+  column widens.
+
+### Fixed
+- Preserved the complete 0.5.0 positional meaning of `PipelineSpec` by
+  appending `db_publication_strategy` after `output_schema`. Keyword arguments
+  remain the recommended form.
+- Applied publication-strategy validation to direct `DbPayload`, `from_petl()`
+  and `from_pandas()` callers, and revalidated mutable payloads at `publish()`.
+  Unknown strategies no longer fall through to replacement, and inferred
+  refill is rejected at every boundary.
+- Enforced `acquisition_timeout_ms >= n * lock_timeout_ms + margin_ms` for the
+  actual existing target set before `LOCK TABLE`. A multi-target policy can no
+  longer turn ordinary contention into terminal `57014` merely because
+  cumulative waits exhaust the aggregate statement timeout.
+- Included column-default presence (`pg_attribute.atthasdef`) in exact refill
+  compatibility. Defaults are not declared in this release, so a target
+  default is rejected instead of silently ignored.
+- Updated README, architecture, task-authoring guidance and ADR 0011 to treat
+  schema source, loader and publication strategy as separate concerns.
+
+### Migration
+- Review every running script containing `output_schema=`. Add
+  `db_publication_strategy='refill'` only where the ordinary table object and
+  attached views, grants, indexes, ownership, triggers or RLS must survive.
+  See `docs/migrating-to-0.5.1.md`.
+
+### Notes
+- `partition` is deliberately absent from the strategy vocabulary rather
+  than reserved and rejected. It is added when it is built.
+- See `docs/decisions/0012`, which amends `0009`.
+
+
 ## 0.5.0
 
 Adds a second database schema contract while preserving inferred publication

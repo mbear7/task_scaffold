@@ -157,8 +157,15 @@ nullable by default. Enabled framework-owned columns are appended afterward:
 timestamp column is always `TIMESTAMPTZ NOT NULL` and is not repeated in
 `output_schema`. Missing or unexpected user columns, incompatible values and
 `NULL` in a column declared with `nullable=False` fail during staging
-preparation before the live target is changed. Existing declared targets keep
-their table identity and are refreshed transactionally.
+preparation before the live target is changed. Schema source does not select
+publication strategy: both inferred and declared outputs use replacement by
+default. A declared pipeline may explicitly request stable refill with
+`db_publication_strategy='refill'` when preserving the ordinary table object
+and its attached database objects is worth the extra write and longer lock.
+
+
+Existing 0.5.0 scripts using `output_schema` should read the concise
+[0.5.1 migration note](docs/migrating-to-0.5.1.md).
 
 
 ## Limitations
@@ -172,18 +179,18 @@ are to matter. Each is expanded in
   files may disagree with the database. Nothing downstream may read them
   programmatically; if something needs the data, it reads the published
   table.
-- **Inferred outputs replace the table on every run.** Their schema may
-  change with the data; grants are not preserved, and dependent views make
-  publication fail. Fully declared outputs instead keep a stable ordinary
-  table and use transactional `TRUNCATE` plus refill, preserving table-bound
-  objects but blocking readers for the complete refill critical section.
-- **Publication is atomic; preparation is not.** Each DB target is
-  prepared in its own committed transaction, followed by one atomic
-  publication transaction. Inferred swaps are short; declared stable-target
-  refills may be materially longer because the target stays locked through
-  `TRUNCATE`, refill and commit. No transaction spans the run — but a failed
-  run leaves committed staging tables, which the next run of the same task
-  removes.
+- **Replacement is the default for both schema sources.** It performs one
+  database write and a short `DROP`/`RENAME` publication, but grants, indexes,
+  ownership and triggers do not survive; dependent views make `DROP` fail.
+  Explicit declared `refill` preserves the ordinary table object and attached
+  objects, but writes every row twice and blocks readers through `TRUNCATE`,
+  refill, index/constraint maintenance and commit.
+- **Publication is atomic; preparation is not.** Each DB target is prepared
+  in its own committed transaction, followed by one atomic publication
+  transaction. Replacement publication is normally short; explicit stable
+  refill may be materially longer and row-dependent. No transaction spans the
+  run, but a failed run can leave committed staging tables for positively
+  scoped cleanup.
 - **Schema, table and column names published to PostgreSQL must be
   lower-case portable identifiers** matching `^[a-z_][a-z0-9_]*$`.
 - **`task_core.types` shadows the standard library `types` module** inside
@@ -191,5 +198,5 @@ are to matter. Each is expanded in
 - **`requirements.txt` is unpinned**, and this codebase is sensitive to
   pandas missing-value semantics.
 - **`creds` is required only when the run actually uses PostgreSQL** —
-  a declared `db_table` or enabled source tracking. `output_db=True`
-  alone does not require it.
+  `output_db=True` with at least one executed pipeline declaring `db_table`,
+  or enabled source tracking. `output_db=True` alone does not require it.

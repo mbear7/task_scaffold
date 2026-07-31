@@ -100,6 +100,7 @@ def _build_db_payload_with_spec(task_cls, tbl, spec, pg_schema, *, run_started_a
         db_contract=db_contract,
         not_null_columns=spec.db_not_null_columns,
         output_schema=spec.output_schema,
+        publication_strategy=spec.db_publication_strategy or 'replace',
         db_table_id_pix=spec.db_table_id_pix,
     )
     apply_db_updated_at(payload, spec, run_started_at)

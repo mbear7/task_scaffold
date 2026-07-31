@@ -1,6 +1,6 @@
 # 0001 — Replace published tables instead of truncating them
 
-Status: accepted for inferred outputs; superseded for declared outputs by [0009](0009-add-fully-declared-output-schemas.md)
+Status: accepted as the default for both schema sources; explicit declared refill is the opt-in exception from [0009](0009-add-fully-declared-output-schemas.md), separated by [0012](0012-separate-publication-strategy-from-schema-source.md)
 
 ## Problem
 
@@ -11,8 +11,14 @@ staging plus swap).
 
 ## Decision
 
-Replace the table. Column types are inferred from the data on every run,
-and the new table is created with whatever schema that inference produced.
+Replace the table by default. The prepared staging table already has the
+resolved schema: inferred from data when `output_schema` is absent, or built
+from the declaration when it is supplied. Publication drops the old relation
+and renames staging into place.
+
+A declared pipeline may explicitly choose stable refill when preserving the
+ordinary table object is worth the second write and row-dependent lock window.
+That exception does not change replacement as the default.
 
 ## Why
 
@@ -23,9 +29,12 @@ telling deliberate schema evolution apart from accidental drift. For a
 scaffold whose purpose is to remove repeated work from reporting tasks,
 that is the wrong burden in the wrong place.
 
-Replacement makes schema evolution automatic and invisible. A column that
-gains its first decimal value becomes `numeric` without anyone doing
-anything.
+For inferred outputs, replacement makes schema evolution automatic and
+invisible. A column that gains its first decimal value becomes `numeric`
+without anyone doing anything. For declared outputs, replacement makes the
+current declaration authoritative without requiring an in-place migration.
+In both cases it writes the dataset once and keeps the locked publication work
+to catalog operations.
 
 ## Consequences
 
@@ -33,12 +42,12 @@ anything.
   `ALTER DEFAULT PRIVILEGES` on the schema is the answer, and it is
   configuration rather than code.
 - **Dependent views break the publish.** `DROP TABLE` fails when a view
-  depends on the table, and `CASCADE` would destroy the view. Views and
-  freely-evolving schemas are mutually exclusive; this is a property of
-  the decision, not a defect in it.
-- **Column types are data-dependent.** A table's schema can differ between
-  runs. For any table with downstream consumers, pin types with
-  `db_type_overrides`. Inference is a convenience for exploratory tables.
+  depends on the table, and `CASCADE` would destroy the view. Views and replacement publication are mutually exclusive unless an
+  indirection or another explicit publication strategy is used; this is a
+  property of the decision, not a defect in it.
+- **Inferred column types are data-dependent.** An inferred table's schema can
+  differ between runs. For downstream consumers, pin selected types with
+  `db_type_overrides` or declare the complete user schema with `output_schema`.
 - **Type inference must be right**, because nothing downstream will catch
   it being wrong. Sampling the first 5000 rows was not sufficient: a
   column whose sample is all integers and whose later rows contain a
@@ -48,9 +57,10 @@ anything.
 
 ## Rejected
 
-**`TRUNCATE` + `INSERT`** — requires schema compatibility, which is the
-burden this decision exists to avoid. It would preserve grants and views,
-which is genuinely valuable, but not at that price.
+**`TRUNCATE` + `INSERT` as the default** — requires schema compatibility and
+writes every row a second time while the live table is locked. Explicit
+declared refill retains it only for targets whose stable ordinary-table
+identity and attached objects justify that price.
 
 **Direct `DROP` + `CREATE` inside the pipeline loop** — how this worked
 originally. Correct, but it took an `ACCESS EXCLUSIVE` lock on the live
