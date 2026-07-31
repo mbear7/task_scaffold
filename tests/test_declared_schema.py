@@ -246,7 +246,15 @@ class Test2ResolvedSchemaAndValidation(unittest.TestCase):
         _resolve_payload_schema(payload, sample_size=5000)
 
     def test_unsupported_numeric_shape_is_rejected_at_schema_resolution(self):
-        for type_obj in (sa.Numeric(0, 0), sa.Numeric(2, 3), sa.Numeric(4, -1)):
+        for type_obj in (
+            sa.Numeric(0, 0),
+            sa.Numeric(2, 3),
+            sa.Numeric(4, -1),
+            sa.Numeric(1001, 2),
+            sa.Numeric(scale=2),
+            sa.Numeric(18.0, 2),
+            sa.Numeric(18, 2.0),
+        ):
             with self.subTest(type=type_obj):
                 payload = DbPayload(
                     'target', 'bsr', ['amount'], [{'amount': Decimal('1')}],
@@ -254,6 +262,67 @@ class Test2ResolvedSchemaAndValidation(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(DbPublishError, 'NUMERIC'):
                     _resolve_payload_schema(payload, sample_size=5000)
+
+    def test_postgresql_numeric_maximum_shape_is_supported(self):
+        payload = DbPayload(
+            'target', 'bsr', ['amount'], [{'amount': Decimal('0')}],
+            output_schema=(tc.OutputColumn('amount', sa.Numeric(1000, 1000)),),
+        )
+        _resolve_payload_schema(payload, sample_size=5000)
+
+    def test_unsupported_float_precision_is_rejected_at_schema_resolution(self):
+        for type_obj in (sa.Float(0), sa.Float(54), sa.Float(1.5), sa.Float(True)):
+            with self.subTest(type=type_obj):
+                payload = DbPayload(
+                    'target', 'bsr', ['value'], [{'value': 1.0}],
+                    output_schema=(tc.OutputColumn('value', type_obj),),
+                )
+                with self.assertRaisesRegex(DbPublishError, 'FLOAT precision'):
+                    _resolve_payload_schema(payload, sample_size=5000)
+
+    def test_postgresql_float_precision_boundaries_are_supported(self):
+        for type_obj in (sa.Float(1), sa.Float(53)):
+            with self.subTest(type=type_obj):
+                payload = DbPayload(
+                    'target', 'bsr', ['value'], [{'value': 1.0}],
+                    output_schema=(tc.OutputColumn('value', type_obj),),
+                )
+                _resolve_payload_schema(payload, sample_size=5000)
+
+    def test_unsupported_string_shapes_are_rejected_at_schema_resolution(self):
+        for type_obj in (
+            sa.String(0),
+            sa.String(-1),
+            sa.String(1.5),
+            sa.String(True),
+            sa.String(10, collation='C'),
+        ):
+            with self.subTest(type=type_obj):
+                payload = DbPayload(
+                    'target', 'bsr', ['value'], [{'value': 'x'}],
+                    output_schema=(tc.OutputColumn('value', type_obj),),
+                )
+                with self.assertRaisesRegex(DbPublishError, 'VARCHAR|collation'):
+                    _resolve_payload_schema(payload, sample_size=5000)
+
+    def test_bounded_large_binary_is_rejected_because_postgresql_ignores_length(self):
+        payload = DbPayload(
+            'target', 'bsr', ['value'], [{'value': b'x'}],
+            output_schema=(tc.OutputColumn('value', sa.LargeBinary(5)),),
+        )
+        with self.assertRaisesRegex(DbPublishError, 'LargeBinary'):
+            _resolve_payload_schema(payload, sample_size=5000)
+
+    def test_nul_character_in_declared_text_is_rejected_contextually(self):
+        payload = DbPayload(
+            'target', 'bsr', ['value'], [{'value': 'before\x00after'}],
+            output_schema=(tc.OutputColumn('value', sa.Text()),),
+        )
+        with self.assertRaisesRegex(
+            DbPublishError,
+            r"'target': output row 1 column 'value'.*NUL character",
+        ):
+            _resolve_payload_schema(payload, sample_size=5000)
 
     def test_deferred_string_like_types_are_rejected(self):
         for type_obj in (sa.Enum('a', 'b', name='status_enum'), sa.CHAR(5)):

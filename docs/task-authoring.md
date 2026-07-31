@@ -219,10 +219,24 @@ Declared validation performs no implicit parsing or lossy conversion. In
 particular, `float` is not converted to `NUMERIC`, `datetime` is not converted
 to `DATE`, and strings are not parsed into typed values. Python `Decimal` is
 supported for `NUMERIC` when precision and scale fit without rounding.
-Fixed-length `CHAR`, enums and other PostgreSQL-specific type families are not
-part of the initial declared-schema contract. Naive
-datetimes are required for `timestamp without time zone`; timezone-aware
-datetimes are required for `timestamp with time zone`.
+
+Declared type parameters must survive PostgreSQL rendering exactly:
+
+- `Float()` is unconstrained; `Float(p)` requires integer `1 <= p <= 53`;
+- `String()` is unbounded; `String(n)` requires a positive integer length;
+- `Numeric()` is unconstrained; constrained `Numeric(p[, s])` requires integer
+  `1 <= p <= 1000` and the supported subset `0 <= s <= p`;
+- `Numeric(scale=s)` without precision is rejected because PostgreSQL receives
+  unconstrained `NUMERIC` and silently loses the requested scale;
+- bounded `LargeBinary(n)` and text collations are not supported because the
+  current declared/refill contract does not preserve or compare those shapes.
+
+Text containing NUL (`\x00`) is rejected during staging validation with a
+contextual `DbPublishError`; PostgreSQL text cannot store it. Fixed-length
+`CHAR`, enums and other PostgreSQL-specific type families are not part of the
+initial declared-schema contract. Naive datetimes are required for `timestamp
+without time zone`; timezone-aware datetimes are required for `timestamp with
+time zone`.
 
 `output_schema` cannot be combined with `db_output`, `db_type_overrides`,
 `db_not_null_columns`, or `get_dynamic_db_contract()`. The dynamic hook conflict

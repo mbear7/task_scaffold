@@ -2,7 +2,7 @@
 
 Status: proposed
 
-Not implemented in 0.5.1.
+Not implemented in 0.5.2.
 
 Amended before implementation by ADR 0012: schema source and publication
 strategy are independent. COPY changes staging transport only and must work
@@ -10,7 +10,7 @@ with every legal schema/publication combination.
 
 ## Problem
 
-`task_core` 0.5.1 prepares PostgreSQL staging tables through chunked
+`task_core` 0.5.2 prepares PostgreSQL staging tables through chunked
 SQLAlchemy inserts. The path is proven and remains the compatibility baseline,
 but it has two costs that become dominant for large or wide outputs:
 
@@ -23,7 +23,7 @@ the `O(rows)` Python object graph or the per-row binding work.
 
 PostgreSQL provides `COPY FROM STDIN` for bulk ingestion. Adding it is useful
 only if it changes the staging transport without weakening the guarantees that
-already exist in 0.5.1:
+already exist in 0.5.2:
 
 - one session-scoped task advisory lock;
 - ordinary logged staging tables;
@@ -52,9 +52,9 @@ provide an end-to-end bounded-memory path.
 COPY therefore requires a small lifecycle change above the transport layer as
 well as a responsibility-based module split below it.
 
-## Current 0.5.1 baseline
+## Current 0.5.2 baseline
 
-The decision is based on the actual 0.5.1 scaffold, not the earlier coupled
+The decision is based on the actual 0.5.2 scaffold, not the earlier coupled
 schema/publication design.
 
 ### Two schema sources, one resolved representation
@@ -110,7 +110,7 @@ publication strategy remain separate, subject to the legal matrix from ADR
 0012: inferred supports replacement only; declared supports replacement or
 explicit refill.
 
-The 0.5.1 external acceptance campaigns have now verified this separation on
+The accepted 0.5.1 external acceptance campaigns verified this separation on
 PostgreSQL 16.11. The live-server campaign passed all 9 cases, including
 declared replacement, explicit refill, mixed replace/refill rollback, exact
 default-metadata rejection and hard multi-target timeout enforcement. The VPS
@@ -194,7 +194,7 @@ declared + insert/copy + explicit refill
 
 `db_output` remains inferred-mode only. `output_schema`,
 `db_not_null_columns`, `db_type_overrides`, static `db_contract` and the
-framework-owned timestamp configured by `db_updated_at` keep their 0.5.1
+framework-owned timestamp configured by `db_updated_at` keep their 0.5.2
 meanings. `True` uses `etl_updated_at`; a string supplies a custom portable
 lower-case name.
 
@@ -206,7 +206,7 @@ separate replayability contract rather than an undocumented convention.
 
 ## Public configuration
 
-`db_loader` is appended after every field that exists in `PipelineSpec` 0.5.1
+`db_loader` is appended after every field that exists in `PipelineSpec` 0.5.2
 so existing positional construction retains its meaning. New code should
 continue to use keyword arguments.
 
@@ -354,7 +354,7 @@ class DbPayload:
     schema: str
     columns: list[str]
     rows: list[dict[str, Any]] | None
-    ...                         # every 0.5.1 field, unchanged
+    ...                         # every 0.5.2 field, unchanged
     loader: str = "insert"
     row_source: DbRowSource | None = None
 ```
@@ -467,7 +467,7 @@ It owns the behavior currently concentrated in `db_publish.py`:
 - framework-column integration;
 - shared compatibility rules used before either transport.
 
-It must preserve the 0.5.1 meanings of:
+It must preserve the 0.5.2 meanings of:
 
 - scalar NaN and `NaT` normalizing to SQL `NULL`;
 - containers not being collapsed into scalar `NULL`;
@@ -500,7 +500,7 @@ not changed merely to make COPY easier.
 - insert-specific errors.
 
 Its initial extraction is mechanical. Chunking, SQL shape, row counts and
-failure semantics remain equivalent to 0.5.1.
+failure semantics remain equivalent to 0.5.2.
 
 It does not create or finish transactions, create tables, manage locks, attach
 comments or publish targets.
@@ -718,7 +718,7 @@ missing value fails before the database transaction opens.
 
 ## Declared-schema COPY
 
-Declared COPY uses the exact 0.5.1 schema contract:
+Declared COPY uses the exact 0.5.2 schema contract:
 
 - `output_schema` is the sole complete user schema;
 - produced and declared column sets must match exactly;
@@ -832,7 +832,7 @@ No ready flag or registry table is introduced.
 A prepared staging table does not record or require its loading transport for
 publication correctness.
 
-After preparation commits, the existing 0.5.1 state machine remains:
+After preparation commits, the existing 0.5.2 state machine remains:
 
 ```text
 verify every owned staging artifact
@@ -1039,7 +1039,7 @@ No loader selection or insert behavior change is introduced.
 
 ### Phase 3 - add configuration and row-source representation
 
-Add `PipelineSpec.db_loader` after all 0.5.1 fields, payload validation and the
+Add `PipelineSpec.db_loader` after all 0.5.2 fields, payload validation and the
 one-shot row-source adapters.
 
 Insert remains the default and current tasks remain unchanged.
@@ -1085,11 +1085,12 @@ Run the complete unit suite and both live PostgreSQL campaigns before release.
 
 ### Baseline regression
 
-The accepted local 0.5.1 baseline must remain green:
+The 0.5.2 INSERT baseline must remain green:
 
-- 464 automated tests;
-- the external 0.5.1 real-server publication-strategy campaign;
-- the external 0.5.1 VPS explicit-refill concurrency and recovery campaign.
+- 470 automated tests;
+- the accepted 0.5.1 real-server publication-strategy campaign;
+- the accepted 0.5.1 VPS explicit-refill concurrency and recovery campaign;
+- the 0.5.2 VPS declared-types campaign.
 
 The exact count may grow during implementation; the requirement is no lost
 coverage or weakened assertion.
@@ -1111,7 +1112,7 @@ Required coverage:
 
 - omitted `db_loader` resolves to insert;
 - invalid values fail during structural validation;
-- old positional `PipelineSpec` construction retains 0.5.1 meanings;
+- old positional `PipelineSpec` construction retains 0.5.2 meanings;
 - direct payload callers cannot bypass loader validation;
 - COPY plus `get_dynamic_db_contract()` fails during structural validation;
 - static `db_contract` remains supported in both schema modes;
@@ -1424,23 +1425,24 @@ for small outputs.
 
 No COPY implementation exists yet.
 
-`task_core` 0.5.1 is the accepted implementation baseline for this ADR:
+The local `task_core` 0.5.2 candidate passes 470 automated tests. It tightens
+the INSERT-path declared type contract so SQLAlchemy type parameters cannot be
+silently erased during PostgreSQL rendering, and normalizes PostgreSQL-invalid
+NUL text into contextual framework rejection.
 
-- the complete automated suite passes: 464 tests;
-- the PostgreSQL 16.11 live-server publication-strategy campaign passes: 9/9;
-- the PostgreSQL 16.11 VPS concurrency and recovery campaign passes: 10/10;
+The accepted 0.5.1 PostgreSQL evidence remains applicable to publication
+mechanics because 0.5.2 does not change strategy selection, locking, refill,
+rollback or cleanup:
+
+- the PostgreSQL 16.11 live-server publication-strategy campaign passed 9/9;
+- the PostgreSQL 16.11 VPS concurrency and recovery campaign passed 10/10;
 - both campaigns completed with no owned staging artifacts left behind.
 
-The live-server campaign verified direct strategy validation, declared
-replacement and OID change, explicit refill and dependent-object preservation,
-exact target-default rejection, hard `A >= n * L + M` enforcement and mixed
-replace/refill atomic rollback.
-
-The VPS campaign verified `55P03` retry, stable OID, observable reader blocking,
-backend-termination rollback and successor cleanup. Its 50,000-row refill
-measurement was 4.433 seconds to commit with 2.415 seconds of concurrent reader
-blocking. These values document the baseline behavior of explicit refill; they
-are not performance targets for COPY.
+Before 0.5.2 becomes the accepted INSERT reference baseline for COPY, the
+external 0.5.2 VPS declared-types campaign must pass its full round-trip,
+replacement, refill, catalog and rejection matrix. The campaign specifically
+requires ambiguous type shapes and NUL text to fail as `DbPublishError` before
+any live target is created or changed.
 
 ADR 0011 is complete as a decision only when the implementation demonstrates:
 
