@@ -1845,6 +1845,16 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         # explanation the payload boundary exists to deliver. Mirrors
         # test_mutated_payload_strategy_is_revalidated_at_publish_boundary
         # in test_declared_schema.py for the same reason.
+        #
+        # Also asserts that no staging DDL runs when validation fails --
+        # ADR 0011 §Preparation flows step 2 requires loader/payload
+        # validation before source execution or staging DDL. A prior
+        # arrangement of publish() ran CREATE TABLE first and then rejected
+        # the loader; the earlier version of this test satisfied itself
+        # with the exception type + message and would have passed either
+        # way. Revert-observe-restore ritual: moving validate_db_loader
+        # back down to after staging_table.create() must make this test
+        # fail on the no-DDL assertion, not on the exception assertion.
         import petl as etl
         from task_core.db_publish import from_petl
         payload = from_petl(
@@ -1858,11 +1868,24 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         publisher._engine = object()
         publisher.begin_run()
 
+        before_publish = len(conn.statements)
         with self.assertRaises(DbPublishError) as caught:
             publisher.publish(payload)
         message = str(caught.exception)
         self.assertIn('not implemented', message)
         self.assertIn('0011', message)
+
+        added = conn.statements[before_publish:]
+        offending = [s for s in added if 'create table' in s.lower()]
+        self.assertEqual(
+            offending, [],
+            'staging DDL ran before db_loader validation rejected the payload; '
+            f'ADR 0011 requires the reverse order. Statements added by publish(): {added!r}',
+        )
+        self.assertIsNone(
+            publisher._tx,
+            'publish() opened a transaction before db_loader validation rejected the payload',
+        )
 
     def test_publication_dispatches_through_the_loaders_registry(self):
         """The registry only earns its keep if publish() actually reaches

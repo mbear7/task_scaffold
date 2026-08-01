@@ -1045,8 +1045,34 @@ No loader selection or insert behavior change is introduced.
 
 ### Phase 3 - add configuration and row-source representation
 
-Add `PipelineSpec.db_loader` after all 0.5.2 fields, payload validation and the
-one-shot row-source adapters.
+Amended after 0.6.0 shipped the first half only. What was originally one phase
+is now recorded as two, so the shipped state matches the plan on record. The
+original phase text is preserved above the split for the same reason other
+`docs/decisions/` files keep advice that turned out to be partial or backwards:
+the record of what was planned is what makes the divergence legible later.
+
+Originally:
+
+> Add `PipelineSpec.db_loader` after all 0.5.2 fields, payload validation and
+> the one-shot row-source adapters. Insert remains the default and current
+> tasks remain unchanged.
+
+Split into:
+
+**Phase 3a - configuration surface.** `PipelineSpec.db_loader`,
+`DbPayload.db_loader`, the `LOADERS` dispatch registry with 'insert' as its
+sole entry, boundary validation at both spec and payload, and the drift check
+that fails at import if `DB_LOADERS` names a value with no registry entry.
+Shipped in 0.6.0 (commit `1c55a42`). Insert remains the default and current
+tasks remain unchanged.
+
+**Phase 3b - one-shot row-source representation.** `DbRowSource` protocol,
+`DbPayload.row_source: DbRowSource | None`, the exact `rows`/`row_source`
+state matrix, and the one-shot adapters in `from_petl`/`from_pandas` that
+expose the source without materializing. Deferred to immediately before
+Phase 5 begins -- COPY is the only consumer that needs a non-materialized
+row source, and landing the protocol earlier with no consumer would produce
+speculative code guarded only by its own tests.
 
 Insert remains the default and current tasks remain unchanged.
 
@@ -1429,7 +1455,9 @@ for small outputs.
 
 ## Verification status
 
-No COPY implementation exists yet.
+No COPY implementation exists yet. Phases 1 and 2 shipped in 0.6.0 (commit
+`1c55a42`), as did Phase 3a (see the amended Phase 3 above). Phase 3b is
+deferred until immediately before Phase 5.
 
 The local `task_core` 0.5.2 candidate passes 470 automated tests. It tightens
 the INSERT-path declared type contract so SQLAlchemy type parameters cannot be

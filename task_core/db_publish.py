@@ -1411,6 +1411,19 @@ class DbPublisher:
             error_type=DbPublishError,
         )
 
+        # Revalidated here, not only in DbPayload.__post_init__, because
+        # DbPayload is a plain dataclass (not frozen) -- payload.db_loader
+        # can change between construction and publish(). Placed before any
+        # database work so a configuration failure never leaves staging DDL
+        # or a transaction behind, per ADR 0011 (a configuration error
+        # before source execution or staging DDL). Same reason
+        # validate_publication_strategy is revalidated a few lines above.
+        validate_db_loader(
+            payload.db_loader,
+            field_name='db_loader',
+            error_type=DbPublishError,
+        )
+
         # Startup cleanup scans exactly one schema -- the publisher's. A
         # payload prepared into a different one would leave an orphan that
         # no future run ever scans, which quietly breaks the cleanup
@@ -1477,18 +1490,6 @@ class DbPublisher:
         # tidy away. Let PostgreSQL raise 'relation already exists'.
         staging_table.create(conn)
 
-        # Revalidated here, not only in DbPayload.__post_init__, because
-        # DbPayload is a plain dataclass (not frozen) -- payload.db_loader
-        # can change between construction and publish(). Without this the
-        # dispatch below would still fail closed (KeyError), but with an
-        # ugly error instead of the "not implemented, see 0011" message
-        # the payload boundary exists to deliver. Same reason
-        # validate_publication_strategy is revalidated a few lines above.
-        validate_db_loader(
-            payload.db_loader,
-            field_name='db_loader',
-            error_type=DbPublishError,
-        )
         loader = LOADERS[payload.db_loader]
         loaded = loader(
             conn, staging_table, payload.rows, self.chunk_size,

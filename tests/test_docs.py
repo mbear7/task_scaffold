@@ -446,6 +446,75 @@ class Test6TheQuickStartActuallyRuns(unittest.TestCase):
         self.assertEqual([p.name for p in parameters if p.kind is p.KEYWORD_ONLY], ['source'])
 
 
+class Test7DbInsertBoundary(unittest.TestCase):
+    """db_insert.py is the INSERT loader factored out of db_publish.py so
+    it holds exactly one responsibility -- filling a staging table -- and
+    none of the publisher's lifecycle. ADR 0011 §Tests names three
+    structural properties that make that separation real rather than
+    stylistic: db_insert does not know about DbPublisher, does not manage
+    transactions, and does not build engines or open connections. AST
+    checks rather than call-count mocks because the check is on what the
+    file IS, not on what it happens to do this month.
+    """
+
+    _SOURCE = Path('task_core/db_insert.py').read_text(encoding='utf-8')
+    _TREE = ast.parse(_SOURCE)
+
+    def _all_attribute_and_name_calls(self):
+        # Every Call node with either a bare Name callee (create_engine,
+        # connect) or an Attribute callee (.begin, .commit, .rollback).
+        # Yields the leaf name in either case, which is what these tests
+        # actually want to check membership on.
+        for node in ast.walk(self._TREE):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                yield func.id
+            elif isinstance(func, ast.Attribute):
+                yield func.attr
+
+    def test_db_insert_does_not_import_db_publisher(self):
+        for node in ast.walk(self._TREE):
+            if isinstance(node, ast.ImportFrom):
+                imported = [alias.name for alias in (node.names or [])]
+                with self.subTest(module=node.module, names=imported):
+                    self.assertNotIn('DbPublisher', imported)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertFalse(
+                        alias.name.endswith('db_publish'),
+                        f'db_insert imports {alias.name} -- the loader must not '
+                        f'know the publisher exists',
+                    )
+
+    def test_db_insert_never_begins_commits_or_rolls_back_transactions(self):
+        forbidden = {'begin', 'commit', 'rollback',
+                     '_ensure_transaction', '_commit_transaction'}
+        calls = set(self._all_attribute_and_name_calls())
+        offenders = sorted(forbidden & calls)
+        self.assertEqual(
+            offenders, [],
+            f'db_insert calls {offenders}: the publisher owns the transaction, '
+            f'per db_insert\'s own module docstring and ADR 0011',
+        )
+
+    def test_db_insert_never_creates_an_engine_or_second_connection(self):
+        forbidden = {'create_engine', 'connect', 'URL', 'create'}
+        # 'create' is broad on purpose -- create_engine, URL.create, and
+        # engine.connect all show up under it or under connect. False
+        # positives would come from calls named 'create' that are unrelated
+        # (e.g. sa.Table.create), and there are none in db_insert today; a
+        # future one would need justification here rather than a silent
+        # pass.
+        calls = set(self._all_attribute_and_name_calls())
+        offenders = sorted(forbidden & calls)
+        self.assertEqual(
+            offenders, [],
+            f'db_insert calls {offenders}: it must run against the connection '
+            f'the publisher passed in, not construct its own',
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

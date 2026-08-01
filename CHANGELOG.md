@@ -9,6 +9,47 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.1
+
+Follow-up patch closing four gaps external review found against 0.6.0. No
+change any `db_loader='insert'` caller (all callers today) can observe: the
+public API is byte-identical, only an internal validation moves earlier and
+tests are added.
+
+### Fixed
+- `db_loader` revalidation now runs before staging DDL, not after. 0.6.0
+  placed the payload-boundary revalidation immediately before the `LOADERS`
+  dispatch, which meant `CREATE TABLE` for the staging table and the
+  publisher's transaction had already opened before an invalid loader could
+  be rejected. ADR 0011 §Preparation flows step 2 and §Failure semantics
+  both require a configuration error to fail before any database work; the
+  fix moves the check up to sit alongside `validate_publication_strategy`.
+
+### Changed
+- ADR 0011 §Implementation sequence Phase 3 amended to record the 3a/3b
+  split. 0.6.0 shipped Phase 3a (the `db_loader` configuration surface);
+  Phase 3b (the one-shot `DbRowSource` protocol and adapter rewrites) is
+  deferred to immediately before Phase 5 begins, since COPY is its only
+  consumer. The original Phase 3 text is preserved in the amendment.
+
+### Tests
+- **`test_mutated_payload_loader_is_revalidated_at_publish_boundary`**
+  strengthened to assert that no `CREATE TABLE` statement runs and no
+  transaction opens when the payload boundary rejects the loader --
+  earlier the test satisfied itself with the exception type and message
+  and would have passed either way. Verified by revert-observe-restore.
+- **`Test7DbInsertBoundary`** in `tests/test_docs.py` -- three AST-based
+  structural checks required by ADR 0011 §Tests: `db_insert` does not
+  import `DbPublisher`, never begins/commits/rolls back transactions, and
+  never creates an engine or opens a second connection. Verified by
+  temporary sentinel that made the transaction check fail as expected.
+- **`Test4OldPositionalPipelineSpecConstructionKeepsItsMeaning`** in
+  `tests/test_types.py` -- the 0.5.2 positional call sequence still binds
+  field for field. Pins the API-hygiene rule that every new field must be
+  appended, which the source comments at `types.py:208`, `:213` and `:221`
+  claim but nothing else enforces.
+
+
 ## 0.6.0
 
 Adds the `db_loader` configuration surface described by ADR 0011 without
