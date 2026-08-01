@@ -1071,11 +1071,14 @@ tasks remain unchanged.
 state matrix, and the one-shot adapters (`_PetlAdapter.to_row_source`,
 `_PandasAdapter.to_row_source`) that expose the source without
 materializing. The helpers shipped in 0.6.2 (tightened in 0.6.3) with
-`db_loader='copy'` still rejected at every public boundary; the wired
-producer-consumer chain that makes these helpers reachable from a real
-pipeline run lands with Phase 5, when the runner starts actually calling
-`to_row_source()` and handing the resulting `_ProjectedRowSource` to a
-COPY loader.
+`db_loader='copy'` still rejected at every public boundary. Phase 5
+completes the internal row-source → spool-preparation chain (runner
+calls `to_row_source()`, builds the `RowProjection`, and hands the
+resulting `_ProjectedRowSource` to the Phase 5 spool code in
+`db_copy.py`). Phase 6 then integrates `copy_expert()` against the
+publisher's DBAPI connection, lifts the public `'copy'` rejection, and
+completes the real end-to-end pipeline path. Until Phase 6, the internal
+chain is exercisable from tests only; no shipped caller can reach it.
 
 Also shipped in 0.6.2: `RowProjection` + `_ProjectedRowSource`, the one
 transport-neutral mechanism that composes `db_contract` renaming/projection
@@ -1121,14 +1124,16 @@ helper does *not* do -- and the 0.6.2 CHANGELOG and this ADR previously
 overstated -- is actually consume a `DbRowSource` object. It branches on
 the *string* `'copy'` in `spec.db_loader`; nothing in `runner.py` today
 calls `to_row_source()`, constructs a `RowProjection`, or hands a
-`_ProjectedRowSource` to a loader. The real producer-consumer wiring
-(and with it Phase 4's true completion) lands with Phase 5, which is
-what makes the branch reachable from a real run for the first time.
+`_ProjectedRowSource` to a loader. Phase 5 completes the internal
+producer-consumer wiring (runner → row source → spool preparation in
+`db_copy.py`); Phase 6 then lifts the public `db_loader='copy'`
+rejection and integrates `copy_expert()`, at which point the branch is
+reachable from a real pipeline run.
 
 No database COPY execution is integrated until traversal and row-count tests
 are complete.
 
-### Phase 5 - implement spool preparation
+### Phase 5 - complete the internal row-source → spool-preparation chain
 
 Create `db_copy.py` and implement:
 
@@ -1139,13 +1144,29 @@ Create `db_copy.py` and implement:
 - final target-aware COPY text spool;
 - all cleanup paths.
 
-This phase is testable without PostgreSQL.
+Wire the runner into it: `runner.py` calls `adapter.to_row_source()`,
+composes the `RowProjection` from `db_contract` + framework columns,
+constructs the `_ProjectedRowSource`, and hands it to the Phase 5 spool
+code. This is the point at which the Phase 3b helpers get a real
+non-test consumer.
 
-### Phase 6 - integrate DBAPI COPY
+This phase is testable without PostgreSQL. `db_loader='copy'` remains
+rejected at every public boundary throughout Phase 5 -- the internal
+chain is exercised via helper-level tests only, not through
+`run_pipelines()`.
+
+### Phase 6 - integrate DBAPI COPY and activate 'copy' publicly
 
 Load the final spool through the publisher's existing SQLAlchemy/psycopg2
-connection and preparation transaction. Reuse current staging creation,
-verification, comments, commit and pending-publication registration.
+connection and preparation transaction (via `copy_expert()`). Reuse
+current staging creation, verification, comments, commit and
+pending-publication registration.
+
+Lift the public `db_loader='copy'` rejection at `validate_db_loader`
+(both spec and payload boundaries) and register `'copy'` in the
+`LOADERS` dispatch. This is the phase that completes the real
+end-to-end pipeline path: a `PipelineSpec(db_loader='copy', ...)`
+becomes reachable from `run_pipelines()` for the first time.
 
 ### Phase 7 - predecessor spool cleanup
 
@@ -1508,10 +1529,13 @@ land in 0.6.2 was the actual producer-consumer wiring: no path in
 `runner.py` calls `to_row_source()`, constructs a `RowProjection`, or
 hands a `_ProjectedRowSource` to a COPY loader. `db_loader='copy'`
 remains rejected at every public boundary, and the helpers are dormant
-production code exercised only by direct unit tests. The wired
-producer-consumer chain lands with Phase 5 (`db_copy.py`), which is
-what makes those helpers reachable from a real pipeline run for the
-first time. 0.6.3 corrected the 0.6.2 language that described the
+production code exercised only by direct unit tests. Phase 5 completes
+the internal producer-consumer wiring by connecting the runner to
+`db_copy.py`'s spool preparation, still test-only since `'copy'`
+remains publicly rejected. Phase 6 integrates `copy_expert()` against
+the publisher's DBAPI connection and activates `'copy'` publicly, at
+which point those helpers become reachable from a real pipeline run for
+the first time. 0.6.3 corrected the 0.6.2 language that described the
 runner as a "real consumer" of `DbRowSource` — it consumes the *string*
 `'copy'`, not a `DbRowSource` object — and tightened four correctness
 gaps found by external review: `_PetlRawRowSource` walking the
