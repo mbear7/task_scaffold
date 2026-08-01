@@ -270,13 +270,16 @@ def _plan_pipeline_output_handling(
     result after the source has been streamed.
 
     ``db_loader='copy'`` is still rejected by ``validate_db_loader`` at
-    every public boundary, so no shipped pipeline actually reaches this
-    branch in 0.6.2. The branching is here as dormant production code so
-    the runner is already the real consumer of the row-source contract
-    when the transport lands, rather than needing a separate wiring
-    change. Exercised in isolation by ``test_runner.py`` calling this
-    helper directly with ``db_loader='copy'``; that is why the parameter
-    is passed in rather than pulled from ``spec.db_loader`` inline.
+    every public boundary, so no shipped pipeline reaches the copy
+    branch through normal configuration -- it is exercised in isolation
+    by ``tests/test_db_publish.py``'s ``Test17dRunnerCopyBranching``,
+    which is why the parameter is passed in rather than pulled from
+    ``spec.db_loader`` inline. The 0.6.2 phrasing that this helper made
+    the runner "the real consumer of the row-source contract" was
+    overstated: the branching consumes the *string* ``'copy'``, not a
+    ``DbRowSource`` object -- see the 0.6.3 CHANGELOG note. The actual
+    producer-consumer wiring (``to_row_source`` -> ``RowProjection`` ->
+    a COPY consumer) lands with Phase 5.
     """
     # bool() around each ``a and b`` idiom so the returned tuple is
     # (bool, bool) rather than (whatever_truthy_str, bool). Callers use
@@ -287,11 +290,25 @@ def _plan_pipeline_output_handling(
         or spec.debug_display
         or (output_excel and spec.excel_name)
     )
-    if db_loader == 'copy':
+    # The copy branch only kicks in when a COPY publication will
+    # actually happen for this pipeline. output_db=False, or a
+    # publication-less spec (no db_table), means no COPY regardless
+    # of the requested loader -- so the pipeline behaves like insert
+    # (nrows() runs for the log line; stabilize() runs if any other
+    # consumer will traverse). Without this gate, the post-publish
+    # branch in run_pipelines() that reads the row count from
+    # publisher.table_rows never runs for a copy pipeline with
+    # output_db=False, and pipeline_rows silently omits it -- a
+    # dormant KeyError today only because db_loader='copy' is still
+    # rejected at every public boundary.
+    copy_publication_active = bool(
+        db_loader == 'copy' and output_db and spec.db_table
+    )
+    if copy_publication_active:
         # No adapter.nrows() and no stabilize() for the DB path alone --
         # both would traverse the pipeline output, and COPY forbids that.
         # Other consumers (Excel, debug_display, publish_result) still
-        # need it if they were asked for.
+        # need stabilize() if they were asked for.
         return needs_stabilization_for_other_consumers, False
     needs_stabilization = bool(
         needs_stabilization_for_other_consumers

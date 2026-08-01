@@ -2165,6 +2165,126 @@ class Test17cRowSourceProjection(unittest.TestCase):
         self.assertEqual(insert_columns, copy_columns)
         self.assertEqual(insert_rows, copy_rows)
 
+    def test_duplicate_source_columns_are_rejected(self):
+        # Mirrors _stringify_and_reject_duplicate_columns (db_values.py)
+        # which the INSERT path applies first. Without this,
+        # RowProjection.build would silently keep the last occurrence
+        # (dict {name: index} discards duplicates), so a broken source
+        # would look valid at the projection layer and fail cryptically
+        # much later.
+        from task_core.db_publish import RowProjection, DbPublishError
+        with self.assertRaises(DbPublishError) as caught:
+            RowProjection.build(
+                ('a', 'b', 'a'),
+                db_contract=None, framework_columns=(),
+                run_started_at=None,
+            )
+        self.assertIn("'a'", str(caught.exception))
+
+    def test_duplicate_contract_target_names_are_rejected(self):
+        # Mirrors _apply_db_contract_columns's own duplicate-target
+        # check. Without this, RowProjection.build would produce
+        # output_columns=('x', 'x') which then fails inside SQLAlchemy
+        # CREATE TABLE. Reproducing the reviewer's example exactly.
+        from task_core.db_publish import RowProjection, DbPublishError
+        with self.assertRaises(DbPublishError) as caught:
+            RowProjection.build(
+                ('a', 'b'),
+                db_contract={'a': 'x', 'b': 'x'},
+                framework_columns=(),
+                run_started_at=None,
+            )
+        self.assertIn("'x'", str(caught.exception))
+
+    def test_framework_column_colliding_with_a_projected_column_is_rejected(self):
+        # Mirrors PipelineSpec.__post_init__'s rejection of an
+        # output_schema column named the same as the framework
+        # timestamp. On the row-source path the collision would
+        # produce two output columns with the same name and one
+        # would silently override the other in any consumer that
+        # keys by name.
+        from task_core.db_publish import RowProjection, DbPublishError
+        from task_core.types import OutputColumn
+        with self.assertRaises(DbPublishError) as caught:
+            RowProjection.build(
+                ('etl_updated_at',),
+                db_contract=None,
+                framework_columns=(
+                    OutputColumn('etl_updated_at', 'TIMESTAMPTZ', nullable=False),
+                ),
+                run_started_at=None,
+            )
+        self.assertIn('etl_updated_at', str(caught.exception))
+
+    def test_duplicate_framework_column_names_are_rejected(self):
+        # There is only one framework column today (the timestamp), so
+        # this case has no natural production path -- but keeping the
+        # mechanism general (framework_columns is a tuple) means a
+        # future framework column could accidentally duplicate the
+        # timestamp's name. Catch it at the same boundary as the other
+        # collision checks.
+        from task_core.db_publish import RowProjection, DbPublishError
+        from task_core.types import OutputColumn
+        with self.assertRaises(DbPublishError) as caught:
+            RowProjection.build(
+                ('a',),
+                db_contract=None,
+                framework_columns=(
+                    OutputColumn('etl_updated_at', 'TIMESTAMPTZ', nullable=False),
+                    OutputColumn('etl_updated_at', 'TIMESTAMPTZ', nullable=False),
+                ),
+                run_started_at=None,
+            )
+        self.assertIn('etl_updated_at', str(caught.exception))
+
+    def test_projected_row_source_second_iter_rows_call_raises(self):
+        # The row-source contract requires one-shot semantics. Before
+        # the fix, _ProjectedRowSource had no _claimed guard of its
+        # own; delegation to the underlying source's guard is only
+        # correct if that guard exists AND fires -- a hand-rolled
+        # DbRowSource that returned a fresh iterator each call would
+        # be silently accepted here. This test uses a re-iterable
+        # fake source specifically to prove the _ProjectedRowSource
+        # layer enforces one-shot itself, not by delegation.
+        from task_core.db_publish import (
+            RowProjection, _ProjectedRowSource, DbPublishError,
+        )
+        proj = RowProjection.build(
+            ('a',), db_contract=None, framework_columns=(),
+            run_started_at=None,
+        )
+        # Re-iterable bare source (iter_rows() returns a fresh
+        # iterator every call) -- the underlying source has no
+        # one-shot guard of its own here.
+        rows = [(1,), (2,)]
+        class ReIterableSource:
+            def iter_rows(self): return iter(rows)
+        projected = _ProjectedRowSource(ReIterableSource(), proj)
+        self.assertEqual(list(projected.iter_rows()), [(1,), (2,)])
+        with self.assertRaises(DbPublishError):
+            list(projected.iter_rows())
+
+    def test_constant_at_a_source_backed_position_is_an_invariant_error(self):
+        # __post_init__ enforces that constants may only appear at
+        # positions where source_indices == -1. A constant at a
+        # source-backed position would be silently ignored by
+        # iter_rows() (the ternary picks row[src_idx] and never
+        # touches constants[out_idx]) -- exactly the class of silent
+        # projection drift these checks exist to prevent. Only
+        # reachable via a hand-constructed RowProjection since build()
+        # would never emit such a shape, but the invariant belongs
+        # here regardless.
+        from types import MappingProxyType
+        from task_core.db_publish import RowProjection, DbPublishInvariantError
+        with self.assertRaises(DbPublishInvariantError) as caught:
+            RowProjection(
+                source_columns=('a',),
+                output_columns=('a',),
+                source_indices=(0,),  # source-backed
+                constants=MappingProxyType({0: 'stray'}),  # but a constant is here
+            )
+        self.assertIn('coincides', str(caught.exception))
+
 
 class Test17dRunnerCopyBranching(unittest.TestCase):
     """_plan_pipeline_output_handling (ADR 0011 §Preparation flows) is
@@ -2267,6 +2387,48 @@ class Test17dRunnerCopyBranching(unittest.TestCase):
         )
         self.assertIs(type(needs), bool)
         self.assertIs(type(precount), bool)
+
+    def test_copy_without_db_output_falls_back_to_precount(self):
+        # The copy branch must only kick in when a COPY publication
+        # will actually happen. output_db=False means no publication
+        # regardless of db_loader, so no publisher.table_rows will
+        # exist to fall back on -- the runner's post-publish "read the
+        # row count from publisher.table_rows" branch is inside the
+        # `if output_db and spec.db_table:` guard, so with output_db
+        # off the row count MUST come from nrows() up front. Without
+        # the gate, pipeline_rows silently omits this pipeline: a
+        # dormant KeyError today only because db_loader='copy' is
+        # rejected publicly.
+        result = self._call(
+            db_loader='copy', spec=self._spec(),
+            output_db=False, output_excel=False,
+        )
+        self.assertEqual(result, (False, True))
+
+    def test_copy_without_db_output_but_with_excel_stabilizes_and_precounts(self):
+        # Same gate; second consumer (Excel) present. The pipeline
+        # behaves like insert -- nrows() for the log line, stabilize()
+        # so Excel does not re-run whatever lazy chain produced the
+        # table. COPY-specific semantics do not apply because no COPY
+        # happens.
+        result = self._call(
+            db_loader='copy', spec=self._spec(excel_name='out.xlsx'),
+            output_db=False, output_excel=True,
+        )
+        self.assertEqual(result, (True, True))
+
+    def test_copy_with_output_db_true_but_no_db_table_falls_back_to_precount(self):
+        # The runner's publish block is guarded on
+        # `output_db and spec.db_table` -- if spec.db_table is None,
+        # no publication happens even when output_db=True, and
+        # publisher.table_rows for this pipeline never gets written.
+        # Same reasoning as the output_db=False case: fall back to
+        # the insert-style pre-count so pipeline_rows stays populated.
+        result = self._call(
+            db_loader='copy', spec=self._spec(db_table=None),
+            output_db=True, output_excel=False,
+        )
+        self.assertEqual(result, (False, True))
 
 
 class Test18ConnectionLossIsFatal(unittest.TestCase):

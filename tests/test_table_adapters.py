@@ -443,17 +443,69 @@ class Test6AdapterToRowSource(unittest.TestCase):
         with self.assertRaises(PipelineContractError):
             PANDAS_ADAPTER.to_row_source(pd.DataFrame())
 
-    def test_bare_source_is_one_shot(self):
-        # ADR 0011 requires one-shot semantics. For pandas the DataFrame
-        # itself is materialized so re-iterating iter_rows() is a caller
-        # decision, but iter_rows() returning a fresh iterator each time
-        # would let the caller stream twice by accident, which the
-        # contract forbids. Verify by consuming once and checking that
-        # the second consumption is empty.
+    def test_petl_bare_source_second_iter_rows_call_raises(self):
+        # ADR 0011 requires one-shot semantics: exactly one traversal,
+        # not "a single generator handle you may consume once." The
+        # previous version of this test called iter_rows() once and
+        # consumed the returned generator twice -- external review
+        # correctly pointed out that only proves generator exhaustion
+        # (a Python language guarantee), not one-shot on the source.
+        # This form makes two SEPARATE iter_rows() calls: the second
+        # must raise. Otherwise a caller could accidentally spool the
+        # same source twice (once via COPY, once via a debugging list()
+        # somewhere), which the contract forbids.
+        from task_core.types import PipelineContractError
         _, source = PETL_ADAPTER.to_row_source(etl.wrap([('a',), (1,), (2,)]))
-        it = source.iter_rows()
-        self.assertEqual(list(it), [(1,), (2,)])
-        self.assertEqual(list(it), [])
+        self.assertEqual(list(source.iter_rows()), [(1,), (2,)])
+        with self.assertRaises(PipelineContractError):
+            list(source.iter_rows())
+
+    def test_pandas_bare_source_second_iter_rows_call_raises(self):
+        # Same one-shot contract as petl. Even though a DataFrame is
+        # materialized (so re-iteration is safe against the source),
+        # the row-source layer above still requires exactly one
+        # traversal so a second COPY cannot be issued by accident.
+        from task_core.types import PipelineContractError
+        _, source = PANDAS_ADAPTER.to_row_source(pd.DataFrame({'a': [1, 2]}))
+        self.assertEqual(list(source.iter_rows()), [(1,), (2,)])
+        with self.assertRaises(PipelineContractError):
+            list(source.iter_rows())
+
+    def test_petl_to_row_source_does_not_double_iterate_underlying_table(self):
+        # The 0.6.2 shape passed tbl (not the iterator) to
+        # _PetlRawRowSource, then called iter(tbl) again inside
+        # iter_rows() and skipped a second header. For a
+        # db_resource-backed petl table -- confirmed by the pre-existing
+        # test_db_resource_query_executes_once_not_per_traversal test
+        # -- each iter() call re-executes the underlying SQL query, so
+        # the row-source path was silently running the source twice
+        # (once for the header, once for the data). That's an ADR 0011
+        # violation regardless of whether the data happens to match
+        # across the two runs.
+        #
+        # A fake table with an __iter__ counter is the direct probe:
+        # exactly one __iter__ call across header extraction AND the
+        # full iter_rows() consumption is the correct behaviour;
+        # anything else is the regression this test exists to catch.
+        iter_count = [0]
+
+        class FakePetlTable:
+            def __iter__(self):
+                iter_count[0] += 1
+                yield ('a',)
+                yield (1,)
+                yield (2,)
+                yield (3,)
+
+        _, source = PETL_ADAPTER.to_row_source(FakePetlTable())
+        rows = list(source.iter_rows())
+        self.assertEqual(rows, [(1,), (2,), (3,)])
+        self.assertEqual(
+            iter_count[0], 1,
+            f'the underlying petl table was iterated {iter_count[0]} times; '
+            'the row-source path must walk it exactly once (see ADR 0011 '
+            '§Row-source contract)',
+        )
 
 
 if __name__ == '__main__':

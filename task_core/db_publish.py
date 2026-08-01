@@ -183,6 +183,19 @@ class RowProjection:
                     f'RowProjection: constant at position {const_idx} is '
                     f'outside output range [0, {len(self.output_columns)})'
                 )
+            if self.source_indices[const_idx] != -1:
+                # A constant sitting at a source-backed position would
+                # be silently ignored by iter_rows() (the ternary picks
+                # row[src_idx], never touching constants[out_idx]) --
+                # exactly the class of silent projection drift these
+                # checks exist to prevent.
+                raise DbPublishInvariantError(
+                    f'RowProjection: constant at position {const_idx} '
+                    f'coincides with a source-backed position '
+                    f'(source_indices[{const_idx}]='
+                    f'{self.source_indices[const_idx]}); constants may '
+                    f'only appear at positions where source_indices == -1'
+                )
 
     @classmethod
     def build(cls, source_columns, *, db_contract, framework_columns, run_started_at):
@@ -209,6 +222,22 @@ class RowProjection:
         pass a different position.
         """
         src_cols = tuple(str(c) for c in source_columns)
+
+        # Collision validation mirrors the checks the INSERT path
+        # already performs at db_values._stringify_and_reject_duplicate_columns
+        # (source-name duplicates) and _apply_db_contract_columns
+        # (target-name duplicates), plus PipelineSpec.__post_init__'s
+        # rejection of framework-name collisions with the declared
+        # schema. Without this, RowProjection.build would silently
+        # accept configurations INSERT rejects, which is exactly the
+        # semantic-drift class the parity test exists to catch.
+        src_dupes = find_duplicates(src_cols)
+        if src_dupes:
+            raise DbPublishError(
+                f'RowProjection.build: duplicate source column names: '
+                f'{src_dupes!r}'
+            )
+
         src_index = {name: i for i, name in enumerate(src_cols)}
 
         if db_contract:
@@ -222,9 +251,32 @@ class RowProjection:
                         f'column {src_name!r} not in source_columns'
                     )
                 projected_indices.append(src_index[src_name])
+
+            target_dupes = find_duplicates(projected_cols)
+            if target_dupes:
+                raise DbPublishError(
+                    f'RowProjection.build: db_contract maps multiple source '
+                    f'columns to the same target name: {target_dupes!r}'
+                )
         else:
             projected_cols = list(src_cols)
             projected_indices = list(range(len(src_cols)))
+
+        fw_names = [fw.name for fw in framework_columns]
+        fw_dupes = find_duplicates(fw_names)
+        if fw_dupes:
+            raise DbPublishError(
+                f'RowProjection.build: duplicate framework column names: '
+                f'{fw_dupes!r}'
+            )
+
+        projected_set = set(projected_cols)
+        colliding = [name for name in fw_names if name in projected_set]
+        if colliding:
+            raise DbPublishError(
+                f'RowProjection.build: framework column(s) collide with '
+                f'projected column(s): {colliding!r}'
+            )
 
         output_cols = list(projected_cols)
         source_indices = list(projected_indices)
@@ -248,17 +300,27 @@ class _ProjectedRowSource:
     """DbRowSource decorator: wraps another DbRowSource and yields rows
     reshaped by a RowProjection (renamed, projected, framework-augmented).
 
-    One-shot, like the underlying source. Row width from the underlying
-    source is checked exactly against the projection's declared
-    ``source_columns`` width -- an under- or over-wide row is a broken
-    source, and the ADR's row-source contract requires exact width.
+    One-shot at its own layer, not merely by delegation. Delegating to
+    the wrapped source's own one-shot guard would give a correct answer
+    only if that guard existed and fired -- a hand-rolled DbRowSource
+    that re-iterates would otherwise be silently accepted here.
+    Row width from the underlying source is checked exactly against the
+    projection's declared ``source_columns`` width -- an under- or
+    over-wide row is a broken source, and the ADR's row-source contract
+    requires exact width.
     """
 
     def __init__(self, source, projection):
         self._source = source
         self._projection = projection
+        self._claimed = False
 
     def iter_rows(self):
+        if self._claimed:
+            raise DbPublishError(
+                'projected row source already consumed -- one-shot per ADR 0011'
+            )
+        self._claimed = True
         projection = self._projection
         expected_width = len(projection.source_columns)
         source_indices = projection.source_indices

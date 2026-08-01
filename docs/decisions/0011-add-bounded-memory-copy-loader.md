@@ -1070,8 +1070,12 @@ tasks remain unchanged.
 `DbPayload.row_source: DbRowSource | None`, the exact `rows`/`row_source`
 state matrix, and the one-shot adapters (`_PetlAdapter.to_row_source`,
 `_PandasAdapter.to_row_source`) that expose the source without
-materializing. Shipped in 0.6.2, alongside Phase 4, so the protocol had a
-real consumer at introduction.
+materializing. The helpers shipped in 0.6.2 (tightened in 0.6.3) with
+`db_loader='copy'` still rejected at every public boundary; the wired
+producer-consumer chain that makes these helpers reachable from a real
+pipeline run lands with Phase 5, when the runner starts actually calling
+`to_row_source()` and handing the resulting `_ProjectedRowSource` to a
+COPY loader.
 
 Also shipped in 0.6.2: `RowProjection` + `_ProjectedRowSource`, the one
 transport-neutral mechanism that composes `db_contract` renaming/projection
@@ -1083,15 +1087,14 @@ review); an INSERT/COPY parity test asserts `_ProjectedRowSource` produces
 byte-identical output to the current INSERT path so the two cannot
 silently drift.
 
-Sequenced immediately before Phase 4, corrected after external review: the
-first draft of this amendment said 3b landed "immediately before Phase 5,"
-but Phase 4's runner redesign has to stop pre-counting and pre-caching the
-database-only path, which means it must already have a one-shot source
-handle to pass to the loader. 3b is Phase 4's prerequisite, not Phase 5's.
-The rationale for splitting 3a out of the original Phase 3 stands: without
-Phase 4 or 5, the protocol has no non-test consumer, so 3b did not land in
-its own release -- it landed as the setup step of the same commit sequence
-that shipped Phase 4.
+Sequenced ahead of Phase 4's planning skeleton because that skeleton had
+to reason about a database-only COPY path that would eventually hand a
+one-shot source handle to a loader, and the protocol had to exist before
+the branching could refer to it even in dormant form. The rationale for
+splitting 3a out of the original Phase 3 stands: without Phase 5 wiring,
+the protocol has no non-test consumer, so 3b did not land in its own
+release -- it landed as the setup step of the same commit sequence that
+shipped Phase 4's planning skeleton.
 
 Insert remains the default and current tasks remain unchanged.
 
@@ -1105,14 +1108,22 @@ Consumes the Phase 3b `DbRowSource` handle -- the pre-count removal only
 makes sense once the runner has a source object it can hand to the loader
 without materializing.
 
-Shipped in 0.6.2 as `_plan_pipeline_output_handling` in `task_core.runner`,
-a helper taking `db_loader` as a parameter (so tests exercise the branch
-directly, since `db_loader='copy'` is still rejected at every public
-boundary). On the COPY path the helper returns `precount_via_nrows=False`;
-the runner then reads the row count from `publisher.table_rows` after
-publish rather than calling `adapter.nrows()` up front. Stabilization is
-still triggered when another consumer (Excel, `debug_display`, or
-`publish_result`) needs the table traversed more than once.
+Shipped in 0.6.2 (relabelled honestly in 0.6.3) as the *planning skeleton*
+`_plan_pipeline_output_handling` in `task_core.runner`, a helper taking
+`db_loader` as a parameter (so tests exercise the branch directly, since
+`db_loader='copy'` is still rejected at every public boundary). On the
+database-only COPY path the helper returns `precount_via_nrows=False`;
+callers are expected to read the row count from `publisher.table_rows`
+after publish rather than call `adapter.nrows()` up front. Stabilization
+is still triggered when another consumer (Excel, `debug_display`, or
+`publish_result`) needs the table traversed more than once. What the 0.6.2
+helper does *not* do -- and the 0.6.2 CHANGELOG and this ADR previously
+overstated -- is actually consume a `DbRowSource` object. It branches on
+the *string* `'copy'` in `spec.db_loader`; nothing in `runner.py` today
+calls `to_row_source()`, constructs a `RowProjection`, or hands a
+`_ProjectedRowSource` to a loader. The real producer-consumer wiring
+(and with it Phase 4's true completion) lands with Phase 5, which is
+what makes the branch reachable from a real run for the first time.
 
 No database COPY execution is integrated until traversal and row-count tests
 are complete.
@@ -1488,22 +1499,37 @@ for small outputs.
 ## Verification status
 
 No COPY implementation exists yet. Phases 1 and 2 shipped in 0.6.0 (commit
-`1c55a42`), as did Phase 3a (see the amended Phase 3 above). Phases 3b and
-4 shipped in 0.6.2, landed together so the `DbRowSource` protocol has a
-real consumer (the runner's `_plan_pipeline_output_handling` helper and
-the adapters' `to_row_source` method) from the moment it exists.
-`db_loader='copy'` remains rejected at every public boundary; the new
-machinery is dormant production code, exercised by direct helper tests.
+`1c55a42`), as did Phase 3a (see the amended Phase 3 above). 0.6.2 shipped
+the Phase 3b helpers (`DbRowSource` protocol, `to_row_source()` producers
+on both adapters, `RowProjection` + `_ProjectedRowSource` composer) and
+the Phase 4 planning skeleton (`_plan_pipeline_output_handling`
+branching on the string `'copy'` in `spec.db_loader`). What did *not*
+land in 0.6.2 was the actual producer-consumer wiring: no path in
+`runner.py` calls `to_row_source()`, constructs a `RowProjection`, or
+hands a `_ProjectedRowSource` to a COPY loader. `db_loader='copy'`
+remains rejected at every public boundary, and the helpers are dormant
+production code exercised only by direct unit tests. The wired
+producer-consumer chain lands with Phase 5 (`db_copy.py`), which is
+what makes those helpers reachable from a real pipeline run for the
+first time. 0.6.3 corrected the 0.6.2 language that described the
+runner as a "real consumer" of `DbRowSource` — it consumes the *string*
+`'copy'`, not a `DbRowSource` object — and tightened four correctness
+gaps found by external review: `_PetlRawRowSource` walking the
+header-advanced iterator instead of the table (so a `db_resource`-backed
+lazy chain is not re-executed on iteration), one-shot enforcement on
+both raw sources and on `_ProjectedRowSource`, duplicate-column and
+framework-collision checks in `RowProjection.build()`, and a
+`RowProjection` invariant that a constant may not coincide with a
+source-backed position.
 
-Also landing in 0.6.2: `RowProjection` + `_ProjectedRowSource` in
-`db_publish.py`, the one transport-neutral mechanism that composes
-`db_contract` renaming/projection and framework columns into the final
-logical row shape (see ADR §Row-source contract L378-380 which required
-this to be done as a row-source transformation rather than a
-dictionary-first mutation). A parity test asserts `_ProjectedRowSource`
-produces byte-identical output to the current INSERT path (which stays
-untouched), so the two cannot silently drift; verified by
-revert-observe-restore.
+`RowProjection` + `_ProjectedRowSource` in `db_publish.py` is the one
+transport-neutral mechanism that composes `db_contract` renaming/projection
+and framework columns into the final logical row shape (see ADR §Row-source
+contract L378-380 which required this to be done as a row-source
+transformation rather than a dictionary-first mutation). A parity test
+asserts `_ProjectedRowSource` produces byte-identical output to the current
+INSERT path (which stays untouched), so the two cannot silently drift;
+verified by revert-observe-restore.
 
 The local `task_core` 0.5.2 candidate passes 470 automated tests. It tightens
 the INSERT-path declared type contract so SQLAlchemy type parameters cannot be

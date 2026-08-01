@@ -75,19 +75,37 @@ class _PetlRawRowSource:
     # ADR 0011: 'The source yields positional rows rather than
     # dictionaries. Column order is owned separately and row width is
     # checked exactly.' Width checking is enforced by _ProjectedRowSource
-    # on top of this bare source, not here -- this class only knows how
-    # to walk a petl table, skipping its header once.
-    def __init__(self, tbl):
-        self._tbl = tbl
+    # on top of this bare source, not here -- this class only walks the
+    # already-header-advanced iterator handed to it.
+    #
+    # Takes the iterator, NOT the petl table. Calling iter(tbl) a second
+    # time here would re-run the underlying lazy chain -- for a
+    # db_resource-backed table specifically, that re-executes the SQL
+    # query, which the existing
+    # test_db_resource_query_executes_once_not_per_traversal test
+    # already confirms. Header extraction in to_row_source() advances an
+    # iterator; that same iterator is passed here so the underlying
+    # source is walked exactly once. Confirmed empirically with a fake
+    # table whose __iter__ increments a counter: __iter__ was called
+    # twice with the old (tbl-owning) shape, once with this
+    # iterator-owning shape.
+    #
+    # One-shot semantics: a second iter_rows() call raises rather than
+    # returning a fresh iterator or an empty generator. ADR 0011's
+    # row-source contract requires one traversal exactly; a second
+    # would either quietly duplicate work (via a second COPY) or
+    # silently produce nothing.
+    def __init__(self, iterator):
+        self._iterator = iterator
+        self._claimed = False
 
     def iter_rows(self):
-        # petl iterates the header on every fresh iter() call. Skipped
-        # once, then yield each remaining row as a positional tuple.
-        # One-shot semantics: a caller who needs a second traversal must
-        # materialize themselves (same rule the ADR requires).
-        it = iter(self._tbl)
-        next(it, None)
-        for row in it:
+        if self._claimed:
+            raise PipelineContractError(
+                'row source already consumed -- one-shot per ADR 0011'
+            )
+        self._claimed = True
+        for row in self._iterator:
             yield tuple(row)
 
 
@@ -95,10 +113,22 @@ class _PandasRawRowSource:
     # itertuples(index=False, name=None) is the ADR-specified iteration
     # method: no index column, no named-tuple overhead, plain tuples
     # yielded straight from the DataFrame's own row buffer.
+    #
+    # DataFrames are already materialized in memory so calling
+    # itertuples() twice would not re-run any lazy chain -- but the
+    # row-source contract still requires one-shot semantics, so a
+    # second iter_rows() call raises. Otherwise a caller could
+    # accidentally spool twice (via a second COPY).
     def __init__(self, df):
         self._df = df
+        self._claimed = False
 
     def iter_rows(self):
+        if self._claimed:
+            raise PipelineContractError(
+                'row source already consumed -- one-shot per ADR 0011'
+            )
+        self._claimed = True
         for row in self._df.itertuples(index=False, name=None):
             yield row
 
@@ -149,6 +179,12 @@ class _PetlAdapter:
         # no framework columns; those are wrapped in by _ProjectedRowSource
         # in the orchestrator. Returned columns are the petl header, in
         # the exact order that _PetlRawRowSource will yield values.
+        #
+        # The header-extracting iterator is what _PetlRawRowSource
+        # walks -- NOT the table itself. See that class's docstring for
+        # why: calling iter(tbl) a second time re-runs the underlying
+        # lazy chain, and for a db_resource-backed table that
+        # re-executes the SQL query.
         it = iter(tbl)
         try:
             header = next(it)
@@ -157,7 +193,7 @@ class _PetlAdapter:
                 'expected a non-empty petl table for row source, got empty'
             )
         columns = tuple(str(col) for col in header)
-        return columns, _PetlRawRowSource(tbl)
+        return columns, _PetlRawRowSource(it)
 
 
 class _PandasAdapter:

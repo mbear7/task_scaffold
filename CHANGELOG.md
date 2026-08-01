@@ -9,6 +9,80 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.3
+
+Correction patch for four gaps external review found against 0.6.2, and
+a downgrade of language in ADR 0011 + the 0.6.2 CHANGELOG that overstated
+what shipped. `db_loader='copy'` remains rejected at every public
+boundary; the helpers added in 0.6.2 are still dormant production code
+exercised only by direct helper tests. Callers using the default
+`db_loader='insert'` observe no API or behavioral change.
+
+### Fixed
+- **`_PetlRawRowSource` now walks the header-advanced iterator, not the
+  petl table.** In 0.6.2 the class held a reference to the table itself,
+  which meant `iter_rows()` called `iter(tbl)` a second time -- re-running
+  the underlying lazy chain, and for a `db_resource`-backed table
+  re-executing the SQL query. The row source now receives the iterator
+  that `to_row_source()` already advanced past the header row, so the
+  table is walked exactly once. Verified by revert-observe-restore
+  against a fake petl table whose `__iter__` increments a counter.
+- **One-shot enforcement on `_PetlRawRowSource`, `_PandasRawRowSource`,
+  and `_ProjectedRowSource`.** ADR 0011 §Row-source contract requires
+  exactly one traversal; the 0.6.2 sources would silently spool a second
+  time on a second `iter_rows()` call, which for a real COPY consumer
+  would either duplicate work or (worse) run a second COPY against the
+  same target. A second call now raises `PipelineContractError` /
+  `DbPublishError`.
+- **`RowProjection.build()` now rejects colliding column configurations.**
+  0.6.2 accepted a `db_contract` mapping two source columns to the same
+  target, duplicate framework column names, framework columns whose name
+  matched a projected column, and duplicate source columns -- any of
+  which would produce a `RowProjection` that silently discarded rows'
+  worth of data downstream. All four cases now raise `DbPublishError`
+  at build time. The INSERT path had this validation via
+  `_apply_db_contract_columns` in `db_values.py`; the row-source path
+  now has parity.
+- **`RowProjection.__post_init__` invariant: a constant may not coincide
+  with a source-backed position.** 0.6.2's constructor accepted a
+  `constants` index that pointed at a position whose `source_indices`
+  entry was `>= 0`, silently overwriting the source value. Now raises
+  `DbPublishInvariantError`.
+
+### Changed
+- **CHANGELOG 0.6.2 language downgraded.** The 0.6.2 entry described the
+  runner's `_plan_pipeline_output_handling` as "a real consumer" of the
+  `DbRowSource` protocol. It is not: the helper branches on the *string*
+  `'copy'` in `spec.db_loader`; nothing in `runner.py` today calls
+  `to_row_source()`, constructs a `RowProjection`, or hands a
+  `_ProjectedRowSource` to a loader. The real producer-consumer chain
+  lands with Phase 5 (`db_copy.py`). This entry corrects the record
+  without rewriting the 0.6.2 entry itself, per the project rule that
+  superseded prose is preserved so the record shows what was believed
+  when.
+- **ADR 0011 §Verification status** and §Phase 4 amended to match: 0.6.2
+  shipped the Phase 3b helpers and the Phase 4 planning skeleton; the
+  wired producer-consumer path lands with Phase 5.
+
+### Tests
+- **`test_petl_bare_source_second_iter_rows_call_raises`** and
+  **`test_pandas_bare_source_second_iter_rows_call_raises`** in
+  `tests/test_table_adapters.py` -- replace the 0.6.2
+  `test_bare_source_is_one_shot`, which only checked exhaustion, not the
+  raise-on-reentry contract.
+- **`test_petl_to_row_source_does_not_double_iterate_underlying_table`**
+  -- a `FakePetlTable` records `__iter__` call count; asserts it is
+  called exactly once across header extraction and full row iteration.
+  Verified by revert-observe-restore against the 0.6.2 shape.
+- **`Test17cRowSourceProjection`** gains six tests covering the five
+  collision cases and the projected-source one-shot contract. All
+  verified by revert-observe-restore.
+- **`Test17dRunnerCopyBranching`** gains three tests covering the
+  fall-through cases where `db_loader='copy'` is set but the pipeline
+  does not actually reach the database-only COPY branch (no
+  `output_db`, or `output_db` set but no `db_table`).
+
+
 ## 0.6.2
 
 Phase 3b + Phase 4 of ADR 0011, landed together so the row-source
@@ -16,6 +90,11 @@ contract has a real consumer from the moment it exists. `db_loader='copy'`
 remains rejected at every public boundary -- the new machinery is dormant
 production code, exercised by direct helper tests. Callers using the
 default `db_loader='insert'` observe no API or behavioral change.
+
+(Note: the "real consumer" claim above and the parallel wording in the
+Changed section were corrected in 0.6.3. See the 0.6.3 entry for the
+downgrade rationale; the 0.6.2 wording is preserved here so the record
+shows what was believed at 0.6.2.)
 
 ### Added
 - **`DbRowSource`** protocol in `task_core.types` -- level-0,
