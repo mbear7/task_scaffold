@@ -100,6 +100,51 @@ if __name__ == '__main__':
     unittest.main()
 
 
+class Test3DbLoaderVocabulary(unittest.TestCase):
+    """PipelineSpec.db_loader landed in 0.6.0 as the public configuration
+    surface for the loader described by ADR 0011. Until COPY is
+    implemented the only accepted value is 'insert' -- 'copy' is named in
+    the validator and rejected with a message that says why, per the
+    'no reserved-and-rejected vocabulary' rule in CLAUDE.md."""
+
+    def test_the_vocabulary_lists_only_the_implemented_loader(self):
+        # If a value ever appears here that has no implementation behind
+        # it, the drift check in db_publish.py fails at import. This
+        # assertion documents the current vocabulary in test form so a
+        # future addition without a matching loader also fails here.
+        from task_core.types import DB_LOADERS
+        self.assertEqual(DB_LOADERS, ('insert',))
+
+    def test_default_is_insert(self):
+        spec = tc.PipelineSpec(db_table='t')
+        self.assertEqual(spec.db_loader, 'insert')
+
+    def test_explicit_insert_is_accepted(self):
+        spec = tc.PipelineSpec(db_table='t', db_loader='insert')
+        self.assertEqual(spec.db_loader, 'insert')
+
+    def test_copy_is_rejected_by_name_not_by_generic_message(self):
+        # An accepted vocabulary value that raises NotImplementedError is
+        # a lie. So is a generic 'unknown value' error for a value the
+        # ADR names explicitly. The message must say "not implemented"
+        # and point at the ADR so a task author who tries 'copy' knows
+        # what happened, not just that they typed something wrong.
+        with self.assertRaises(ValueError) as caught:
+            tc.PipelineSpec(db_table='t', db_loader='copy')
+        message = str(caught.exception)
+        self.assertIn('not implemented', message)
+        self.assertIn('0011', message)
+
+    def test_an_unknown_value_gets_the_generic_message(self):
+        with self.assertRaises(ValueError) as caught:
+            tc.PipelineSpec(db_table='t', db_loader='banana')
+        self.assertIn("'banana'", str(caught.exception))
+
+    def test_a_non_string_is_rejected(self):
+        with self.assertRaises(ValueError):
+            tc.PipelineSpec(db_table='t', db_loader=None)
+
+
 class TestFindDuplicates(unittest.TestCase):
     """find_duplicates() is the one shared implementation of the
     order-preserving duplicate-finder previously hand-rolled in

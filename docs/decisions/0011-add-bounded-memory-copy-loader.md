@@ -1,8 +1,11 @@
 # 0011 — Add a bounded-memory `COPY FROM STDIN` loader
 
-Status: proposed
+Status: proposed. The `db_loader` configuration surface landed in 0.6.0 with
+`'insert'` as the only accepted value; `'copy'` is rejected by name at every
+public boundary until the transport lands, per the no-reserved-vocabulary
+rule in CLAUDE.md.
 
-Not implemented in 0.5.2.
+Not implemented in 0.6.0.
 
 Amended before implementation by ADR 0012: schema source and publication
 strategy are independent. COPY changes staging transport only and must work
@@ -222,13 +225,16 @@ class PipelineSpec:
 
 Validation occurs at two boundaries:
 
-1. `PipelineSpec` rejects any value other than `"insert"` or `"copy"`;
-2. structural pipeline validation rejects COPY combined with
+1. `PipelineSpec` rejects any value other than an implemented loader; today
+   that means `'copy'` is rejected by name with a message pointing at this
+   ADR, and any other unknown value is rejected generically. When COPY
+   lands, `PipelineSpec` will accept `'insert'` or `'copy'`;
+2. structural pipeline validation will reject COPY combined with
    `get_dynamic_db_contract()` before resources are built;
 3. the database payload/publisher boundary repeats loader validation so direct
    callers cannot bypass it.
 
-Normal insert tasks require no source change. COPY tasks state the choice
+Normal insert tasks require no source change. COPY tasks will state the choice
 explicitly so the performance and scratch-disk decision is visible in review.
 
 COPY tuning belongs under `PublisherConfig`, not as loose `run_pipelines()`

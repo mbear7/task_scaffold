@@ -136,6 +136,41 @@ def validate_publication_strategy(
     return value
 
 
+# How rows travel from the fully-materialized payload into the staging
+# table. Same engine-neutral vocabulary rule as PUBLICATION_STRATEGIES:
+# only values that are actually implemented appear here. 'copy' is
+# named separately in validate_db_loader() below so a task author who
+# tries to set it gets the accurate reason ("not implemented") rather
+# than the generic "not one of DB_LOADERS", per ADR 0011.
+DB_LOADERS = ('insert',)
+
+
+def validate_db_loader(
+    value, *, field_name='db_loader', error_type=ValueError,
+):
+    """Validate one db-loader value at any public boundary.
+
+    ``PipelineSpec`` and direct ``DbPayload`` callers enforce the same
+    rule so the spec path and the direct publisher path cannot drift
+    apart -- the same discipline validate_publication_strategy() applies
+    above.
+    """
+    if not isinstance(value, str):
+        raise error_type(
+            f'{field_name} must be a str, got {type(value).__name__}'
+        )
+    if value == 'copy':
+        raise error_type(
+            f"{field_name}='copy' is not implemented -- only 'insert' is "
+            "accepted. See docs/decisions/0011."
+        )
+    if value not in DB_LOADERS:
+        raise error_type(
+            f'{field_name} must be one of {DB_LOADERS}, got {value!r}'
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class OutputColumn:
     """One column in a fully declared database output schema.
@@ -181,6 +216,10 @@ class PipelineSpec:
     # 'refill' requires output_schema: it needs the target's physical schema
     # to remain stable across runs, and only a declaration can promise that.
     db_publication_strategy: str | None = None
+    # 'insert' is the only implemented value. 'copy' is rejected by name
+    # rather than silently accepted -- see ADR 0011. Appended after every
+    # 0.5.1 field for the same API-hygiene reason.
+    db_loader: str = 'insert'
 
     def __post_init__(self):
         if self.excel_name is not None and not isinstance(self.excel_name, str):
@@ -195,6 +234,8 @@ class PipelineSpec:
             allow_none=True,
             field_name='db_publication_strategy',
         )
+
+        validate_db_loader(self.db_loader, field_name='db_loader')
 
         if self.db_output is not None:
             # Require the declared contract (list[str] | tuple[str, ...] |

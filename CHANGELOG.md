@@ -9,7 +9,52 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
-## Unreleased
+## 0.6.0
+
+Adds the `db_loader` configuration surface described by ADR 0011 without
+adding the COPY loader itself. Minor rather than patch: `PipelineSpec` and
+`DbPayload` grow a new field, `from_petl()`/`from_pandas()` grow a new keyword
+argument, and both `db_publish` and `db_insert` become independently
+importable modules following the split described under Changed. Keyword
+construction of `PipelineSpec(...)` and `DbPayload(...)` needs no source
+change; only callers that reach for the now-moved private symbols do.
+
+### Added
+- **`PipelineSpec.db_loader`** -- `'insert'` (the default and only
+  implemented value). `'copy'` is rejected by name at construction with a
+  message pointing at ADR 0011. Any other value is rejected generically.
+  Same rule enforced at the `DbPayload` boundary and at every
+  `from_petl()`/`from_pandas()` adapter constructor so direct callers cannot
+  bypass validation.
+- `task_core.types.DB_LOADERS` and `validate_db_loader()`. Mirrors the
+  `PUBLICATION_STRATEGIES`/`validate_publication_strategy()` pair so the
+  spec path and the direct-payload path cannot drift apart.
+- Loader dispatch table `LOADERS` in `db_publish.py`, keyed on the payload's
+  `db_loader`. An import-time drift check turns any future addition to
+  `DB_LOADERS` without a matching registry entry into a `RuntimeError` at
+  import, rather than a `KeyError` at first publish.
+
+### Changed
+- Extracted the stateless schema/value kernel out of `db_publish.py` into
+  `db_values.py` -- exception classes, dataclasses, value predicates,
+  declared and inferred schema resolvers. `db_publish.py` re-exports every
+  moved name, so import spellings are unchanged. Dependency direction is
+  one way (`db_publish` -> `db_values`).
+- Extracted the staging-table INSERT loader out of `db_publish.py` into
+  `db_insert.py` -- one function, `load_rows_into_staging(conn,
+  staging_table, rows, chunk_size)`, plus its `_chunked` helper. The
+  publisher still owns the transaction, the table creation, the
+  post-load integrity check, and the ownership comment. Any test that
+  monkeypatched `task_core.db_publish._chunked` now needs to patch
+  `task_core.db_insert._chunked`; the old attribute no longer exists.
+
+### Notes
+- `'copy'` is *absent from* `DB_LOADERS` rather than reserved-and-rejected
+  inside it -- an accepted vocabulary value that raises `NotImplementedError`
+  is its own small lie. It joins the tuple when the loader lands. `'copy'`
+  is nonetheless called out by name in the validator so a task author who
+  tries it gets the accurate reason rather than the generic one.
+- See `docs/decisions/0011` (amended before implementation by `0012`).
 
 
 ## 0.5.2

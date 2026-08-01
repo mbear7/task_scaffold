@@ -150,6 +150,7 @@ class derived:
 | `debug_display` | `False` | Print the table during the run. |
 | `table_adapter` | `None` | `'petl'`, `'pandas'`, or `None` to infer. |
 | `db_publication_strategy` | `None` | `'replace'` (default) or `'refill'`. See below. |
+| `db_loader` | `'insert'` | Staging loader. Only `'insert'` is implemented; `'copy'` is reserved by ADR 0011 but rejected at construction until it lands. |
 
 ### `db_output` is declarative
 

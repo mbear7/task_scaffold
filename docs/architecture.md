@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.5.2. This describes the present system, not
+How `task_core` works as of 0.6.0. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -16,10 +16,12 @@ level 0   types.py                    dataclasses, errors, PORTABLE_IDENTIFIER_R
           cleanup.py                  attempt_all_cleanup()
           logging_setup.py
           openpyxl_compat.py
+          db_insert.py                staging-table INSERT loader
 
 level 1   file_access.py              local and SMB file/workbook access
           excel_metadata.py
           source_tracking.py          fingerprints
+          db_values.py                stateless schema/value kernel
 
 level 2   context.py                  task_context: lazy resources, close-once
           binding.py                  ResourceSpec, bind(), wiring
@@ -46,9 +48,10 @@ adapter interface.
 
 Other modules do import an engine, for different reasons:
 `table_adapters.py` imports both because encapsulating their differences
-is its job; `db_publish.py` imports pandas to normalize scalar values;
-`resources/excel.py` and `resources/db.py` import petl because
-**resources return petl tables**. That last one is visible to task
+is its job; `db_publish.py` imports pandas to accept a DataFrame in
+`from_pandas()`; `db_values.py` imports pandas to normalize scalar values
+and identify missing markers; `resources/excel.py` and `resources/db.py`
+import petl because **resources return petl tables**. That last one is visible to task
 authors: a pandas pipeline reading an Excel or DB resource receives petl
 tables and converts them itself.
 

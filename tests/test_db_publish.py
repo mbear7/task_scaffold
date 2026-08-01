@@ -1748,16 +1748,20 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
         payload = DbPayload(table_name='target', schema=None, columns=['a'],
                             rows=[{'a': 1}, {'a': 2}, {'a': 3}])
 
-        real_chunked = sys.modules['task_core.db_publish']._chunked
+        # Patch _chunked in task_core.db_insert -- that is where the
+        # loader resolves it. Patching task_core.db_publish would be a
+        # dead statement now (0.6.0), and defaults-to-permissive means
+        # the invariant would silently stop being tested.
+        real_chunked = sys.modules['task_core.db_insert']._chunked
         try:
-            sys.modules['task_core.db_publish']._chunked = (
+            sys.modules['task_core.db_insert']._chunked = (
                 lambda rows, size: real_chunked(rows[:-1], size)   # silently drops one
             )
             with self.assertRaises(DbPublishInvariantError) as caught:
                 publisher.publish(payload)
             self.assertIn('loaded 2 rows', str(caught.exception))
         finally:
-            sys.modules['task_core.db_publish']._chunked = real_chunked
+            sys.modules['task_core.db_insert']._chunked = real_chunked
 
     def test_publication_refuses_a_staging_table_that_lost_its_metadata(self):
         conn = self._Conn(columns=['a'])
@@ -1782,6 +1786,117 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
             parse_staging_comment(conn.comments.get('target')),
             'the published table still carries staging ownership metadata',
         )
+
+
+class Test17bDbLoaderBoundary(unittest.TestCase):
+    """The `db_loader` field landed in 0.6.0 as the public configuration
+    surface for the loader described by ADR 0011. The DbPayload boundary
+    repeats the validation the spec applies, and publish() dispatches
+    through a LOADERS registry rather than a hardcoded call. These tests
+    guard the same rules the PipelineSpec tests guard, plus the dispatch
+    seam itself -- since the seam only earns its keep if a test can
+    prove the loader flows through it."""
+
+    def test_direct_payload_rejects_copy_by_name(self):
+        with self.assertRaises(DbPublishError) as caught:
+            DbPayload(
+                table_name='t', schema=None, columns=['v'],
+                rows=[{'v': 1}], db_loader='copy',
+            )
+        message = str(caught.exception)
+        self.assertIn('not implemented', message)
+        self.assertIn('0011', message)
+
+    def test_direct_payload_rejects_unknown_loader(self):
+        with self.assertRaises(DbPublishError) as caught:
+            DbPayload(
+                table_name='t', schema=None, columns=['v'],
+                rows=[{'v': 1}], db_loader='banana',
+            )
+        self.assertIn("'banana'", str(caught.exception))
+
+    def test_adapter_constructors_apply_the_same_loader_validation(self):
+        # from_petl and from_pandas are the two direct-adapter constructors
+        # task authors can reach without going through PipelineSpec. Both
+        # funnel through DbPayload.__post_init__ so the coverage is
+        # implicit, but the check is asserted explicitly on both -- the
+        # existing publication_strategy test at test_declared_schema.py
+        # covers both for the same reason: a future refactor that split the
+        # constructors would otherwise silently lose coverage on one side.
+        import petl as etl
+        from task_core.db_publish import from_pandas, from_petl
+        with self.assertRaises(DbPublishError):
+            from_petl(
+                etl.wrap([['v'], [1]]), table_name='t', schema=None,
+                db_loader='copy',
+            )
+        with self.assertRaises(DbPublishError):
+            from_pandas(
+                pd.DataFrame({'v': [1]}), table_name='t', schema=None,
+                db_loader='copy',
+            )
+
+    def test_mutated_payload_loader_is_revalidated_at_publish_boundary(self):
+        # DbPayload is not frozen, so payload.db_loader can be reassigned
+        # after construction. Without revalidation at the publish boundary
+        # the LOADERS dispatch would still fail closed (KeyError), but
+        # with the wrong message -- callers would see a Python-level
+        # missing-key trace instead of the "not implemented, see 0011"
+        # explanation the payload boundary exists to deliver. Mirrors
+        # test_mutated_payload_strategy_is_revalidated_at_publish_boundary
+        # in test_declared_schema.py for the same reason.
+        import petl as etl
+        from task_core.db_publish import from_petl
+        payload = from_petl(
+            etl.wrap([['a'], [1]]), table_name='target', schema=None,
+        )
+        payload.db_loader = 'copy'
+
+        conn = Test17PreparationValidationAndOwnership._Conn(columns=['a'])
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
+        publisher._conn = conn
+        publisher._engine = object()
+        publisher.begin_run()
+
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.publish(payload)
+        message = str(caught.exception)
+        self.assertIn('not implemented', message)
+        self.assertIn('0011', message)
+
+    def test_publication_dispatches_through_the_loaders_registry(self):
+        """The registry only earns its keep if publish() actually reaches
+        it, so this test proves the seam is load-bearing by monkeypatching
+        LOADERS['insert'] to a counter and asserting the counter fires.
+        A test that instead called publish() with the real loader and
+        checked the row count would pass identically if publish() bypassed
+        LOADERS and called load_rows_into_staging() directly -- which is
+        exactly the regression this seam has to prevent."""
+        import task_core.db_publish as dbp
+
+        conn = Test17PreparationValidationAndOwnership._Conn(columns=['a'])
+        publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
+        publisher._conn = conn
+        publisher._engine = object()
+        publisher.begin_run()
+
+        calls = []
+        real = dbp.LOADERS['insert']
+
+        def counting(conn_, table, rows, chunk):
+            calls.append(len(rows))
+            return real(conn_, table, rows, chunk)
+
+        dbp.LOADERS['insert'] = counting
+        try:
+            publisher.publish(DbPayload(
+                table_name='target', schema=None, columns=['a'],
+                rows=[{'a': 1}, {'a': 2}],
+            ))
+        finally:
+            dbp.LOADERS['insert'] = real
+
+        self.assertEqual(calls, [2], 'publish() did not dispatch through LOADERS')
 
 
 class Test18ConnectionLossIsFatal(unittest.TestCase):

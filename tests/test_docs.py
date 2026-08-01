@@ -77,7 +77,7 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
             {'excel_name', 'db_table', 'db_output', 'db_contract', 'db_type_overrides',
              'db_not_null_columns', 'output_schema', 'db_table_id_pix',
              'db_updated_at', 'publish_result', 'debug_display', 'table_adapter',
-             'db_publication_strategy'},
+             'db_publication_strategy', 'db_loader'},
         )
 
     def test_result_shapes_are_as_documented(self):
@@ -155,8 +155,8 @@ class Test2DocumentedLayeringHolds(unittest.TestCase):
         self.assertIsNone(re.search(r'^(import|from) (petl|pandas)', source, re.M))
 
     def test_only_the_documented_modules_import_an_engine(self):
-        # architecture.md names these four and says why each needs one.
-        allowed = {'table_adapters.py', 'db_publish.py', 'excel.py', 'db.py'}
+        # architecture.md names these and says why each needs one.
+        allowed = {'table_adapters.py', 'db_publish.py', 'db_values.py', 'excel.py', 'db.py'}
         for name, path in self._modules():
             if re.search(r'^(import|from) (petl|pandas)', Path(path).read_text(encoding='utf-8'), re.M):
                 with self.subTest(module=name):
