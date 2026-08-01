@@ -455,6 +455,16 @@ class Test7DbInsertBoundary(unittest.TestCase):
     transactions, and does not build engines or open connections. AST
     checks rather than call-count mocks because the check is on what the
     file IS, not on what it happens to do this month.
+
+    Scope: these are architectural tripwires, not exhaustive enforcement.
+    They catch the obvious regressions (direct `create_engine`, `.begin`,
+    `from task_core.db_publish import DbPublisher`) that would show up
+    literally in the source; they do not catch `engine.raw_connection()`,
+    `engine_from_config()`, or a transitive import that reaches the
+    publisher through an intermediate helper. The current loader is 44
+    lines and clean, so nothing more is warranted today. A stronger form
+    -- import allowlist plus a check that the connection is only reached
+    through a parameter -- is fair to add if the loader grows.
     """
 
     _SOURCE = Path('task_core/db_insert.py').read_text(encoding='utf-8')

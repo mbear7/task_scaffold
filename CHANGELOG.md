@@ -11,10 +11,9 @@ chronologically rather than by release.
 
 ## 0.6.1
 
-Follow-up patch closing four gaps external review found against 0.6.0. No
-change any `db_loader='insert'` caller (all callers today) can observe: the
-public API is byte-identical, only an internal validation moves earlier and
-tests are added.
+Follow-up patch closing four gaps external review found against 0.6.0.
+Existing insert callers observe no API or behavioral change: only an
+internal validation moves earlier and tests are added.
 
 ### Fixed
 - `db_loader` revalidation now runs before staging DDL, not after. 0.6.0
@@ -22,8 +21,12 @@ tests are added.
   dispatch, which meant `CREATE TABLE` for the staging table and the
   publisher's transaction had already opened before an invalid loader could
   be rejected. ADR 0011 §Preparation flows step 2 and §Failure semantics
-  both require a configuration error to fail before any database work; the
-  fix moves the check up to sit alongside `validate_publication_strategy`.
+  both require a configuration error to fail before source processing, the
+  preparation transaction, or staging DDL; the fix moves the check up to
+  sit alongside `validate_publication_strategy`. (`_require_task_lock()`
+  still runs earlier -- that is preserved on purpose, so a direct caller
+  who has not acquired the lock keeps failing with the lock error rather
+  than the loader error.)
 
 ### Changed
 - ADR 0011 §Implementation sequence Phase 3 amended to record the 3a/3b

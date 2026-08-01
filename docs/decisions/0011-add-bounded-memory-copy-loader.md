@@ -1069,10 +1069,17 @@ tasks remain unchanged.
 **Phase 3b - one-shot row-source representation.** `DbRowSource` protocol,
 `DbPayload.row_source: DbRowSource | None`, the exact `rows`/`row_source`
 state matrix, and the one-shot adapters in `from_petl`/`from_pandas` that
-expose the source without materializing. Deferred to immediately before
-Phase 5 begins -- COPY is the only consumer that needs a non-materialized
-row source, and landing the protocol earlier with no consumer would produce
-speculative code guarded only by its own tests.
+expose the source without materializing.
+
+Sequenced immediately before Phase 4, corrected after external review: the
+first draft of this amendment said 3b landed "immediately before Phase 5,"
+but Phase 4's runner redesign has to stop pre-counting and pre-caching the
+database-only path, which means it must already have a one-shot source
+handle to pass to the loader. 3b is Phase 4's prerequisite, not Phase 5's.
+The rationale for splitting 3a out of the original Phase 3 stands: without
+Phase 4 or 5, the protocol has no non-test consumer, so 3b does not land in
+its own release -- it lands as the setup step of the same commit sequence
+that ships Phase 4, or immediately before it.
 
 Insert remains the default and current tasks remain unchanged.
 
@@ -1081,6 +1088,10 @@ Insert remains the default and current tasks remain unchanged.
 Remove the mandatory pre-count/cache from the database-only COPY path. Return
 the exact prepared row count to the runner. Preserve current stabilization when
 another output consumer requires it.
+
+Consumes the Phase 3b `DbRowSource` handle -- the pre-count removal only
+makes sense once the runner has a source object it can hand to the loader
+without materializing.
 
 No database COPY execution is integrated until traversal and row-count tests
 are complete.
@@ -1457,7 +1468,7 @@ for small outputs.
 
 No COPY implementation exists yet. Phases 1 and 2 shipped in 0.6.0 (commit
 `1c55a42`), as did Phase 3a (see the amended Phase 3 above). Phase 3b is
-deferred until immediately before Phase 5.
+deferred until immediately before Phase 4, which is its first consumer.
 
 The local `task_core` 0.5.2 candidate passes 470 automated tests. It tightens
 the INSERT-path declared type contract so SQLAlchemy type parameters cannot be

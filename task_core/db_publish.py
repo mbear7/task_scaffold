@@ -1413,11 +1413,15 @@ class DbPublisher:
 
         # Revalidated here, not only in DbPayload.__post_init__, because
         # DbPayload is a plain dataclass (not frozen) -- payload.db_loader
-        # can change between construction and publish(). Placed before any
-        # database work so a configuration failure never leaves staging DDL
-        # or a transaction behind, per ADR 0011 (a configuration error
-        # before source execution or staging DDL). Same reason
-        # validate_publication_strategy is revalidated a few lines above.
+        # can change between construction and publish(). Placed before
+        # source processing, the preparation transaction and staging DDL,
+        # so a configuration failure never leaves staging DDL or a
+        # transaction behind, per ADR 0011 (a configuration error before
+        # source execution or staging DDL). _require_task_lock() above is
+        # intentionally earlier -- a direct caller who has not acquired
+        # the task lock should still fail with the lock error rather than
+        # the loader error. Same reason validate_publication_strategy is
+        # revalidated a few lines above.
         validate_db_loader(
             payload.db_loader,
             field_name='db_loader',
