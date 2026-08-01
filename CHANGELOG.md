@@ -32,8 +32,9 @@ internal validation moves earlier and tests are added.
 - ADR 0011 §Implementation sequence Phase 3 amended to record the 3a/3b
   split. 0.6.0 shipped Phase 3a (the `db_loader` configuration surface);
   Phase 3b (the one-shot `DbRowSource` protocol and adapter rewrites) is
-  deferred to immediately before Phase 5 begins, since COPY is its only
-  consumer. The original Phase 3 text is preserved in the amendment.
+  sequenced immediately before Phase 4, which is its first consumer --
+  Phase 4's runner redesign consumes the row-source handle. The original
+  Phase 3 text is preserved in the amendment.
 
 ### Tests
 - **`test_mutated_payload_loader_is_revalidated_at_publish_boundary`**
