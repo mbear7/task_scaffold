@@ -2,8 +2,8 @@
 
 Status: proposed. The `db_loader` configuration surface landed in 0.6.0 with
 `'insert'` as the only accepted value; `'copy'` is rejected by name at every
-public boundary until the transport lands, per the no-reserved-vocabulary
-rule in CLAUDE.md.
+public boundary until the transport lands, because the project does not
+reserve vocabulary it has not implemented.
 
 Not implemented in 0.6.0.
 
@@ -1068,8 +1068,20 @@ tasks remain unchanged.
 
 **Phase 3b - one-shot row-source representation.** `DbRowSource` protocol,
 `DbPayload.row_source: DbRowSource | None`, the exact `rows`/`row_source`
-state matrix, and the one-shot adapters in `from_petl`/`from_pandas` that
-expose the source without materializing.
+state matrix, and the one-shot adapters (`_PetlAdapter.to_row_source`,
+`_PandasAdapter.to_row_source`) that expose the source without
+materializing. Shipped in 0.6.2, alongside Phase 4, so the protocol had a
+real consumer at introduction.
+
+Also shipped in 0.6.2: `RowProjection` + `_ProjectedRowSource`, the one
+transport-neutral mechanism that composes `db_contract` renaming/projection
+and framework columns into the final logical row shape -- required by
+§Row-source contract L378-380 which stipulates that both transformations
+must be row-source transformations rather than dictionary-first mutations.
+The INSERT path is deliberately left untouched (Reading A of the design
+review); an INSERT/COPY parity test asserts `_ProjectedRowSource` produces
+byte-identical output to the current INSERT path so the two cannot
+silently drift.
 
 Sequenced immediately before Phase 4, corrected after external review: the
 first draft of this amendment said 3b landed "immediately before Phase 5,"
@@ -1077,9 +1089,9 @@ but Phase 4's runner redesign has to stop pre-counting and pre-caching the
 database-only path, which means it must already have a one-shot source
 handle to pass to the loader. 3b is Phase 4's prerequisite, not Phase 5's.
 The rationale for splitting 3a out of the original Phase 3 stands: without
-Phase 4 or 5, the protocol has no non-test consumer, so 3b does not land in
-its own release -- it lands as the setup step of the same commit sequence
-that ships Phase 4, or immediately before it.
+Phase 4 or 5, the protocol has no non-test consumer, so 3b did not land in
+its own release -- it landed as the setup step of the same commit sequence
+that shipped Phase 4.
 
 Insert remains the default and current tasks remain unchanged.
 
@@ -1092,6 +1104,15 @@ another output consumer requires it.
 Consumes the Phase 3b `DbRowSource` handle -- the pre-count removal only
 makes sense once the runner has a source object it can hand to the loader
 without materializing.
+
+Shipped in 0.6.2 as `_plan_pipeline_output_handling` in `task_core.runner`,
+a helper taking `db_loader` as a parameter (so tests exercise the branch
+directly, since `db_loader='copy'` is still rejected at every public
+boundary). On the COPY path the helper returns `precount_via_nrows=False`;
+the runner then reads the row count from `publisher.table_rows` after
+publish rather than calling `adapter.nrows()` up front. Stabilization is
+still triggered when another consumer (Excel, `debug_display`, or
+`publish_result`) needs the table traversed more than once.
 
 No database COPY execution is integrated until traversal and row-count tests
 are complete.
@@ -1467,8 +1488,22 @@ for small outputs.
 ## Verification status
 
 No COPY implementation exists yet. Phases 1 and 2 shipped in 0.6.0 (commit
-`1c55a42`), as did Phase 3a (see the amended Phase 3 above). Phase 3b is
-deferred until immediately before Phase 4, which is its first consumer.
+`1c55a42`), as did Phase 3a (see the amended Phase 3 above). Phases 3b and
+4 shipped in 0.6.2, landed together so the `DbRowSource` protocol has a
+real consumer (the runner's `_plan_pipeline_output_handling` helper and
+the adapters' `to_row_source` method) from the moment it exists.
+`db_loader='copy'` remains rejected at every public boundary; the new
+machinery is dormant production code, exercised by direct helper tests.
+
+Also landing in 0.6.2: `RowProjection` + `_ProjectedRowSource` in
+`db_publish.py`, the one transport-neutral mechanism that composes
+`db_contract` renaming/projection and framework columns into the final
+logical row shape (see ADR §Row-source contract L378-380 which required
+this to be done as a row-source transformation rather than a
+dictionary-first mutation). A parity test asserts `_ProjectedRowSource`
+produces byte-identical output to the current INSERT path (which stays
+untouched), so the two cannot silently drift; verified by
+revert-observe-restore.
 
 The local `task_core` 0.5.2 candidate passes 470 automated tests. It tightens
 the INSERT-path declared type contract so SQLAlchemy type parameters cannot be

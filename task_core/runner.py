@@ -249,6 +249,57 @@ def validate_pipeline_classes(pipelines, run_sequence):
     return specs
 
 
+def _plan_pipeline_output_handling(
+    *, db_loader, spec, output_db, output_excel,
+):
+    """Decide, given a resolved db_loader and the pipeline's spec, how the
+    pipeline's output table should be handled after ``.run()`` returns.
+
+    Two flags come out. ``needs_stabilization`` is True when the output
+    will be traversed by more than one consumer, so ``adapter.stabilize()``
+    should run before the first traversal. ``precount_via_nrows`` is True
+    when ``adapter.nrows()`` should be called up front to populate
+    ``pipeline_rows`` for the RunResult and the log line.
+
+    The COPY branch (ADR 0011) is the reason this helper exists. On
+    that path the pipeline output is a one-shot, bounded-memory source:
+    calling ``adapter.nrows()`` first either consumes the source (so
+    publish sees nothing) or re-runs the underlying lazy chain (defeating
+    both bounded memory and correctness -- the second traversal could
+    see different data). Row count is instead read from the publisher's
+    result after the source has been streamed.
+
+    ``db_loader='copy'`` is still rejected by ``validate_db_loader`` at
+    every public boundary, so no shipped pipeline actually reaches this
+    branch in 0.6.2. The branching is here as dormant production code so
+    the runner is already the real consumer of the row-source contract
+    when the transport lands, rather than needing a separate wiring
+    change. Exercised in isolation by ``test_runner.py`` calling this
+    helper directly with ``db_loader='copy'``; that is why the parameter
+    is passed in rather than pulled from ``spec.db_loader`` inline.
+    """
+    # bool() around each ``a and b`` idiom so the returned tuple is
+    # (bool, bool) rather than (whatever_truthy_str, bool). Callers use
+    # these as `if needs_stabilization:` so truthy works, but returning
+    # a bool is what the docstring and tests expect.
+    needs_stabilization_for_other_consumers = bool(
+        spec.publish_result
+        or spec.debug_display
+        or (output_excel and spec.excel_name)
+    )
+    if db_loader == 'copy':
+        # No adapter.nrows() and no stabilize() for the DB path alone --
+        # both would traverse the pipeline output, and COPY forbids that.
+        # Other consumers (Excel, debug_display, publish_result) still
+        # need it if they were asked for.
+        return needs_stabilization_for_other_consumers, False
+    needs_stabilization = bool(
+        needs_stabilization_for_other_consumers
+        or (output_db and spec.db_table)
+    )
+    return needs_stabilization, True
+
+
 def _build_db_run_result(*, output_db, has_db_outputs, publisher=None):
     if publisher is None:
         return DbRunResult(
@@ -539,18 +590,24 @@ def run_pipelines(
             # correctness risk, not just a performance one -- a changing
             # source table could produce different row counts between
             # nrows() and whatever publishes afterward.
-            needs_stabilization = (
-                spec.publish_result
-                or spec.debug_display
-                or (output_excel and spec.excel_name)
-                or (output_db and spec.db_table)
+            #
+            # _plan_pipeline_output_handling owns the two decisions
+            # (stabilize? pre-count?). Both branch on db_loader: COPY is
+            # bounded-memory one-shot, so nrows() must not run first.
+            # See ADR 0011.
+            needs_stabilization, precount_via_nrows = (
+                _plan_pipeline_output_handling(
+                    db_loader=spec.db_loader, spec=spec,
+                    output_db=output_db, output_excel=output_excel,
+                )
             )
             if needs_stabilization:
                 out_tbl = adapter.stabilize(out_tbl, repeated=True)
 
-            rows = adapter.nrows(out_tbl)
-            pipeline_rows[pipeline_name] = rows
-            log.info('pipeline %s finished, rows=%s', pipeline_name, rows)
+            if precount_via_nrows:
+                rows = adapter.nrows(out_tbl)
+                pipeline_rows[pipeline_name] = rows
+                log.info('pipeline %s finished, rows=%s', pipeline_name, rows)
 
             if spec.publish_result:
                 ctx.set_result(pipeline_name, out_tbl)
@@ -566,6 +623,16 @@ def run_pipelines(
             if output_db and spec.db_table:
                 payload = _build_db_payload_with_spec(pipeline_cls, out_tbl, spec, pg_schema, run_started_at=run_started_at)
                 publisher.publish(payload)
+                if not precount_via_nrows:
+                    # COPY path row count comes from the publisher after
+                    # streaming, since adapter.nrows() was not called first
+                    # (see _plan_pipeline_output_handling). Dormant in
+                    # 0.6.2: db_loader='copy' is publicly rejected, so
+                    # this branch is only reached via the helper test.
+                    full_name = f'{pg_schema}.{spec.db_table}'
+                    rows = publisher.table_rows[full_name]
+                    pipeline_rows[pipeline_name] = rows
+                    log.info('pipeline %s finished, rows=%s', pipeline_name, rows)
 
         if publisher is not None:
             if source_check_enabled:

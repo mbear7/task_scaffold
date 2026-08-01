@@ -93,7 +93,15 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
         )
 
     def test_the_adapter_interface_is_the_documented_five_plus_validate(self):
-        expected = {'validate', 'nrows', 'display', 'to_excel', 'to_db_payload', 'stabilize'}
+        # to_row_source is the COPY-path counterpart to to_db_payload,
+        # added in 0.6.2 for ADR 0011 §Row-source contract. It is
+        # exercised only when db_loader='copy' (currently rejected at
+        # every public boundary) but is part of the adapter interface
+        # rather than a hidden helper because the runner reaches for it
+        # by name; keeping it in this documented surface makes any
+        # future removal or rename fail visibly here.
+        expected = {'validate', 'nrows', 'display', 'to_excel', 'to_db_payload',
+                    'stabilize', 'to_row_source'}
         for key, adapter in _ADAPTERS.items():
             with self.subTest(adapter=key):
                 self.assertEqual({m for m in dir(adapter) if not m.startswith('_')}, expected)

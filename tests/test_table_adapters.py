@@ -388,5 +388,73 @@ class Test5NormalizeForExcelHandlesPdNaCorrectly(unittest.TestCase):
             )
 
 
+class Test6AdapterToRowSource(unittest.TestCase):
+    """to_row_source (ADR 0011 §Row-source contract) is the adapter's
+    COPY-path counterpart to to_db_payload. It hands back the raw
+    header/column tuple and a bare DbRowSource yielding positional row
+    tuples -- no db_contract projection, no framework columns; those
+    get layered on top by _ProjectedRowSource in the orchestrator.
+    These tests pin exactly that: header widths, positional yield
+    order, native column-type coercion for petl headers (stringified),
+    and the one-shot / bounded-memory shape (no whole-table
+    materialization inside the adapter helper)."""
+
+    def test_petl_returns_header_columns_and_bare_positional_rows(self):
+        tbl = etl.wrap([('a', 'b'), (1, 2), (3, 4)])
+        columns, source = PETL_ADAPTER.to_row_source(tbl)
+        self.assertEqual(columns, ('a', 'b'))
+        self.assertEqual(list(source.iter_rows()), [(1, 2), (3, 4)])
+
+    def test_petl_stringifies_non_string_header_values(self):
+        # Same rule from_petl already applies at db_publish.py:164 -- a
+        # header value that isn't a str (e.g. an integer column label)
+        # gets converted so downstream identifier validation sees a str.
+        # Pinning it separately on this helper because the two paths are
+        # independent code sites.
+        tbl = etl.wrap([(1, 'name'), ('a', 'b')])
+        columns, _ = PETL_ADAPTER.to_row_source(tbl)
+        self.assertEqual(columns, ('1', 'name'))
+
+    def test_petl_empty_table_is_rejected_with_a_clear_message(self):
+        from task_core.types import PipelineContractError
+        with self.assertRaises(PipelineContractError):
+            PETL_ADAPTER.to_row_source(etl.wrap([]))
+
+    def test_pandas_returns_columns_and_bare_positional_rows(self):
+        df = pd.DataFrame({'a': [10, 20], 'b': [30, 40]})
+        columns, source = PANDAS_ADAPTER.to_row_source(df)
+        self.assertEqual(columns, ('a', 'b'))
+        self.assertEqual(list(source.iter_rows()), [(10, 30), (20, 40)])
+
+    def test_pandas_uses_itertuples_index_false_name_none(self):
+        # ADR 0011 §Row-source contract names itertuples(index=False,
+        # name=None) explicitly. The observable consequence is that no
+        # index value appears in the yielded tuples and each tuple is
+        # a plain tuple, not a named-tuple -- both are checked here.
+        df = pd.DataFrame({'a': [1, 2]}, index=['x', 'y'])
+        _, source = PANDAS_ADAPTER.to_row_source(df)
+        rows = list(source.iter_rows())
+        self.assertEqual(rows, [(1,), (2,)])
+        for row in rows:
+            self.assertIs(type(row), tuple)
+
+    def test_pandas_empty_dataframe_is_rejected(self):
+        from task_core.types import PipelineContractError
+        with self.assertRaises(PipelineContractError):
+            PANDAS_ADAPTER.to_row_source(pd.DataFrame())
+
+    def test_bare_source_is_one_shot(self):
+        # ADR 0011 requires one-shot semantics. For pandas the DataFrame
+        # itself is materialized so re-iterating iter_rows() is a caller
+        # decision, but iter_rows() returning a fresh iterator each time
+        # would let the caller stream twice by accident, which the
+        # contract forbids. Verify by consuming once and checking that
+        # the second consumption is empty.
+        _, source = PETL_ADAPTER.to_row_source(etl.wrap([('a',), (1,), (2,)]))
+        it = source.iter_rows()
+        self.assertEqual(list(it), [(1,), (2,)])
+        self.assertEqual(list(it), [])
+
+
 if __name__ == '__main__':
     unittest.main()

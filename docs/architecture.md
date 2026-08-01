@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.6.1. This describes the present system, not
+How `task_core` works as of 0.6.2. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -190,7 +190,7 @@ structurally for every declared pipeline, whether or not it is in
 
 ## Table adapters
 
-petl and pandas are reached through one six-method interface, selected
+petl and pandas are reached through one seven-method interface, selected
 per pipeline by `spec.table_adapter` or inferred from the returned object.
 
 ```
@@ -198,7 +198,8 @@ validate(tbl)          reject something that is not a table of this kind
 nrows(tbl)             row count
 display(tbl)           debug output
 to_excel(tbl, name)    write a workbook
-to_db_payload(tbl, …)  build a DbPayload
+to_db_payload(tbl, …)  build a DbPayload for the INSERT path
+to_row_source(tbl)     (columns, DbRowSource) for the row-source path
 stabilize(tbl, …)      materialize a lazy table that will be traversed twice
 ```
 
@@ -474,6 +475,6 @@ anything, so a failure part-way through does not leave it half-open.
 - **`build_context`** — the task supplies its own, or uses
   `build_resource_context()` for the standard `RESOURCES`/`bind()` model.
 - **`table_adapter`** — registered in `table_adapters.py`. Adding one means
-  implementing the six methods; nothing in `runner.py` changes.
+  implementing the seven methods; nothing in `runner.py` changes.
 - **`source_access`** — `build_source_access()` selects local or SMB file
   access; a resource takes whichever it is given.

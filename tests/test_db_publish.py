@@ -1887,6 +1887,21 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
             'publish() opened a transaction before db_loader validation rejected the payload',
         )
 
+    def test_payload_state_matrix_uses_dbpublisherror(self):
+        # DbPayload.__post_init__ calls validate_payload_source_state
+        # with error_type=DbPublishError so any invalid combination at
+        # this boundary surfaces with the same exception class the rest
+        # of the payload validation uses -- callers catching
+        # DbPublishError see all payload-construction failures uniformly.
+        # 'insert' with rows=None is the only insert-side leg reachable
+        # via the DbPayload constructor (the copy-side legs are blocked
+        # earlier by validate_db_loader).
+        with self.assertRaises(DbPublishError):
+            DbPayload(
+                table_name='t', schema=None, columns=['v'],
+                rows=None, db_loader='insert',
+            )
+
     def test_publication_dispatches_through_the_loaders_registry(self):
         """The registry only earns its keep if publish() actually reaches
         it, so this test proves the seam is load-bearing by monkeypatching
@@ -1920,6 +1935,338 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
             dbp.LOADERS['insert'] = real
 
         self.assertEqual(calls, [2], 'publish() did not dispatch through LOADERS')
+
+
+class Test17cRowSourceProjection(unittest.TestCase):
+    """RowProjection + _ProjectedRowSource (ADR 0011 §Row-source
+    contract) are the one transport-neutral mechanism that composes
+    db_contract renaming/projection and framework columns (currently
+    just the run-started-at timestamp) into the final logical rows of
+    a DbPayload -- see db_publish.py's own docstrings.
+
+    Two things worth pinning explicitly. First, that a
+    _ProjectedRowSource wrapping the raw bare source produces exactly
+    the same column values as the current INSERT path (from_petl +
+    _apply_db_contract_columns + apply_db_updated_at), so the two paths
+    cannot silently drift -- the parity test uses identical inputs
+    on both sides and compares column-by-column. Second, that the
+    framework timestamp is computed once per RowProjection instance
+    and injected into every row, matching the current
+    apply_db_updated_at semantics (one datetime per publish, not one
+    per row).
+    """
+
+    def _bare_source(self, rows):
+        # Minimal DbRowSource for tests: yields the given positional
+        # tuples once. Not a mock -- a plain object with iter_rows(),
+        # exactly what the runtime_checkable protocol asks for.
+        class _S:
+            def __init__(self, r): self._r = r
+            def iter_rows(self): return iter(self._r)
+        return _S(rows)
+
+    def test_identity_projection_passes_rows_through_unchanged(self):
+        from task_core.db_publish import RowProjection, _ProjectedRowSource
+        proj = RowProjection.build(
+            ('a', 'b'), db_contract=None, framework_columns=(),
+            run_started_at=None,
+        )
+        self.assertEqual(proj.output_columns, ('a', 'b'))
+        rows = list(_ProjectedRowSource(
+            self._bare_source([(1, 2), (3, 4)]), proj,
+        ).iter_rows())
+        self.assertEqual(rows, [(1, 2), (3, 4)])
+
+    def test_contract_renames_and_projects_columns(self):
+        # Same inputs the INSERT path passes to
+        # _apply_db_contract_columns: source column names get mapped to
+        # target names, and a source column not listed in the mapping
+        # is dropped from output.
+        from task_core.db_publish import RowProjection, _ProjectedRowSource
+        proj = RowProjection.build(
+            ('a', 'b', 'c'),
+            db_contract={'a': 'x', 'c': 'z'},
+            framework_columns=(),
+            run_started_at=None,
+        )
+        self.assertEqual(proj.output_columns, ('x', 'z'))
+        rows = list(_ProjectedRowSource(
+            self._bare_source([(1, 2, 3), (10, 20, 30)]), proj,
+        ).iter_rows())
+        self.assertEqual(rows, [(1, 3), (10, 30)])
+
+    def test_framework_column_is_appended_after_contract(self):
+        # Composition order matches export.py: contract projection first,
+        # framework columns after. That is what the INSERT path does
+        # today; the parity test below re-asserts it against real
+        # from_petl output as ground truth.
+        from datetime import datetime, timezone
+        from task_core.db_publish import RowProjection, _ProjectedRowSource
+        from task_core.types import OutputColumn
+        ts = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+        proj = RowProjection.build(
+            ('a', 'b'),
+            db_contract={'a': 'x', 'b': 'y'},
+            framework_columns=(
+                OutputColumn('etl_updated_at', 'TIMESTAMPTZ', nullable=False),
+            ),
+            run_started_at=ts,
+        )
+        self.assertEqual(proj.output_columns, ('x', 'y', 'etl_updated_at'))
+        rows = list(_ProjectedRowSource(
+            self._bare_source([(1, 2), (3, 4)]), proj,
+        ).iter_rows())
+        self.assertEqual(rows, [(1, 2, ts), (3, 4, ts)])
+
+    def test_framework_timestamp_is_computed_once_not_per_row(self):
+        # The timestamp is bound to the RowProjection at build time --
+        # every row gets the SAME object, not a fresh datetime.now() per
+        # row. Verified with `is` because that is the precise property
+        # the user's directive named ('calculate the timestamp once per
+        # payload/run, not once per row').
+        from datetime import datetime, timezone
+        from task_core.db_publish import RowProjection, _ProjectedRowSource
+        from task_core.types import OutputColumn
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        proj = RowProjection.build(
+            ('a',), db_contract=None,
+            framework_columns=(OutputColumn('etl_updated_at', 'TIMESTAMPTZ', nullable=False),),
+            run_started_at=ts,
+        )
+        rows = list(_ProjectedRowSource(
+            self._bare_source([(1,), (2,), (3,)]), proj,
+        ).iter_rows())
+        for row in rows:
+            self.assertIs(row[1], ts)
+
+    def test_framework_position_is_derived_not_hardcoded(self):
+        # The framework column position is len(contract_projected_cols),
+        # not "always last". Today it resolves to last because there is
+        # no other kind of appended-after column -- pinned as encoded,
+        # not assumed, so a future non-terminal framework column keeps
+        # the projection honest without a rewrite.
+        from datetime import datetime, timezone
+        from task_core.db_publish import RowProjection
+        from task_core.types import OutputColumn
+        ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        proj = RowProjection.build(
+            ('a', 'b', 'c'),
+            db_contract={'a': 'x', 'b': 'y'},  # drops 'c'; two output cols
+            framework_columns=(OutputColumn('etl_updated_at', 'TIMESTAMPTZ', nullable=False),),
+            run_started_at=ts,
+        )
+        # constants sits at index 2 (after two contract-projected
+        # columns), not blindly at len(source_columns)=3.
+        self.assertIn(2, proj.constants)
+        self.assertNotIn(3, proj.constants)
+
+    def test_source_row_wrong_width_raises_with_row_number(self):
+        from task_core.db_publish import RowProjection, _ProjectedRowSource, DbPublishError
+        proj = RowProjection.build(
+            ('a', 'b'), db_contract=None, framework_columns=(),
+            run_started_at=None,
+        )
+        with self.assertRaises(DbPublishError) as caught:
+            # Second row has width 3; expected 2.
+            list(_ProjectedRowSource(
+                self._bare_source([(1, 2), (10, 20, 30)]), proj,
+            ).iter_rows())
+        message = str(caught.exception)
+        self.assertIn('row 2', message)
+
+    def test_missing_source_column_in_contract_is_a_configuration_error(self):
+        from task_core.db_publish import RowProjection, DbPublishError
+        with self.assertRaises(DbPublishError) as caught:
+            RowProjection.build(
+                ('a', 'b'), db_contract={'c': 'z'}, framework_columns=(),
+                run_started_at=None,
+            )
+        self.assertIn("'c'", str(caught.exception))
+
+    def test_rowprojection_is_frozen_immutable_after_construction(self):
+        # frozen=True dataclass + tuple fields + MappingProxyType for
+        # constants. Reassigning a field must raise; mutating the
+        # constants map must raise. Both properties matter -- the
+        # existing PipelineSpec bug (mutable dict inside a frozen
+        # dataclass) is exactly the failure mode this closes.
+        import dataclasses
+        from task_core.db_publish import RowProjection
+        proj = RowProjection.build(
+            ('a',), db_contract=None, framework_columns=(),
+            run_started_at=None,
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proj.output_columns = ('z',)
+        with self.assertRaises(TypeError):
+            proj.constants[0] = 'x'
+
+    def test_projected_output_matches_the_insert_paths_output_column_by_column(self):
+        """Parity test (Reading A) -- the whole point of introducing
+        this test is that the INSERT path is untouched and the COPY
+        path uses the new projection mechanism, so an assertion that
+        both produce the same values on the same input is what
+        prevents semantic drift between them. The current INSERT path
+        is: from_petl (which applies _apply_db_contract_columns
+        internally) followed by apply_db_updated_at (which appends the
+        framework column and injects the run-started-at into every
+        row). The COPY equivalent goes through
+        _petl_row_source + RowProjection + _ProjectedRowSource.
+        Every column value in every row must match, in order.
+        """
+        from datetime import datetime, timezone
+        import petl as etl
+        from task_core.db_publish import (
+            RowProjection, _ProjectedRowSource, from_petl,
+        )
+        from task_core.export import apply_db_updated_at
+        from task_core.table_adapters import PETL_ADAPTER
+        from task_core.types import OutputColumn, PipelineSpec
+
+        ts = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
+        contract = {'src_a': 'a', 'src_c': 'c'}  # drops src_b, renames the rest
+
+        # INSERT-path payload.
+        tbl = etl.wrap([
+            ('src_a', 'src_b', 'src_c'),
+            (1, 'skip1', 10),
+            (2, 'skip2', 20),
+            (3, 'skip3', 30),
+        ])
+        payload = from_petl(
+            tbl, table_name='t', schema=None, db_contract=contract,
+        )
+        spec = PipelineSpec(db_table='t', db_updated_at=True)
+        apply_db_updated_at(payload, spec, run_started_at=ts)
+        insert_columns = list(payload.columns)
+        insert_rows = [
+            tuple(row[col] for col in insert_columns) for row in payload.rows
+        ]
+
+        # COPY-path projection over the same table.
+        tbl2 = etl.wrap([
+            ('src_a', 'src_b', 'src_c'),
+            (1, 'skip1', 10),
+            (2, 'skip2', 20),
+            (3, 'skip3', 30),
+        ])
+        source_columns, bare = PETL_ADAPTER.to_row_source(tbl2)
+        proj = RowProjection.build(
+            source_columns,
+            db_contract=contract,
+            framework_columns=(OutputColumn('etl_updated_at', 'TIMESTAMPTZ', nullable=False),),
+            run_started_at=ts,
+        )
+        copy_columns = list(proj.output_columns)
+        copy_rows = list(_ProjectedRowSource(bare, proj).iter_rows())
+
+        # Column order and row values must match. Framework column at
+        # the same position; timestamp identical; dropped column
+        # actually dropped.
+        self.assertEqual(insert_columns, copy_columns)
+        self.assertEqual(insert_rows, copy_rows)
+
+
+class Test17dRunnerCopyBranching(unittest.TestCase):
+    """_plan_pipeline_output_handling (ADR 0011 §Preparation flows) is
+    the runner's Phase 4 branching helper: given a resolved db_loader
+    and the pipeline's spec, it decides whether to stabilize the
+    output for repeated traversal and whether to pre-count rows via
+    adapter.nrows() before publishing.
+
+    Lives in test_db_publish.py rather than a runner-specific file
+    because the branching rule is a consequence of the row-source
+    contract, and the row-source contract is what this file tests.
+    db_loader='copy' is still rejected at every public spec/payload
+    boundary in 0.6.2, so the (db_loader='copy', ...) legs here are
+    exercised by calling the helper directly -- exactly the pattern
+    the user asked for: dormant production code, exercised by direct
+    helper tests, so the runner is already the real consumer of the
+    row-source contract when the transport lands.
+    """
+
+    def _spec(self, **overrides):
+        # Every test wants the same PipelineSpec baseline (db_table set,
+        # everything else default) and overrides one or two fields.
+        from task_core.types import PipelineSpec
+        defaults = {'db_table': 't', 'db_loader': 'insert'}
+        defaults.update(overrides)
+        return PipelineSpec(**defaults)
+
+    def _call(self, *, db_loader, spec, output_db, output_excel):
+        from task_core.runner import _plan_pipeline_output_handling
+        return _plan_pipeline_output_handling(
+            db_loader=db_loader, spec=spec,
+            output_db=output_db, output_excel=output_excel,
+        )
+
+    def test_insert_with_db_output_stabilizes_and_precounts(self):
+        # The historical behavior: publish will traverse the table, and
+        # nrows() traverses it once first for the log line and the
+        # RunResult. Both flags must be True so stabilize() runs before
+        # the first traversal (nrows()) populates the cache.
+        result = self._call(
+            db_loader='insert', spec=self._spec(),
+            output_db=True, output_excel=False,
+        )
+        self.assertEqual(result, (True, True))
+
+    def test_insert_without_any_output_still_precounts_for_the_log(self):
+        # No DB, no Excel, no display, no publish_result -- but the log
+        # line 'pipeline X finished, rows=N' is unconditional on the
+        # insert path, so nrows() still runs. Stabilize is skipped
+        # because nothing else traverses.
+        result = self._call(
+            db_loader='insert', spec=self._spec(),
+            output_db=False, output_excel=False,
+        )
+        self.assertEqual(result, (False, True))
+
+    def test_copy_with_db_output_alone_skips_stabilize_and_precount(self):
+        # The whole point of the branch. COPY is one-shot and
+        # bounded-memory; adapter.nrows() would consume or re-run the
+        # source, either of which defeats the contract. stabilize()
+        # only earns its keep when the table is traversed twice, so
+        # skipping nrows() also removes any reason to stabilize -- the
+        # publish call is the sole consumer.
+        result = self._call(
+            db_loader='copy', spec=self._spec(),
+            output_db=True, output_excel=False,
+        )
+        self.assertEqual(result, (False, False))
+
+    def test_copy_with_debug_display_stabilizes_but_still_no_precount(self):
+        # Second consumer (debug_display) forces stabilization; the DB
+        # publish traversal is the second one, not the first, so cache
+        # populates fine. nrows() is still skipped -- the row count on
+        # the COPY path comes from the publisher after streaming.
+        result = self._call(
+            db_loader='copy', spec=self._spec(debug_display=True),
+            output_db=True, output_excel=False,
+        )
+        self.assertEqual(result, (True, False))
+
+    def test_copy_with_excel_stabilizes(self):
+        # Same shape as debug_display: Excel export traverses the
+        # table, so stabilization prevents a second traversal from
+        # re-running the underlying chain. precount stays False.
+        result = self._call(
+            db_loader='copy', spec=self._spec(excel_name='out.xlsx'),
+            output_db=True, output_excel=True,
+        )
+        self.assertEqual(result, (True, False))
+
+    def test_return_type_is_a_pair_of_bools(self):
+        # The runner uses these as ``if needs_stabilization:`` which
+        # accepts truthy strings too, but returning a bool is the
+        # documented shape -- pinned here so a future refactor that
+        # accidentally leaks a truthy str fails visibly rather than
+        # silently.
+        needs, precount = self._call(
+            db_loader='insert', spec=self._spec(excel_name='out.xlsx'),
+            output_db=True, output_excel=True,
+        )
+        self.assertIs(type(needs), bool)
+        self.assertIs(type(precount), bool)
 
 
 class Test18ConnectionLossIsFatal(unittest.TestCase):

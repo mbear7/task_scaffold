@@ -9,6 +9,81 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.2
+
+Phase 3b + Phase 4 of ADR 0011, landed together so the row-source
+contract has a real consumer from the moment it exists. `db_loader='copy'`
+remains rejected at every public boundary -- the new machinery is dormant
+production code, exercised by direct helper tests. Callers using the
+default `db_loader='insert'` observe no API or behavioral change.
+
+### Added
+- **`DbRowSource`** protocol in `task_core.types` -- level-0,
+  engine-neutral, `runtime_checkable`. Yields positional row sequences
+  (not dicts) so a future COPY transport can spool them straight to
+  PostgreSQL without walking a dict per row. See ADR 0011 §Row-source
+  contract.
+- **`DbPayload.row_source`** field, appended after every 0.6.0 field to
+  preserve positional-construction stability. Only meaningful when
+  `db_loader='copy'`; `None` on the insert path.
+- **`validate_payload_source_state(loader, rows, row_source)`** in
+  `task_core.types`. Enforces the exact ADR state matrix at
+  `DbPayload.__post_init__` after `validate_db_loader`. `insert` requires
+  materialized rows and forbids a row source; `copy` requires a row
+  source and forbids materialized rows.
+- **`RowProjection`** (frozen dataclass) + **`_ProjectedRowSource`** in
+  `task_core.db_publish`. One transport-neutral mechanism composes
+  `db_contract` renaming/projection and framework columns (currently
+  just the run-started-at timestamp) into the final logical row shape.
+  Timestamp is bound at construction and injected once per row -- not
+  recomputed. Framework column position is derived from
+  `len(contract_projected_columns)`, not hardcoded to "last".
+- **`_PetlAdapter.to_row_source(tbl)`** and
+  **`_PandasAdapter.to_row_source(df)`** -- return `(columns_tuple,
+  DbRowSource)` yielding bare positional rows. `db_contract` and
+  framework columns are added by `_ProjectedRowSource` in the
+  orchestrator, not per adapter, so the two engines never accumulate
+  duplicated row-shaping semantics.
+- **`_plan_pipeline_output_handling`** in `task_core.runner` -- the
+  Phase 4 branching helper. On the COPY path, `adapter.nrows()` and
+  `adapter.stabilize()` are skipped for the DB consumer alone (both
+  would traverse a one-shot bounded-memory source and defeat the
+  contract); the row count comes from the publisher after streaming.
+  Takes `db_loader` as a parameter so tests can exercise the branch
+  directly even though no shipped pipeline can reach `db_loader='copy'`
+  in 0.6.2.
+
+### Tests
+- **`Test5DbRowSourceProtocolShape`** and **`Test6PayloadSourceStateMatrix`**
+  in `tests/test_types.py` -- the protocol is `runtime_checkable`; the
+  state matrix rejects both invalid `insert` legs and both invalid
+  `copy` legs, and honors `error_type=` for the payload boundary.
+- **`Test17cRowSourceProjection`** in `tests/test_db_publish.py` --
+  identity, contract, framework composition, framework position
+  derivation, timestamp-once-per-run, source-width mismatch, missing
+  contract source, immutability, and a **parity test** proving
+  `_ProjectedRowSource` output matches the current INSERT path
+  (`from_petl` + `apply_db_updated_at`) column-by-column. Parity test
+  verified by revert-observe-restore (skipped the framework-column loop;
+  test failed on the column-list assertion).
+- **`Test17dRunnerCopyBranching`** -- the Phase 4 helper's insert vs
+  copy decisions, with and without other consumers (Excel,
+  debug_display), and the return type invariant.
+- **`Test6AdapterToRowSource`** in `tests/test_table_adapters.py` --
+  petl/pandas header extraction, positional row yield, one-shot
+  semantics, empty-table rejection, and the `itertuples(index=False,
+  name=None)` shape.
+
+### Changed
+- **`DbPayload.rows`** typed as `list[dict[str, Any]] | None`. Only
+  reachable as `None` for `db_loader='copy'`, which is still rejected
+  publicly; insert callers observe no change.
+- **Adapter interface** grew a seventh method `to_row_source`, updated
+  in `Test1DocumentedApiMatchesTheCode`.
+- **ADR 0011 §Verification status** records that 0.6.2 shipped Phase 3b
+  and Phase 4.
+
+
 ## 0.6.1
 
 Follow-up patch closing four gaps external review found against 0.6.0.

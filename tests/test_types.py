@@ -104,8 +104,8 @@ class Test3DbLoaderVocabulary(unittest.TestCase):
     """PipelineSpec.db_loader landed in 0.6.0 as the public configuration
     surface for the loader described by ADR 0011. Until COPY is
     implemented the only accepted value is 'insert' -- 'copy' is named in
-    the validator and rejected with a message that says why, per the
-    'no reserved-and-rejected vocabulary' rule in CLAUDE.md."""
+    the validator and rejected with a message that says why: the project
+    rejects reserved-and-rejected vocabulary."""
 
     def test_the_vocabulary_lists_only_the_implemented_loader(self):
         # If a value ever appears here that has no implementation behind
@@ -195,6 +195,101 @@ class Test4OldPositionalPipelineSpecConstructionKeepsItsMeaning(unittest.TestCas
         # db_loader is the 0.6.0 addition; positional callers from 0.5.2
         # did not pass it, so it must default to 'insert'.
         self.assertEqual(spec.db_loader, 'insert')
+
+
+class Test5DbRowSourceProtocolShape(unittest.TestCase):
+    """DbRowSource (ADR 0011 §Row-source contract) is the shape the COPY
+    transport reads from. It lives in types.py because it is level 0
+    engine-neutral vocabulary -- adapters, publisher, and future
+    db_copy.py all consult it. runtime_checkable is deliberate so a
+    hand-written test double with an ``iter_rows()`` method can be
+    isinstance-checked without a formal subclass declaration."""
+
+    def test_the_protocol_is_declared_and_runtime_checkable(self):
+        from task_core.types import DbRowSource
+        # A plain object with the right method satisfies the protocol
+        # under runtime_checkable, without inheriting from anything.
+        class _Duck:
+            def iter_rows(self):
+                yield (1, 2)
+        self.assertIsInstance(_Duck(), DbRowSource)
+
+    def test_missing_iter_rows_fails_the_protocol_check(self):
+        from task_core.types import DbRowSource
+        class _NotASource:
+            pass
+        self.assertNotIsInstance(_NotASource(), DbRowSource)
+
+
+class Test6PayloadSourceStateMatrix(unittest.TestCase):
+    """validate_payload_source_state (ADR 0011 §Row-source contract)
+    enforces the exact (loader, rows, row_source) legal states. The
+    matrix has four cells; two are valid, two are configuration errors.
+
+    'copy' is still rejected by validate_db_loader at every public
+    payload/spec boundary, so the (copy, ...) legs here are reachable
+    only by calling validate_payload_source_state directly -- exactly
+    what these tests do, so the future db_copy.py transport lands with
+    the state matrix already asserted."""
+
+    def test_insert_with_rows_and_no_row_source_is_valid(self):
+        from task_core.types import validate_payload_source_state
+        # No return value; no exception either.
+        validate_payload_source_state('insert', [{'a': 1}], None)
+
+    def test_insert_with_missing_rows_is_a_configuration_error(self):
+        from task_core.types import validate_payload_source_state
+        with self.assertRaises(ValueError) as caught:
+            validate_payload_source_state('insert', None, None)
+        self.assertIn("'insert'", str(caught.exception))
+
+    def test_insert_with_extra_row_source_is_a_configuration_error(self):
+        from task_core.types import validate_payload_source_state
+        class _S:
+            def iter_rows(self): return iter(())
+        with self.assertRaises(ValueError) as caught:
+            validate_payload_source_state('insert', [{'a': 1}], _S())
+        self.assertIn('row_source', str(caught.exception))
+
+    def test_copy_with_row_source_and_no_rows_is_valid(self):
+        from task_core.types import validate_payload_source_state
+        class _S:
+            def iter_rows(self): return iter(())
+        validate_payload_source_state('copy', None, _S())
+
+    def test_copy_with_missing_row_source_is_a_configuration_error(self):
+        from task_core.types import validate_payload_source_state
+        with self.assertRaises(ValueError) as caught:
+            validate_payload_source_state('copy', None, None)
+        self.assertIn("'copy'", str(caught.exception))
+
+    def test_copy_with_extra_rows_is_a_configuration_error(self):
+        from task_core.types import validate_payload_source_state
+        class _S:
+            def iter_rows(self): return iter(())
+        with self.assertRaises(ValueError) as caught:
+            validate_payload_source_state('copy', [{'a': 1}], _S())
+        self.assertIn('materialized rows', str(caught.exception))
+
+    def test_unknown_loader_is_an_invariant_violation(self):
+        # validate_db_loader is supposed to reject unknown loaders first,
+        # so reaching this function with an unknown value means the two
+        # have drifted. Verified as an internal invariant, not a task-
+        # author error, per the docstring in types.py.
+        from task_core.types import validate_payload_source_state
+        with self.assertRaises(ValueError) as caught:
+            validate_payload_source_state('banana', [{'a': 1}], None)
+        self.assertIn('invariant', str(caught.exception))
+
+    def test_error_type_argument_is_honored(self):
+        # validate_payload_source_state accepts error_type= for the same
+        # reason validate_db_loader does -- DbPayload calls it with
+        # DbPublishError so failures surface with the correct exception
+        # class for downstream handlers.
+        from task_core.types import validate_payload_source_state
+        class _Custom(Exception): pass
+        with self.assertRaises(_Custom):
+            validate_payload_source_state('insert', None, None, error_type=_Custom)
 
 
 class TestFindDuplicates(unittest.TestCase):

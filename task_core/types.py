@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 # Runtime floor for the whole package, enforced at import time -- not just
 # documented in the README. cleanup.py and runner.py use e.add_note() and
@@ -169,6 +170,75 @@ def validate_db_loader(
             f'{field_name} must be one of {DB_LOADERS}, got {value!r}'
         )
     return value
+
+
+@runtime_checkable
+class DbRowSource(Protocol):
+    """One-shot iterator over positional rows for a DbPayload.
+
+    Yields sequences of column values in the order declared by the
+    payload's ``columns``. Consumed exactly once -- callers that need
+    a second traversal must materialize themselves. Positional (not
+    dictionary) so a COPY transport can spool values straight to
+    PostgreSQL without walking a dict per row. See ADR 0011
+    (Row-source contract).
+    """
+
+    def iter_rows(self) -> Iterator[Sequence[Any]]:
+        ...
+
+
+def validate_payload_source_state(
+    loader, rows, row_source, *, error_type=ValueError,
+):
+    """Enforce the exact (db_loader, rows, row_source) state matrix from
+    ADR 0011 §Row-source contract:
+
+        loader=insert  ->  rows present, row_source absent
+        loader=copy    ->  rows absent,  row_source present
+
+    Any other combination is a configuration error before source
+    execution or staging DDL. Called from ``DbPayload.__post_init__``
+    after ``validate_db_loader`` so ``loader`` is already known to be a
+    supported value.
+
+    'copy' is still rejected publicly by ``validate_db_loader``; the
+    ``loader='copy'`` leg here is reachable only by direct callers
+    exercising the state matrix in isolation, and by future code that
+    implements the transport.
+    """
+    if loader == 'insert':
+        if rows is None:
+            raise error_type(
+                "db_loader='insert' requires rows to be present, got None"
+            )
+        if row_source is not None:
+            raise error_type(
+                "db_loader='insert' must not carry a row_source; the "
+                'materialized rows are the source'
+            )
+        return
+
+    if loader == 'copy':
+        if row_source is None:
+            raise error_type(
+                "db_loader='copy' requires row_source to be present, got None"
+            )
+        if rows is not None:
+            raise error_type(
+                "db_loader='copy' must not carry materialized rows; the "
+                'row_source is the source'
+            )
+        return
+
+    # Any loader value not covered above should already have been
+    # rejected by validate_db_loader before this runs. Reaching this
+    # branch means the two functions have drifted -- an invariant
+    # violation, not a task-author mistake.
+    raise error_type(
+        f'internal invariant violated -- validate_payload_source_state '
+        f'reached unknown loader {loader!r}'
+    )
 
 
 @dataclass(frozen=True)

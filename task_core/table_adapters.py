@@ -71,6 +71,38 @@ def normalize_for_excel(value):
     return value
 
 
+class _PetlRawRowSource:
+    # ADR 0011: 'The source yields positional rows rather than
+    # dictionaries. Column order is owned separately and row width is
+    # checked exactly.' Width checking is enforced by _ProjectedRowSource
+    # on top of this bare source, not here -- this class only knows how
+    # to walk a petl table, skipping its header once.
+    def __init__(self, tbl):
+        self._tbl = tbl
+
+    def iter_rows(self):
+        # petl iterates the header on every fresh iter() call. Skipped
+        # once, then yield each remaining row as a positional tuple.
+        # One-shot semantics: a caller who needs a second traversal must
+        # materialize themselves (same rule the ADR requires).
+        it = iter(self._tbl)
+        next(it, None)
+        for row in it:
+            yield tuple(row)
+
+
+class _PandasRawRowSource:
+    # itertuples(index=False, name=None) is the ADR-specified iteration
+    # method: no index column, no named-tuple overhead, plain tuples
+    # yielded straight from the DataFrame's own row buffer.
+    def __init__(self, df):
+        self._df = df
+
+    def iter_rows(self):
+        for row in self._df.itertuples(index=False, name=None):
+            yield row
+
+
 class _PetlAdapter:
     def validate(self, tbl):
         if tbl is None:
@@ -110,6 +142,22 @@ class _PetlAdapter:
     def to_db_payload(self, tbl, **kwargs):
         with suppress_openpyxl_data_validation_warning():
             return from_petl(tbl, **kwargs)
+
+    def to_row_source(self, tbl):
+        # (columns, DbRowSource) pair for the COPY path -- see ADR 0011
+        # §Row-source contract. Bare source: no db_contract projection,
+        # no framework columns; those are wrapped in by _ProjectedRowSource
+        # in the orchestrator. Returned columns are the petl header, in
+        # the exact order that _PetlRawRowSource will yield values.
+        it = iter(tbl)
+        try:
+            header = next(it)
+        except StopIteration:
+            raise PipelineContractError(
+                'expected a non-empty petl table for row source, got empty'
+            )
+        columns = tuple(str(col) for col in header)
+        return columns, _PetlRawRowSource(tbl)
 
 
 class _PandasAdapter:
@@ -176,6 +224,18 @@ class _PandasAdapter:
 
     def to_db_payload(self, tbl, **kwargs):
         return from_pandas(tbl, **kwargs)
+
+    def to_row_source(self, tbl):
+        # Same contract as _PetlAdapter.to_row_source above -- see there
+        # for the ADR reference and why this is a bare source. Pandas has
+        # no separate "header row"; df.columns is the schema and every
+        # itertuple is a data row.
+        columns = tuple(str(col) for col in tbl.columns)
+        if not columns:
+            raise PipelineContractError(
+                'expected a DataFrame with at least one column for row source, got none'
+            )
+        return columns, _PandasRawRowSource(tbl)
 
 
 PETL_ADAPTER = _PetlAdapter()
