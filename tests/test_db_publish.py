@@ -35,6 +35,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from datetime import date, datetime, timedelta, timezone as tz
 from decimal import Decimal
 from pathlib import Path
@@ -3035,6 +3036,101 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
             self.assertEqual(list(Path(tmp).iterdir()), [])
             self.assertEqual(publisher.table_rows['None.target'], 2)
             self.assertEqual(publisher._pending_swaps[-1][-1], 2)
+
+    def test_default_spool_root_is_removed_after_successful_copy(self):
+        from task_core import db_copy as db_copy_module
+        from task_core import db_publish as module
+        from task_core.db_copy import CopyLoadPolicy, DEFAULT_SPOOL_SUBDIR
+
+        source = self._OneShotSource([('a', 1), ('b', 2)])
+        conn = Test17PreparationValidationAndOwnership._Conn(
+            columns=['id', 'amount'],
+        )
+        original = module.LOADERS['copy']
+
+        def fake_copy_loader(_conn, _table, prepared, _chunk_size):
+            with prepared.open_reader() as reader:
+                reader.read()
+            return prepared.row_count
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / DEFAULT_SPOOL_SUBDIR
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                publisher = DbPublisher(
+                    creds=_CREDS,
+                    schema=None,
+                    task_name='copy_task',
+                    copy_load_policy=CopyLoadPolicy(
+                        buffer_bytes=1024,
+                        encrypt_spools=True,
+                    ),
+                )
+                publisher._conn = conn
+                publisher._engine = object()
+                self.assertTrue(publisher.begin_run())
+                self.assertFalse(root.exists())
+
+                module.LOADERS['copy'] = fake_copy_loader
+                try:
+                    result = publisher.publish(self._payload(source))
+                finally:
+                    module.LOADERS['copy'] = original
+
+                self.assertEqual(result.rows, 2)
+                self.assertFalse(
+                    root.exists(),
+                    'successful COPY left the empty task_core-owned spool root',
+                )
+
+    def test_default_spool_root_is_removed_after_copy_failure(self):
+        from task_core import db_copy as db_copy_module
+        from task_core import db_publish as module
+        from task_core.db_copy import CopyLoadPolicy, DEFAULT_SPOOL_SUBDIR
+
+        source = self._OneShotSource([('a', 1)])
+        conn = Test17PreparationValidationAndOwnership._Conn(
+            columns=['id', 'amount'],
+        )
+        original = module.LOADERS['copy']
+
+        def failing_loader(_conn, _table, prepared, _chunk_size):
+            self.assertTrue(prepared.path.exists())
+            raise RuntimeError('deliberate COPY failure')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / DEFAULT_SPOOL_SUBDIR
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                publisher = DbPublisher(
+                    creds=_CREDS,
+                    schema=None,
+                    task_name='copy_task',
+                    copy_load_policy=CopyLoadPolicy(
+                        buffer_bytes=1024,
+                        encrypt_spools=True,
+                    ),
+                )
+                publisher._conn = conn
+                publisher._engine = object()
+                self.assertTrue(publisher.begin_run())
+
+                module.LOADERS['copy'] = failing_loader
+                try:
+                    with self.assertRaisesRegex(
+                        RuntimeError, 'deliberate COPY failure',
+                    ):
+                        publisher.publish(self._payload(source))
+                finally:
+                    module.LOADERS['copy'] = original
+                    publisher.rollback()
+
+                self.assertFalse(
+                    root.exists(),
+                    'failed COPY left the empty task_core-owned spool root',
+                )
 
     def test_copy_failure_preserves_primary_and_reaps_final_spool(self):
         from task_core import db_publish as module

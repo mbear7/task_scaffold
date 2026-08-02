@@ -1,10 +1,14 @@
 # 0011 — Add a bounded-memory `COPY FROM STDIN` loader
 
-Status: accepted in stages. Phases 1-7 are implemented through 0.6.10.
-`db_loader='copy'` is a public staging transport with predecessor-spool cleanup
-under the task advisory lock. The 0.6.8 correctness and failure campaigns passed
-on PostgreSQL 18.4; Phase 8 performance acceptance must be rerun against the
-0.6.10 preparation path before ADR 0011 is considered fully closed.
+Status: accepted — complete.
+
+`db_loader='copy'` is a public staging transport with bounded encrypted spooling
+and predecessor-spool cleanup under the task advisory lock. Formal Phase 8
+closure passed on the target localhost PostgreSQL 18.4 instance: 19/19 harness
+self-tests, 4/4 repository commands, 13/13 adversarial concurrency/failure
+cases, 10/10 memory-scaling checks, 24/24 randomized 1m/10m release
+measurements and 9/9 aggregate assertions. PostgreSQL server tuning is
+explicitly outside this ADR's closure scope.
 
 Amended before implementation by ADR 0012: schema source and publication
 strategy are independent. COPY changes staging transport only and must work
@@ -1328,10 +1332,11 @@ prefixed objects. It must verify:
 No quoted-identifier acceptance case exists because ADR 0010 removed that
 public mode.
 
-### VPS concurrency and recovery acceptance
+### Target concurrency and recovery acceptance
 
-The controlled VPS campaign must rerun the publication risks with at least one
-COPY-loaded staging table:
+The target acceptance environment is the current localhost PostgreSQL instance.
+No separate VPS is required. The campaign must rerun the publication risks with
+at least one COPY-loaded staging table:
 
 - `55P03` lock retry;
 - observable reader blocking during explicit declared stable refill;
@@ -1405,6 +1410,61 @@ improve staging preparation while leaving refill's locked `TRUNCATE` plus
 COPY must demonstrate a material throughput improvement on million-row or
 comparably wide workloads before documentation recommends it broadly. One
 machine's crossover point does not become an automatic framework threshold.
+
+PostgreSQL parameter tuning is not an ADR 0011 acceptance requirement. The final
+release matrix is run against the target localhost server's current configuration.
+Tuning experiments may follow as operational evidence, but they neither change
+the loader contract nor block formal ADR closure.
+
+### Formal closure commands
+
+Run the external evidence scripts from one closure-run directory:
+
+```text
+python ../../scripts/phase8_closure_harness_selftest.py
+python ../../scripts/phase8_repository_verification.py
+python ../../scripts/phase8_concurrency_closure.py
+python ../../scripts/phase8_memory_scaling.py
+python ../../scripts/phase8_performance_release.py
+```
+
+The convenience orchestrator runs the same five closure layers in sequence:
+
+```text
+python ../../scripts/phase8_adr0011_closure.py
+```
+
+Formal closure requires 19/19 closure-harness self-tests, 4/4 repository
+commands, 13/13 adversarial concurrency/failure cases, 10/10 default memory
+cases, 24/24 release measurements and 9/9 aggregate release assertions. Every
+campaign must report zero owned staging or spool residue. The memory series must
+show approximately flat additional Python memory at 100k/1m/5m, and the final
+randomized 1m/10m matrix must prove encrypted COPY is materially faster and uses
+materially less peak RSS than INSERT for replacement and refill.
+
+### Formal closure result
+
+The final target-host campaign completed all gates with zero owned staging or
+spool residue. Median end-to-end results from three randomized repeats per
+combination were:
+
+| Rows | Publication | INSERT | Encrypted COPY |
+| ---: | --- | ---: | ---: |
+| 1m | `replace` | 33.38 s | 9.87 s |
+| 1m | `refill` | 39.63 s | 20.35 s |
+| 10m | `replace` | 337.39 s | 106.12 s |
+| 10m | `refill` | 542.37 s | 315.44 s |
+
+At 10m rows, median peak RSS was about 3.46 GiB for INSERT and 132 MiB
+for encrypted COPY. The lazy PostgreSQL-backed source campaign measured
+task_core-added peak RSS of about 4.7 MiB at 100k rows, 9.3 MiB at 1m and
+34.3 MiB at 5m while spool bytes scaled with row count. This proves bounded,
+sublinear framework memory rather than a literal zero-growth guarantee.
+
+The refill results also isolate the remaining cost boundary. COPY materially
+reduces transport into staging, but it cannot reduce the target-side
+`TRUNCATE` plus `INSERT FROM staging` rewrite. At 10m rows, INSERT and COPY
+refill publication each took about 203 seconds after staging was ready.
 
 ## Rollout
 
@@ -1595,6 +1655,13 @@ data or resume work. Unknown, malformed and foreign files remain untouched,
 and known-owned residue that cannot be deleted is fatal. COPY SQL also declares
 `ENCODING 'UTF8'`, matching the serializer's unconditional UTF-8 bytes. Live
 PostgreSQL acceptance remains Phase 8 evidence and is not claimed by 0.6.7.
+
+0.6.10 completed Phase 8 on the target localhost PostgreSQL 18.4 instance.
+The complete repository, adversarial concurrency/failure, lazy-source memory
+and randomized 1m/10m release campaigns all passed. ADR 0011 is therefore
+closed. Version 0.6.11 is a post-closure cleanup hardening change: after owned
+spool files are removed, task_core best-effort removes its empty implicit
+default spool root with `rmdir()`. Configured directories are never removed.
 
 0.6.3 corrected the 0.6.2 language that described the
 runner as a "real consumer" of `DbRowSource` — it consumes the *string*

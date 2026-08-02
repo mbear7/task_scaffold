@@ -9,6 +9,71 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.12
+
+Adds a repository-local PostgreSQL schema generator for moving an existing
+task_core-created table from inferred output to an explicit declared contract
+without hand-writing dozens or hundreds of `OutputColumn` entries.
+
+### Added
+- **`tools/generate_output_schema.py`.** The standalone script performs
+  read-only PostgreSQL catalog introspection and emits paste-ready Python for
+  either a class-level `PipelineSpec(output_schema=...)` argument or an
+  `OUTPUT_SCHEMA` class constant. It preserves physical column order, declared
+  type parameters and nullability for the task_core-supported PostgreSQL type
+  subset.
+- **Command-line and notebook operation.** Standalone execution provides
+  `--help`, schema/table, connection override, output-style, exclusion and
+  output-file arguments. Notebook/editor execution requires no command line:
+  edit `TABLE_NAME` and `SCHEMA_NAME` in the configuration block at the top of
+  the file and run it.
+- **Credential precedence.** Command-line values override inline `DB_*`
+  settings, which override an importable `pgcreds.pgcreds` mapping. Unspecified
+  pgcreds options such as `sslmode` are preserved.
+- **Fail-complete diagnostics.** Unsupported types, domains, enums, identity or
+  generated columns, non-default collations and nonportable identifiers are
+  reported together and no partial schema code is emitted. Column defaults are
+  reported as warnings because `OutputColumn` does not represent them; refill
+  preserves an existing default while replace recreates the table without it.
+- **Framework-column exclusion.** Repeatable `--exclude-column` and the inline
+  `EXCLUDE_COLUMNS` setting allow framework-owned columns such as
+  `etl_updated_at` to be omitted from the generated user-owned schema.
+
+### Tests
+- Added 35 deterministic tests covering catalog shape, credential precedence,
+  standalone help, notebook defaults, connection and file cleanup, exact
+  SQLAlchemy/PostgreSQL type rendering, aggregate unsupported-column
+  diagnostics, exclusions and AST-valid class indentation.
+
+## 0.6.11
+
+Closes ADR 0011 after the complete target-host acceptance campaign and hardens
+the lifecycle of the framework-owned default COPY spool directory.
+
+### Changed
+- **ADR 0011 is accepted and complete.** The final PostgreSQL 18.4 campaign
+  passed 19/19 harness self-tests, 4/4 repository commands, 13/13 adversarial
+  concurrency/failure cases, 10/10 memory-scaling checks, 24/24 randomized
+  1m/10m release measurements and 9/9 aggregate assertions with zero owned
+  staging or spool residue.
+- **The empty implicit spool root is removed best-effort.** After owned spool
+  files are deleted, task_core attempts atomic `rmdir()` on
+  `task_core-copy-spool`. Nonempty roots are preserved, transient failures are
+  retried and logged, and an operator-configured `spool_directory` is never
+  removed, even when it resolves to the default path. Spool creation
+  recreates a directory that a concurrent empty-root cleanup removed between
+  resolution and the exclusive file open.
+- **Task-authoring guidance records the final release matrix.** It now states
+  explicitly that COPY optimizes source-to-staging transport while refill still
+  rewrites the live table, can block readers for minutes and can amplify WAL.
+
+### Tests
+- Added direct filesystem tests for default-root removal, missing/nonempty
+  roots, configured-directory preservation, retry behavior and logging.
+- Added a publisher integration regression proving a successful default-policy
+  COPY removes the empty framework-owned root.
+
+
 ## 0.6.10
 
 Optimizes the declared one-pass COPY row loop identified by the 0.6.9 live
@@ -28,7 +93,26 @@ the inferred two-pass path are unchanged.
   checked first and declared wire-order fields are written directly from the
   source row.
 
+### Documentation and acceptance
+- ADR 0011 now names the current localhost PostgreSQL 18.4 instance as the
+  target acceptance environment. A separate VPS and PostgreSQL parameter tuning
+  are not closure requirements.
+- The external evidence pack adds a 19-case offline harness self-test, dedicated
+  repository verification, 13-case localhost concurrency/failure coverage,
+  10-case lazy-source memory scaling and a final 24-case 1m/10m release matrix
+  with nine aggregate acceptance assertions. Runtime behavior is unchanged.
+
 ### Tests
+- Closed retained Excel resources inside each temporary-directory scope in the
+  15 repository tests that materialize workbook data. The previous fixtures
+  relied on Linux allowing deletion of an open file; on Windows,
+  `TemporaryDirectory` correctly failed with `WinError 32` before the deferred
+  `addCleanup()` callback could run. Runtime resource behavior is unchanged.
+- Added a documentation regression that preserves the narrowed ADR 0011 closure
+  scope, the five executable closure layers and their mandatory case counts.
+- Corrected three closure-harness assumptions found by the second target run: handled retry exhaustion now expects current-run staging cleanup, terminal connection loss is sampled after invalidation detection, and successor cleanup runs in `finally` so one failed case cannot contaminate the next. Runtime code is unchanged.
+- Corrected the memory-scaling evidence harness found by the third target run: project-root discovery now precedes `task_core` import, worker subprocesses receive `TC_PROJECT_ROOT`, Windows RSS bindings declare their ctypes signature, sampler shutdown is safe before startup, and every worker records and validates package provenance. Runtime code is unchanged.
+- Corrected the lazy-source adapter in the memory-scaling evidence harness found by the fourth target run. The previous callable passed to `petl.fromdb()` returned a psycopg2 connection, while PETL's callable form expects a fresh DB-API cursor and therefore called `execute()` on the connection. The campaign now uses the framework's managed `db_resource` through `task_context`, requests a named server-side cursor, and closes the source connection through normal context cleanup. Four harness regressions raise the offline self-test to 19 cases. Runtime code is unchanged.
 - Added a regression proving native declared values do not call the generic
   normalizer, generic declared validator or generic family serializer. The test
   fails against 0.6.9 at `_normalize_copy_row()` for the intended reason.

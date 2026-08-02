@@ -14,6 +14,7 @@ None of these open a database connection or begin a transaction. The
 whole module is filesystem + bytes work; the tests match.
 """
 
+import errno
 import io
 import json
 import os
@@ -37,6 +38,7 @@ from task_core.db_copy import (
     SPOOL_STAGES,
     SpoolFormatError,
     SpoolIdentity,
+    cleanup_default_spool_directory,
     cleanup_predecessor_spools,
     cleanup_spool_paths,
     load_copy_into_staging,
@@ -476,6 +478,206 @@ class Test4SpoolDirectoryResolvesAndCreatesBestEffort(unittest.TestCase):
             with self.subTest(value=bad):
                 with self.assertRaises(DbPublishError):
                     resolve_spool_directory(bad)
+
+
+class Test4bDefaultSpoolDirectoryCleanup(unittest.TestCase):
+    """Only the implicit default root belongs to task_core.
+
+    Removal is best-effort and uses rmdir so concurrent or foreign contents
+    are never deleted. Configured directories remain operator-owned.
+    """
+
+    def test_empty_default_directory_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                directory = resolve_spool_directory(CopyLoadPolicy())
+                self.assertTrue(directory.is_dir())
+                self.assertTrue(
+                    cleanup_default_spool_directory(CopyLoadPolicy()),
+                )
+                self.assertFalse(directory.exists())
+
+    def test_missing_default_directory_counts_as_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                self.assertTrue(
+                    cleanup_default_spool_directory(CopyLoadPolicy()),
+                )
+
+    def test_nonempty_default_directory_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                directory = resolve_spool_directory(CopyLoadPolicy())
+                foreign = directory / 'foreign.txt'
+                foreign.write_text('keep', encoding='utf-8')
+                self.assertFalse(
+                    cleanup_default_spool_directory(CopyLoadPolicy()),
+                )
+                self.assertTrue(directory.is_dir())
+                self.assertEqual(foreign.read_text(encoding='utf-8'), 'keep')
+
+    def test_configured_directory_is_never_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / 'operator-owned'
+            policy = CopyLoadPolicy(spool_directory=directory)
+            resolve_spool_directory(policy)
+            self.assertFalse(cleanup_default_spool_directory(policy))
+            self.assertTrue(directory.is_dir())
+
+    def test_explicit_default_path_is_still_operator_owned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                directory = (Path(tmp) / DEFAULT_SPOOL_SUBDIR).resolve(
+                    strict=False,
+                )
+                policy = CopyLoadPolicy(spool_directory=directory)
+                resolve_spool_directory(policy)
+                self.assertFalse(cleanup_default_spool_directory(policy))
+                self.assertTrue(directory.is_dir())
+
+    def test_spool_open_recreates_directory_removed_after_resolution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                policy = CopyLoadPolicy()
+                directory = resolve_spool_directory(policy)
+                directory.rmdir()
+
+                handle = open_spool_for_write(
+                    directory,
+                    stage='copytext',
+                    identity=_make_identity(),
+                    encrypt=False,
+                )
+                try:
+                    self.assertTrue(directory.is_dir())
+                    self.assertTrue(handle.path.is_file())
+                finally:
+                    handle.stream.close()
+                    cleanup_spool_paths([handle.path])
+                    cleanup_default_spool_directory(policy)
+
+                self.assertFalse(directory.exists())
+
+    def test_transient_rmdir_failure_is_retried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                directory = resolve_spool_directory(CopyLoadPolicy())
+                with patch.object(
+                    Path, 'rmdir',
+                    side_effect=[OSError(errno.EACCES, 'busy'), None],
+                ) as rmdir:
+                    removed = cleanup_default_spool_directory(
+                        CopyLoadPolicy(),
+                        attempts=2,
+                        retry_delay_seconds=0,
+                    )
+                self.assertTrue(removed)
+                self.assertEqual(rmdir.call_count, 2)
+                directory.rmdir()
+
+    def test_final_unexpected_failure_is_logged_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                directory = resolve_spool_directory(CopyLoadPolicy())
+                with patch.object(
+                    Path, 'rmdir',
+                    side_effect=OSError(errno.EACCES, 'still busy'),
+                ):
+                    with self.assertLogs(
+                        'task_core.db_copy', level='WARNING',
+                    ) as captured:
+                        removed = cleanup_default_spool_directory(
+                            CopyLoadPolicy(),
+                            attempts=2,
+                            retry_delay_seconds=0,
+                        )
+                self.assertFalse(removed)
+                self.assertIn(str(directory), '\n'.join(captured.output))
+                self.assertIn('still busy', '\n'.join(captured.output))
+                directory.rmdir()
+
+    def test_invalid_retry_arguments_are_rejected(self):
+        for attempts in (0, -1, True):
+            with self.subTest(attempts=attempts):
+                with self.assertRaises(DbPublishError):
+                    cleanup_default_spool_directory(
+                        CopyLoadPolicy(), attempts=attempts,
+                    )
+        for delay in (-1, 'slow', True):
+            with self.subTest(delay=delay):
+                with self.assertRaises(DbPublishError):
+                    cleanup_default_spool_directory(
+                        CopyLoadPolicy(), retry_delay_seconds=delay,
+                    )
+
+    def test_declared_prepare_failure_removes_empty_default_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                policy = CopyLoadPolicy()
+                directory = resolve_spool_directory(policy)
+                with self.assertRaises(DbPublishError):
+                    prepare_copy_source(
+                        row_source=[('not-an-integer',)],
+                        columns=['id'],
+                        declared_schema=(
+                            ResolvedColumn('id', sa.BigInteger(), False),
+                        ),
+                        identity=_make_identity(),
+                        directory=directory,
+                        policy=policy,
+                    )
+                self.assertFalse(
+                    directory.exists(),
+                    'failed preparation left the empty default spool root',
+                )
+
+    def test_rmdir_failure_does_not_replace_prepare_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                policy = CopyLoadPolicy()
+                directory = resolve_spool_directory(policy)
+                with patch.object(
+                    Path, 'rmdir',
+                    side_effect=OSError(errno.EACCES, 'still busy'),
+                ):
+                    with self.assertLogs(
+                        'task_core.db_copy', level='WARNING',
+                    ):
+                        with self.assertRaisesRegex(
+                            DbPublishError, 'expected int',
+                        ):
+                            prepare_copy_source(
+                                row_source=[('not-an-integer',)],
+                                columns=['id'],
+                                declared_schema=(
+                                    ResolvedColumn(
+                                        'id', sa.BigInteger(), False,
+                                    ),
+                                ),
+                                identity=_make_identity(),
+                                directory=directory,
+                                policy=policy,
+                            )
+                self.assertTrue(directory.is_dir())
+                directory.rmdir()
 
 
 class Test5ConstantsAreStable(unittest.TestCase):

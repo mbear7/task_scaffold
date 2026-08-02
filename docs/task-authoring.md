@@ -248,6 +248,72 @@ spec = PipelineSpec(
 )
 ```
 
+### Generate a declaration from an existing table
+
+When a table already exists, especially after an earlier inferred-schema run,
+do not hand-write a 100-column declaration. Use the repository tool:
+
+```bash
+python tools/generate_output_schema.py --schema bsr --table customer_summary
+```
+
+The default output is indented for direct paste inside a task class's
+`PipelineSpec(...)` call:
+
+```python
+class customer_summary:
+    spec = PipelineSpec(
+        db_table='customer_summary',
+        # Generated from bsr.customer_summary.
+        output_schema=(
+            OutputColumn('customer_id', sa.BigInteger(), nullable=False),
+            OutputColumn('revenue', sa.Numeric(18, 2), nullable=True),
+        ),
+    )
+```
+
+Use `--style class-constant` to emit a four-space `OUTPUT_SCHEMA = (...)`
+class attribute instead. Use `--output schema_snippet.py` to write UTF-8 code
+to a file. Run `python tools/generate_output_schema.py --help` for all options.
+
+For notebook or editor execution without command-line arguments, open
+`tools/generate_output_schema.py`, edit `TABLE_NAME` and `SCHEMA_NAME` in the
+configuration block near the top, then run the file. The script prints the
+generated code.
+
+Connection settings are resolved in this order:
+
+1. command-line `--host`, `--port`, `--dbname`, `--user`, `--password`;
+2. inline `DB_*` values in the script;
+3. an importable `pgcreds.pgcreds` mapping.
+
+Command-line values override only the supplied keys, so other pgcreds options
+such as `sslmode` remain active. The catalog connection is read-only and the
+tool never changes the table.
+
+The generated declaration contains user-owned columns only. Exclude a
+framework-owned timestamp column explicitly:
+
+```bash
+python tools/generate_output_schema.py \
+    --schema bsr \
+    --table customer_summary \
+    --exclude-column etl_updated_at
+```
+
+The tool does not invent conversions. It emits code only when the existing
+column order, PostgreSQL types, type parameters and nullability fit the exact
+task_core declared-schema subset. Unsupported types, domains, enums, identity
+or generated columns, non-default collations and nonportable identifiers are
+reported together; no partial code is emitted. Resolve those differences by
+manually migrating the table, dropping and recreating it, excluding a genuinely
+framework-owned column, or writing the declaration manually.
+
+Column defaults are not part of `OutputColumn`. The tool therefore emits the
+type and nullability but writes a warning to stderr. `refill` preserves a
+default attached to the existing table; `replace` recreates the table without
+it. Review those warnings before committing the generated declaration.
+
 Columns are nullable by default. Declared output must contain exactly the same
 column set; source order may differ and is reordered into declaration order.
 Missing or unexpected columns, normalized missing values in non-nullable
@@ -534,20 +600,24 @@ Plaintext COPY is omitted deliberately. It is a diagnostic benchmark for
 separating serialization, filesystem and encryption cost, not the production
 recommendation.
 
-### Measured 0.6.10 reference point
+### Measured 0.6.10 final acceptance
 
-The accepted development evidence used one million declared rows on PostgreSQL
-18.4 with default server configuration. Two randomized campaigns produced six
-measurements per mode and publication strategy:
+The accepted target-host campaign used PostgreSQL 18.4 and three randomized
+repeats for each declared loader/publication combination at one million and ten
+million rows:
 
-| Publication | Loader | Median end-to-end | Median peak RSS | Median WAL |
-|---|---|---:|---:|---:|
-| `replace` | INSERT | 32.40 s | 469.1 MiB | 122.5 MiB |
-| `replace` | encrypted COPY | 10.00 s | 131.2 MiB | 77.4 MiB |
-| `refill` | INSERT | 41.00 s | 469.2 MiB | 245.1 MiB |
-| `refill` | encrypted COPY | 21.57 s | 131.3 MiB | 199.8 MiB |
+| Rows | Publication | Loader | Median end-to-end | Median peak RSS | Median WAL |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 1m | `replace` | INSERT | 33.38 s | 469.6 MiB | 122.6 MiB |
+| 1m | `replace` | encrypted COPY | 9.87 s | 131.1 MiB | 77.4 MiB |
+| 1m | `refill` | INSERT | 39.63 s | 469.4 MiB | 245.0 MiB |
+| 1m | `refill` | encrypted COPY | 20.35 s | 131.3 MiB | 199.8 MiB |
+| 10m | `replace` | INSERT | 337.39 s | 3.46 GiB | 1.20 GiB |
+| 10m | `replace` | encrypted COPY | 106.12 s | 131.4 MiB | 773.5 MiB |
+| 10m | `refill` | INSERT | 542.37 s | 3.46 GiB | 3.56 GiB |
+| 10m | `refill` | encrypted COPY | 315.44 s | 131.7 MiB | 3.14 GiB |
 
-These measurements support four task-authoring conclusions for 0.6.10:
+These measurements support four task-authoring conclusions:
 
 - keep INSERT as the global default because small outputs avoid spool setup and
   no universal crossover is promised;
@@ -555,8 +625,15 @@ These measurements support four task-authoring conclusions for 0.6.10:
   representative task benchmark contradicts it;
 - choose `refill` only to preserve table identity and attached objects, not as a
   performance optimization;
-- treat refill timings as more variable than replacement because publication
-  rewrites the live target and is sensitive to WAL and checkpoint timing.
+- treat large refill as a maintenance-window operation because publication
+  rewrites the live table under `ACCESS EXCLUSIVE`, blocks readers and can
+  generate several times the WAL of replacement.
+
+COPY solves the source-to-staging transport. It does not reduce the cost of
+rewriting the live table during refill. In the 10m campaign, median refill
+publication was about 203 seconds for both INSERT and encrypted COPY after
+staging was ready. COPY still reduced total runtime materially by making the
+staging phase much faster.
 
 The figures are evidence from one development environment, not a performance
 contract. Preserve the raw campaign outside the project tree and rerun when row
@@ -594,6 +671,13 @@ explicitly documented reason to accept plaintext business data on local disk.
 Plaintext COPY is useful as a diagnostic benchmark, not as a default tuning
 switch.
 
+When no custom spool path is configured, task_core uses its own
+`task_core-copy-spool` directory below the platform temporary directory. After
+owned spool files are removed, it best-effort removes that directory if it is
+empty. A configured `CopyLoadPolicy.spool_directory` is operator-owned and is
+never removed. Concurrent default-root removal is tolerated: spool creation
+recreates a directory removed between path resolution and file creation.
+
 ### Understand replacement and refill cost
 
 `replace` keeps the publication lock short because publication is primarily
@@ -603,7 +687,14 @@ therefore grow with row count and attached index/constraint work.
 
 For large refills, monitor publication lock duration separately from staging.
 A fast COPY into staging cannot remove the target-side `TRUNCATE` and
-`INSERT FROM staging` cost.
+`INSERT FROM staging` cost. Run large refills in an exclusive maintenance
+window when multi-minute reader blocking, WAL volume or replica lag would be
+operationally significant.
+
+Partition or relation switching may remove the row rewrite, but it is a
+different publication architecture with new constraints, cleanup and rollback
+semantics. Consider it only after measured refill lock duration or WAL volume
+violates an operational SLA.
 
 ### PostgreSQL settings that matter
 

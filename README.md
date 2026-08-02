@@ -149,6 +149,19 @@ PipelineSpec(
 )
 ```
 
+When the destination table already exists, generate the declaration instead
+of typing it manually:
+
+```bash
+python tools/generate_output_schema.py --schema bsr --table customer_summary
+```
+
+The tool uses `pgcreds.py` when available, accepts command-line connection
+overrides, and also supports no-argument notebook/editor execution through the
+`TABLE_NAME` and `SCHEMA_NAME` constants at the top of the script. It performs
+read-only introspection and emits paste-ready class indentation. See
+[task-authoring.md](docs/task-authoring.md#generate-a-declaration-from-an-existing-table).
+
 Supplying `output_schema` disables inference. The declaration defines the
 complete user-owned column set, order, types and nullability. Columns are
 nullable by default. Enabled framework-owned columns are appended afterward:

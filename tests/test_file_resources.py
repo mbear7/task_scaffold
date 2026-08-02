@@ -7,6 +7,7 @@ timing, ordering, and stat behavior are exactly the kind of thing a mock
 would have to reimplement correctly to be worth testing at all.
 """
 
+import contextlib
 import os
 import tempfile
 import time
@@ -566,10 +567,10 @@ class Test12ExcelMetadataIsGenuinelyLazy(unittest.TestCase):
             ws.add_table(Table(displayName='MyTable', ref='A1:B2'))
             wb.save(path)
 
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
-            tbl = resource.get_table('MyTable')
-            rows = list(tc.etl.data(tbl)) if hasattr(tc, 'etl') else list(__import__('petl').data(tbl))
-            self.assertEqual(rows, [(1, 2)])
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                tbl = resource.get_table('MyTable')
+                rows = list(tc.etl.data(tbl)) if hasattr(tc, 'etl') else list(__import__('petl').data(tbl))
+                self.assertEqual(rows, [(1, 2)])
 
 
 class _RejectOverlappingOpensAccess(FileAccessImpl):
@@ -632,17 +633,21 @@ class Test13GetTableDoesNotOverlapWithRetainedWorkbook(unittest.TestCase):
         with TempDir() as d:
             self._build_xlsx_with_table(d)
             access = _RejectOverlappingOpensAccess()
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
-            tbl = resource.get_table('MyTable')  # must not raise
-            self.assertEqual(list(__import__('petl').data(tbl)), [(1, 2)])
+            with contextlib.closing(
+                build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
+            ) as resource:
+                tbl = resource.get_table('MyTable')  # must not raise
+                self.assertEqual(list(__import__('petl').data(tbl)), [(1, 2)])
 
     def test_get_map_does_not_overlap(self):
         with TempDir() as d:
             self._build_xlsx_with_table(d)
             access = _RejectOverlappingOpensAccess()
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
-            m = resource.get_map('MyTable')  # must not raise
-            self.assertEqual(m, {1: 2})
+            with contextlib.closing(
+                build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
+            ) as resource:
+                m = resource.get_map('MyTable')  # must not raise
+                self.assertEqual(m, {1: 2})
 
     def test_get_sheet_rows_then_get_table_does_not_overlap(self):
         # Found by a further review, confirmed directly before fixing:
@@ -655,25 +660,31 @@ class Test13GetTableDoesNotOverlapWithRetainedWorkbook(unittest.TestCase):
         with TempDir() as d:
             self._build_xlsx_with_table(d)
             access = _RejectOverlappingOpensAccess()
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
-            resource.get_sheet_rows('Sheet')
-            resource.get_table('MyTable')  # must not raise
+            with contextlib.closing(
+                build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
+            ) as resource:
+                resource.get_sheet_rows('Sheet')
+                resource.get_table('MyTable')  # must not raise
 
     def test_get_sheet_raw_rows_then_get_map_does_not_overlap(self):
         with TempDir() as d:
             self._build_xlsx_with_table(d)
             access = _RejectOverlappingOpensAccess()
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
-            resource.get_sheet_raw_rows('Sheet')
-            resource.get_map('MyTable')  # must not raise
+            with contextlib.closing(
+                build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
+            ) as resource:
+                resource.get_sheet_raw_rows('Sheet')
+                resource.get_map('MyTable')  # must not raise
 
     def test_get_range_then_tables_property_does_not_overlap(self):
         with TempDir() as d:
             self._build_xlsx_with_table(d)
             access = _RejectOverlappingOpensAccess()
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
-            resource.get_range('Sheet', 'A1:B2')
-            _ = resource.tables  # must not raise
+            with contextlib.closing(
+                build_latest_xlsx_resource(str(d), pattern='*.xlsx', source_access=access)
+            ) as resource:
+                resource.get_range('Sheet', 'A1:B2')
+                _ = resource.tables  # must not raise
 
 
 class Test14ExcelResourceConstructorStaysPubliclyCompatible(unittest.TestCase):
@@ -862,19 +873,23 @@ class Test16SheetRowsSharesRawRowsMaterialization(unittest.TestCase):
     def test_get_sheet_rows_alone_populates_the_shared_raw_cache(self):
         with TempDir() as d:
             self._build_xlsx(d)
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
-            resource.get_sheet_rows('Sheet')
-            self.assertIn('Sheet', resource._raw_cache, 'get_sheet_rows() did not share get_sheet_raw_rows()\'s own cache')
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                resource.get_sheet_rows('Sheet')
+                self.assertIn(
+                    'Sheet',
+                    resource._raw_cache,
+                    'get_sheet_rows() did not share get_sheet_raw_rows()\'s own cache',
+                )
 
     def test_both_return_correct_and_consistent_values(self):
         with TempDir() as d:
             self._build_xlsx(d)
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
-            tbl = resource.get_sheet_rows('Sheet')
-            raw = resource.get_sheet_raw_rows('Sheet')
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                tbl = resource.get_sheet_rows('Sheet')
+                raw = resource.get_sheet_raw_rows('Sheet')
 
-            self.assertEqual(list(etl.data(tbl)), [(1, 2), (3, 4)])
-            self.assertEqual(raw, [('a', 'b'), (1, 2), (3, 4)])
+                self.assertEqual(list(etl.data(tbl)), [(1, 2), (3, 4)])
+                self.assertEqual(raw, [('a', 'b'), (1, 2), (3, 4)])
 
     def test_get_sheet_raw_rows_returns_an_independent_copy_not_the_internal_cache(self):
         # Updated: an earlier version of this test asserted the OPPOSITE
@@ -885,29 +900,29 @@ class Test16SheetRowsSharesRawRowsMaterialization(unittest.TestCase):
         # too, since both were built from that one, shared object.
         with TempDir() as d:
             self._build_xlsx(d)
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
-            resource.get_sheet_rows('Sheet')
-            raw = resource.get_sheet_raw_rows('Sheet')
-            self.assertIsNot(
-                resource._raw_cache['Sheet'], raw,
-                'get_sheet_raw_rows() returned the internal cache object directly, not an independent copy',
-            )
-            self.assertEqual(resource._raw_cache['Sheet'], raw, 'the copy should still be equal in content')
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                resource.get_sheet_rows('Sheet')
+                raw = resource.get_sheet_raw_rows('Sheet')
+                self.assertIsNot(
+                    resource._raw_cache['Sheet'], raw,
+                    'get_sheet_raw_rows() returned the internal cache object directly, not an independent copy',
+                )
+                self.assertEqual(resource._raw_cache['Sheet'], raw, 'the copy should still be equal in content')
 
     def test_repeated_get_sheet_rows_calls_return_the_same_object(self):
         with TempDir() as d:
             self._build_xlsx(d)
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
-            a = resource.get_sheet_rows('Sheet')
-            b = resource.get_sheet_rows('Sheet')
-            self.assertIs(a, b)
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                a = resource.get_sheet_rows('Sheet')
+                b = resource.get_sheet_rows('Sheet')
+                self.assertIs(a, b)
 
     def test_header_false_deprecation_warning_still_fires(self):
         with TempDir() as d:
             self._build_xlsx(d)
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
-            with self.assertWarns(DeprecationWarning):
-                resource.get_sheet_rows('Sheet', header=False)
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                with self.assertWarns(DeprecationWarning):
+                    resource.get_sheet_rows('Sheet', header=False)
 
 
 class Test17GetSheetRawRowsReturnsAnIndependentCopy(unittest.TestCase):
@@ -936,28 +951,28 @@ class Test17GetSheetRawRowsReturnsAnIndependentCopy(unittest.TestCase):
         # The reviewer's own exact reproduction.
         with TempDir() as d:
             self._build_xlsx(d)
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
-            raw = resource.get_sheet_raw_rows('Sheet')
-            table = resource.get_sheet_rows('Sheet')
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                raw = resource.get_sheet_raw_rows('Sheet')
+                table = resource.get_sheet_rows('Sheet')
 
-            raw[1] = (9, 9)
+                raw[1] = (9, 9)
 
-            self.assertEqual(
-                list(etl.data(table)), [(1, 2), (3, 4)],
-                "mutating what get_sheet_raw_rows() returned silently changed get_sheet_rows()'s own table",
-            )
+                self.assertEqual(
+                    list(etl.data(table)), [(1, 2), (3, 4)],
+                    "mutating what get_sheet_raw_rows() returned silently changed get_sheet_rows()'s own table",
+                )
 
     def test_two_separate_calls_return_independent_copies(self):
         with TempDir() as d:
             self._build_xlsx(d)
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
-            raw_a = resource.get_sheet_raw_rows('Sheet')
-            raw_b = resource.get_sheet_raw_rows('Sheet')
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                raw_a = resource.get_sheet_raw_rows('Sheet')
+                raw_b = resource.get_sheet_raw_rows('Sheet')
 
-            raw_a[0] = (99, 99)
+                raw_a[0] = (99, 99)
 
-            self.assertNotEqual(raw_a, raw_b, 'two separate calls should not share a mutable object')
-            self.assertIsNot(raw_a, raw_b)
+                self.assertNotEqual(raw_a, raw_b, 'two separate calls should not share a mutable object')
+                self.assertIsNot(raw_a, raw_b)
 
     def test_the_underlying_read_still_only_happens_once(self):
         # The core benefit of the original shared-materialization fix
@@ -968,15 +983,14 @@ class Test17GetSheetRawRowsReturnsAnIndependentCopy(unittest.TestCase):
         # ones (the metadata scan, the separate retained-workbook open).
         with TempDir() as d:
             self._build_xlsx(d)
-            resource = build_latest_xlsx_resource(str(d), pattern='*.xlsx')
+            with contextlib.closing(build_latest_xlsx_resource(str(d), pattern='*.xlsx')) as resource:
+                resource.get_sheet_raw_rows('Sheet')
+                internal_after_first = resource._raw_cache['Sheet']
+                resource.get_sheet_raw_rows('Sheet')
+                resource.get_sheet_rows('Sheet')
+                resource.get_sheet_raw_rows('Sheet')
 
-            resource.get_sheet_raw_rows('Sheet')
-            internal_after_first = resource._raw_cache['Sheet']
-            resource.get_sheet_raw_rows('Sheet')
-            resource.get_sheet_rows('Sheet')
-            resource.get_sheet_raw_rows('Sheet')
-
-            self.assertIs(resource._raw_cache['Sheet'], internal_after_first)
+                self.assertIs(resource._raw_cache['Sheet'], internal_after_first)
 
 
 class Test18RetainedWorkbookGetsTheSameGcTreatmentAsMetadata(unittest.TestCase):

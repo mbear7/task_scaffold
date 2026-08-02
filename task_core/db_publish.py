@@ -27,6 +27,7 @@ from task_core.cleanup import attempt_all_cleanup
 from task_core.db_insert import load_rows_into_staging
 from task_core.db_copy import (
     SpoolIdentity,
+    cleanup_default_spool_directory,
     cleanup_predecessor_spools,
     cleanup_spool_paths,
     load_copy_into_staging,
@@ -1470,6 +1471,7 @@ class DbPublisher:
                 self.task_name,
                 ', '.join(str(path) for path in deleted),
             )
+        cleanup_default_spool_directory(self.copy_load_policy)
         return deleted
 
     def _require_task_lock(self, action):
@@ -1848,6 +1850,7 @@ class DbPublisher:
                         f'could not remove completed COPY spool(s): '
                         f'{failed_cleanup!r}'
                     )
+                cleanup_default_spool_directory(self.copy_load_policy)
                 prepared_copy = None
 
             self._verify_prepared_table(
@@ -1878,6 +1881,7 @@ class DbPublisher:
         except BaseException:
             if prepared_copy is not None:
                 cleanup_spool_paths([prepared_copy.path])
+                cleanup_default_spool_directory(self.copy_load_policy)
             raise
 
     def _verify_prepared_table(

@@ -107,6 +107,73 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
         self.assertIn('not a performance contract', normalized)
         self.assertIn('keep INSERT as the global default', normalized)
         self.assertIn('prefer declared encrypted COPY + `replace`', normalized)
+        self.assertIn('| 10m | `replace` | encrypted COPY | 106.12 s |', text)
+        self.assertIn('| 10m | `refill` | encrypted COPY | 315.44 s |', text)
+        self.assertIn(
+            'COPY solves the source-to-staging transport. It does not reduce '
+            'the cost of rewriting the live table during refill.',
+            normalized,
+        )
+        self.assertIn('exclusive maintenance window', normalized)
+        self.assertIn(
+            'A configured `CopyLoadPolicy.spool_directory` is operator-owned '
+            'and is never removed.',
+            normalized,
+        )
+
+    def test_adr_0011_closure_scope_is_localhost_and_excludes_tuning(self):
+        """Closure is evidence-driven but does not require another host.
+
+        The accepted target is the current localhost PostgreSQL instance.
+        PostgreSQL parameter tuning may continue independently, but it must not
+        silently reappear as an architectural acceptance gate.
+        """
+        text = Path(
+            'docs/decisions/0011-add-bounded-memory-copy-loader.md'
+        ).read_text(encoding='utf-8')
+        normalized = re.sub(r'\s+', ' ', text)
+
+        self.assertIn(
+            'The target acceptance environment is the current localhost '
+            'PostgreSQL instance.',
+            normalized,
+        )
+        self.assertIn(
+            'PostgreSQL parameter tuning is not an ADR 0011 acceptance '
+            'requirement.',
+            normalized,
+        )
+        self.assertIn(
+            "PostgreSQL server tuning is explicitly outside this ADR's "
+            'closure scope.',
+            normalized,
+        )
+        self.assertIn('Status: accepted — complete.', text)
+        self.assertNotIn('Formal closure remains pending', text)
+        self.assertIn('### Formal closure result', text)
+        self.assertIn('| 10m | `replace` | 337.39 s | 106.12 s |', text)
+        self.assertIn('| 10m | `refill` | 542.37 s | 315.44 s |', text)
+        for script in (
+            'phase8_closure_harness_selftest.py',
+            'phase8_repository_verification.py',
+            'phase8_concurrency_closure.py',
+            'phase8_memory_scaling.py',
+            'phase8_performance_release.py',
+            'phase8_adr0011_closure.py',
+        ):
+            with self.subTest(script=script):
+                self.assertIn(script, text)
+
+        for expected_result in (
+            '19/19 closure-harness self-tests',
+            '4/4 repository',
+            '13/13 adversarial concurrency/failure cases',
+            '10/10 default memory cases',
+            '24/24 release measurements',
+            '9/9 aggregate release assertions',
+        ):
+            with self.subTest(expected_result=expected_result):
+                self.assertIn(expected_result, normalized)
 
     def test_result_shapes_are_as_documented(self):
         self.assertEqual(
@@ -238,10 +305,9 @@ class Test3DocumentedBehaviourOfDeclaredSpecFields(unittest.TestCase):
             workbook.active['A2'] = 'v'
             workbook.save(path)
 
-            resource = tc.build_excel_resource(path)
-            self.addCleanup(resource.close)
-            rows = resource.get_sheet_rows(resource.sheets[0])
-            self.assertTrue(type(rows).__module__.startswith('petl'))
+            with contextlib.closing(tc.build_excel_resource(path)) as resource:
+                rows = resource.get_sheet_rows(resource.sheets[0])
+                self.assertTrue(type(rows).__module__.startswith('petl'))
 
 
 class Test4DocumentationFilesExistWhereLinkedFrom(unittest.TestCase):
@@ -661,6 +727,53 @@ class Test9DbValuesBoundary(unittest.TestCase):
                 for alias in node.names:
                     with self.subTest(name=alias.name):
                         self.assertNotIn(alias.name, forbidden)
+
+
+class Test10OutputSchemaGeneratorBoundary(unittest.TestCase):
+    """The repository tool stays discoverable and read-only without
+    expanding the task_core-only import boundary of tests/.
+    """
+
+    def test_output_schema_generator_has_both_entry_modes_and_read_only_sql(self):
+        source = Path('tools/generate_output_schema.py').read_text(encoding='utf-8')
+        required = (
+            "TABLE_NAME = ''",
+            "SCHEMA_NAME = 'public'",
+            'from pgcreds import pgcreds',
+            "'--table'",
+            "'--schema'",
+            'readonly=True',
+            'SELECT c.relkind',
+            'pg_catalog.format_type',
+        )
+        for phrase in required:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, source)
+
+        forbidden = (
+            'CREATE TABLE',
+            'ALTER TABLE',
+            'DROP TABLE',
+            'INSERT INTO',
+            'UPDATE ',
+            'DELETE FROM',
+        )
+        for phrase in forbidden:
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, source)
+
+    def test_output_schema_generator_is_documented_for_cli_and_notebook_use(self):
+        authoring = Path('docs/task-authoring.md').read_text(encoding='utf-8')
+        readme = Path('README.md').read_text(encoding='utf-8')
+        for phrase in (
+            'tools/generate_output_schema.py',
+            '--style class-constant',
+            'edit `TABLE_NAME` and `SCHEMA_NAME`',
+            'no partial code is emitted',
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, authoring)
+        self.assertIn('generate-a-declaration-from-an-existing-table', readme)
 
 
 if __name__ == '__main__':
