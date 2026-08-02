@@ -484,6 +484,116 @@ must also use only `replace`, or `refill` together with `output_schema`. See
 [migrating-to-0.5.1.md](migrating-to-0.5.1.md).
 
 
+## Performance and loader selection
+
+Performance is a task-authoring decision, not an incidental database detail.
+Measure the complete path: source traversal, normalization, schema work, local
+spooling, PostgreSQL staging and final publication. A faster database load does
+not imply a faster task when preparation dominates.
+
+### Choose the loader deliberately
+
+Use `db_loader='insert'` as the default for small and medium materialized
+outputs. It avoids local spool construction and is often the shortest
+end-to-end path when memory is not a constraint.
+
+Use `db_loader='copy'` when one or more of these properties matter:
+
+- the source is one-shot and must be consumed with bounded Python memory;
+- output size makes materialization unsafe or operationally undesirable;
+- lower staging WAL is valuable;
+- PostgreSQL staging time is the dominant bottleneck;
+- an encrypted local spool is acceptable on the task host.
+
+Do not select COPY from a blanket claim that it is faster. The 0.6.8 Phase 8
+baseline showed much faster PostgreSQL ingestion and lower WAL, but Python-side
+serialization and spool construction offset most or all of that gain in several
+profiles. Version 0.6.9 removes the unnecessary neutral-spool pass for declared
+schemas; benchmark representative tasks again rather than carrying the 0.6.8
+crossover forward as a guarantee.
+
+### Prefer declared schemas for stable production outputs
+
+A declared schema gives the loader its target types and wire order before the
+source is traversed. COPY can validate and serialize directly into the final
+spool in one pass. Inferred COPY must retain a type-neutral first spool, resolve
+the schema at EOF and replay the normalized values into the final spool.
+
+Use inference for exploratory or genuinely variable outputs. Use
+`output_schema` when the output contract is stable, especially for large COPY
+loads or any `refill` target.
+
+### Account for memory and scratch disk
+
+INSERT owns materialized row mappings and can grow with row count. COPY keeps
+Python memory bounded by column metadata, one normalized row and configured I/O
+buffers, but writes local scratch data:
+
+- declared COPY: one final COPY-text spool;
+- inferred COPY: a neutral spool plus the final COPY-text spool during the
+  overlap window;
+- encrypted COPY: ciphertext is slightly larger than the logical body.
+
+Size the spool filesystem for the largest expected output with operational
+headroom. Keep encryption enabled for production unless the deployment has an
+explicitly documented reason to accept plaintext business data on local disk.
+Plaintext COPY is useful as a diagnostic benchmark, not as a default tuning
+switch.
+
+### Understand replacement and refill cost
+
+`replace` keeps the publication lock short because publication is primarily
+catalog work. `refill` preserves the table object but performs a second full-row
+write while holding `ACCESS EXCLUSIVE`; elapsed time, WAL and reader blocking
+therefore grow with row count and attached index/constraint work.
+
+For large refills, monitor publication lock duration separately from staging.
+A fast COPY into staging cannot remove the target-side `TRUNCATE` and
+`INSERT FROM staging` cost.
+
+### PostgreSQL settings that matter
+
+Tune only after stage-level measurements show a database bottleneck. For large
+bulk loads and refills, inspect checkpoint and WAL pressure first. A
+`max_wal_size` smaller than one campaign's WAL volume can cause avoidable
+checkpoints. On a shared 16 GB development machine, test conservative values
+such as 1–2 GB `shared_buffers` and a larger `max_wal_size` in an isolated A/B
+campaign; do not present them as universal production settings.
+
+`work_mem`, `maintenance_work_mem` and `effective_cache_size` usually do not
+control this straight staging path. Do not disable `fsync` or
+`full_page_writes`, and do not change durability semantics merely to improve a
+benchmark number.
+
+### Benchmark a task correctly
+
+Use representative row width and value families, not row count alone. For a
+loader decision:
+
+1. warm the environment with a non-recorded run;
+2. run at least three measured repeats;
+3. randomize INSERT, plaintext COPY and encrypted COPY order;
+4. report median, minimum and maximum;
+5. capture source, spool, database staging and publication durations
+   separately;
+6. capture peak worker RSS, spool sizes, WAL, checkpoint and lock metrics;
+7. invalidate runs affected by suspend, sleep, competing workloads or changed
+   configuration;
+8. preserve raw logs and environment facts outside the project tree.
+
+Treat differences of only a few percent as inconclusive until repeated. Record
+both the fastest path and the operational trade-off: memory, disk, WAL,
+publication blocking and artifact protection.
+
+### Practical decision rule
+
+Start with INSERT. Move to declared encrypted COPY when memory, one-shot input
+or WAL pressure justifies the spool, then measure. Keep inferred COPY only when
+schema inference is itself required. Use refill only to preserve table identity
+and attached objects. The correct combination is the one supported by the
+representative campaign, not the one with the most sophisticated transport.
+
+
 ## Source-change checking
 
 ```python

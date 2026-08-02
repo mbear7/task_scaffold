@@ -16,14 +16,14 @@ created staging table.
 The module is deliberately name-clean of the forbidden transaction and engine
 operations so the architecture tests can enforce that ownership boundary.
 
-Public shape as of 0.6.8:
+Public shape as of 0.6.9:
 
 - `CopyLoadPolicy`               - config dataclass, moved here from
                                     db_publish in 0.6.4 so its home
                                     matches its layer
 - `SpoolFormatError`             - malformed or unowned spool
 - `MAGIC`, `FORMAT_VERSION`      - internal header constants
-- `SPOOL_STAGES`                 - the two spool stages a run produces
+- `SPOOL_STAGES`                 - supported spool-stage names
 - `SPOOL_FILENAME_RE`            - exact portable grammar
 - `compose_ownership_token`      - digest of the five ownership ingredients
 - `compose_spool_filename`       - `task_core-copy-<token>-<stage>.spool`
@@ -56,7 +56,7 @@ import struct
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -69,6 +69,7 @@ from task_core.db_values import (
     _normalize_value,
     _resolve_override,
     _validate_declared_value,
+    _validate_declared_value_family,
 )
 from task_core.types import find_duplicates
 
@@ -159,12 +160,11 @@ MAGIC = b'TCCPY\x00'
 # guess -- see read_spool_header.
 FORMAT_VERSION = 2
 
-# The two stages a run produces, per ADR 0011 §Schema resolution and
-# final COPY spool:
-#   'neutral'  - type-neutral first spool (source normalization output)
+# Supported spool stages, per ADR 0011 §Schema resolution and final COPY
+# spool. Inferred mode uses both; declared mode writes only the final
+# copytext spool because its target schema is known before traversal.
+#   'neutral'  - inferred-mode type-neutral normalization output
 #   'copytext' - final target-aware PostgreSQL COPY text spool
-# Deletion of the neutral spool after copytext is written is part of the
-# lifecycle, not this module's concern.
 SPOOL_STAGES = ('neutral', 'copytext')
 
 PROTECTION_NONE = 'none'
@@ -934,10 +934,8 @@ def _serialize_float_text(value: float) -> bytes:
     return repr(value).encode('ascii')
 
 
-def _serialize_value_copytext(value: Any, column) -> bytes:
-    """Serialize one value already validated against a declared schema."""
-    family = _declared_type_family(column.type)
-
+def _serialize_value_copytext_family(value: Any, column, family: str) -> bytes:
+    """Serialize one non-NULL declared value for a pre-resolved family."""
     if family == 'bool':
         return b't' if value else b'f'
     if family in {'smallint', 'integer', 'bigint'}:
@@ -960,11 +958,18 @@ def _serialize_value_copytext(value: Any, column) -> bytes:
     )
 
 
-def _serialize_inferred_value_copytext(
+def _serialize_value_copytext(value: Any, column) -> bytes:
+    """Serialize one value already validated against a declared schema."""
+    family = _declared_type_family(column.type)
+    return _serialize_value_copytext_family(value, column, family)
+
+
+def _serialize_inferred_value_copytext_family(
     value: Any,
     column: ResolvedColumn,
     table_name: str,
     row_number: int,
+    family: str,
 ) -> bytes:
     """Serialize one inferred/override value using PostgreSQL input syntax.
 
@@ -982,8 +987,6 @@ def _serialize_inferred_value_copytext(
             f'{table_name!r}: output row {row_number} contains NULL in '
             f'non-nullable column {column.name!r}'
         )
-
-    family = _declared_type_family(column.type)
 
     if family == 'bool':
         if type(value) is not bool:
@@ -1091,6 +1094,106 @@ def _serialize_inferred_value_copytext(
     raise DbPublishError(
         f'internal invariant violated -- unsupported family {family!r} in inferred copy serializer'
     )
+
+
+def _serialize_inferred_value_copytext(
+    value: Any,
+    column: ResolvedColumn,
+    table_name: str,
+    row_number: int,
+) -> bytes:
+    family = _declared_type_family(column.type)
+    return _serialize_inferred_value_copytext_family(
+        value,
+        column,
+        table_name,
+        row_number,
+        family,
+    )
+
+
+_CompiledFieldSerializer = tuple[int, Callable[[Any, int], bytes]]
+
+
+def _compile_copy_field_serializers(
+    source_columns: Sequence[str],
+    resolved_columns: Sequence[ResolvedColumn],
+    table_name: str,
+    *,
+    declared: bool,
+) -> tuple[_CompiledFieldSerializer, ...]:
+    """Compile source positions and scalar families once per COPY spool.
+
+    The returned callables retain the shared validation and serialization
+    kernels but remove per-row name dictionaries, column-family discovery,
+    and output-order reconstruction. Declared schemas may reorder columns;
+    the positional index captured here preserves that contract.
+    """
+    source_index = {name: index for index, name in enumerate(source_columns)}
+    compiled: list[_CompiledFieldSerializer] = []
+    for column in resolved_columns:
+        index = source_index[column.name]
+        family = _declared_type_family(column.type)
+        if declared:
+            def render_declared(
+                value,
+                row_number,
+                *,
+                column=column,
+                family=family,
+            ):
+                _validate_declared_value_family(
+                    table_name,
+                    column,
+                    row_number,
+                    value,
+                    family,
+                )
+                if value is None:
+                    return b'\\N'
+                return _serialize_value_copytext_family(
+                    value,
+                    column,
+                    family,
+                )
+
+            render = render_declared
+        else:
+            def render_inferred(
+                value,
+                row_number,
+                *,
+                column=column,
+                family=family,
+            ):
+                return _serialize_inferred_value_copytext_family(
+                    value,
+                    column,
+                    table_name,
+                    row_number,
+                    family,
+                )
+
+            render = render_inferred
+        compiled.append((index, render))
+    return tuple(compiled)
+
+
+def _write_compiled_copytext_row(
+    fp: BinaryIO,
+    values: Sequence[Any],
+    serializers: Sequence[_CompiledFieldSerializer],
+    row_number: int,
+    buffer: bytearray,
+) -> None:
+    """Serialize one positional row into a reusable output buffer."""
+    buffer.clear()
+    for field_number, (source_index, render) in enumerate(serializers):
+        if field_number:
+            buffer.append(0x09)
+        buffer.extend(render(values[source_index], row_number))
+    buffer.append(0x0A)
+    fp.write(buffer)
 
 
 def serialize_row_to_copytext(
@@ -1818,6 +1921,91 @@ def load_copy_into_staging(conn, staging_table, prepared, _chunk_size=None) -> i
             )
 
 
+def _normalize_copy_row(
+    row: Sequence[Any],
+    *,
+    expected_width: int,
+) -> tuple[Any, ...]:
+    if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+        raise DbPublishError(
+            f'row source yielded non-sequence {type(row).__name__}'
+        )
+    normalized = tuple(_normalize_value(value) for value in row)
+    if len(normalized) != expected_width:
+        raise DbPublishError(
+            f'row width {len(normalized)} does not match column '
+            f'count {expected_width}'
+        )
+    return normalized
+
+
+def _prepare_declared_copy_source_one_pass(
+    *,
+    row_source: Iterable[Sequence[Any]],
+    source_columns: tuple[str, ...],
+    resolved_columns: tuple[ResolvedColumn, ...],
+    identity: SpoolIdentity,
+    directory: Path,
+    policy: CopyLoadPolicy,
+) -> PreparedCopySource:
+    """Validate and serialize a declared COPY payload in one traversal.
+
+    A declared schema already supplies the target types and wire order, so a
+    type-neutral spool would only add a full write/read cycle. The final
+    COPY-text spool is therefore written directly while each normalized row
+    is validated against the shared declared-value kernel.
+    """
+    copytext_path: Path | None = None
+    try:
+        serializers = _compile_copy_field_serializers(
+            source_columns,
+            resolved_columns,
+            identity.target_table,
+            declared=True,
+        )
+        handle = open_spool_for_write(
+            directory,
+            stage='copytext',
+            identity=identity,
+            buffer_bytes=policy.buffer_bytes,
+            encrypt=policy.encrypt_spools,
+        )
+        copytext_path = handle.path
+        row_count = 0
+        output_buffer = bytearray()
+        with _close_preserving_primary(
+            handle.stream,
+            description=f'COPY-text spool {copytext_path}',
+        ) as copytext_fp:
+            for row in row_source:
+                values = _normalize_copy_row(
+                    row,
+                    expected_width=len(source_columns),
+                )
+                row_count += 1
+                _write_compiled_copytext_row(
+                    copytext_fp,
+                    values,
+                    serializers,
+                    row_count,
+                    output_buffer,
+                )
+        return PreparedCopySource(
+            path=copytext_path,
+            columns=resolved_columns,
+            row_count=row_count,
+            spool_bytes=copytext_path.stat().st_size,
+            identity=identity,
+            buffer_bytes=policy.buffer_bytes,
+            protection=handle.protection,
+            _key=handle.key,
+        )
+    except BaseException:
+        if copytext_path is not None:
+            cleanup_spool_paths([copytext_path])
+        raise
+
+
 # --- Orchestrator ------------------------------------------------------
 
 def prepare_copy_source(
@@ -1832,21 +2020,18 @@ def prepare_copy_source(
     type_overrides: Mapping[str, Any] | None = None,
     not_null_columns: Sequence[str] = (),
 ) -> PreparedCopySource:
-    """Prepare a COPY-text spool from a positional row source in two passes.
+    """Prepare a final COPY-text spool from a positional row source.
 
-    Pass 1 writes the type-neutral spool while (optionally) feeding a
-    schema-inference accumulator. Pass 2 replays the neutral spool through
-    the target-aware COPY-text serializer, resolving each cell against the
-    now-known column types.
+    Declared mode knows the target schema before traversal and therefore
+    validates and serializes directly into the final spool in one pass.
+    Inferred mode writes a type-neutral spool while accumulating schema state,
+    then replays it once through the resolved target-aware serializer.
 
     `row_source` must yield sequences whose positional order matches
-    `columns`. Each value is normalized exactly once during pass 1 using the
-    same normalization kernel as the INSERT path; the normalized value is
-    both observed by inference and written to the neutral spool.
-
-    `declared_schema=None` triggers inference. Otherwise the declared and
-    source column sets must match, but their order may differ: pass 2 emits
-    values in declared-schema order, matching the existing INSERT contract.
+    `columns`. Each source value is normalized once through the same kernel as
+    INSERT. Declared and source column sets must match, but their order may
+    differ; a positional serializer compiled once before the row loop emits
+    fields in resolved-schema order without rebuilding per-row dictionaries.
 
     `framework_columns` pins the resolved type and nullability of technical
     columns whose value is caller-supplied and constant (e.g.
@@ -1858,8 +2043,8 @@ def prepare_copy_source(
     framework tuple is accepted and validated for symmetry with the caller.
 
     On success: returns an immutable `PreparedCopySource` carrying the final
-    spool, resolved columns, exact row count and on-disk byte count. The
-    neutral spool must be removed before success is returned. On any
+    spool, resolved columns, exact row count and on-disk byte count. An
+    inferred-mode neutral spool is removed before success is returned. On any
     exception, deletion of every current-run spool is attempted with bounded
     retries; a cleanup failure is logged without replacing the primary
     exception and may be reaped by a later positively-owned cleanup pass.
@@ -1895,9 +2080,8 @@ def prepare_copy_source(
             raise DbPublishError(
                 f'column names must be non-empty strings, got {name!r}'
             )
-    # Duplicate column names would silently collapse in pass 2's
-    # `dict(zip(columns_tuple, values))`, causing later columns of the
-    # same name to overwrite earlier ones in the serialized row. The
+    # Duplicate names would make source-position lookup ambiguous and could
+    # route a resolved output column to the wrong positional value. The
     # caller-side RowProjection already blocks duplicates upstream, so
     # this is defensive symmetry rather than the primary guard.
     duplicates = find_duplicates(columns_tuple)
@@ -1977,20 +2161,26 @@ def prepare_copy_source(
     if row_source is None:
         raise DbPublishError('row_source must not be None')
 
-    # --- Execute the two passes ---------------------------------------
+    # --- Execute the selected preparation path -----------------------
 
+    if declared_schema is not None:
+        return _prepare_declared_copy_source_one_pass(
+            row_source=row_source,
+            source_columns=columns_tuple,
+            resolved_columns=declared_tuple,
+            identity=identity,
+            directory=directory,
+            policy=policy,
+        )
+
+    # Inferred mode still needs two passes: the target schema is unknown
+    # until every sampled/observed family has been resolved. Pass 1 writes
+    # normalized values to the neutral spool while feeding inference. Pass 2
+    # uses a positional serializer compiled once from the resolved schema.
     neutral_path: Path | None = None
     copytext_path: Path | None = None
     try:
-        # Pass 1: type-neutral spool. Inference runs alongside only if the
-        # caller did not supply a schema -- otherwise the accumulator's
-        # output would be discarded, which is a false parallel worth
-        # avoiding for readability.
-        if declared_schema is None:
-            state = _InferenceStreamState(len(columns_tuple))
-        else:
-            state = None
-
+        state = _InferenceStreamState(len(columns_tuple))
         source_row_count = 0
         neutral_handle = open_spool_for_write(
             directory,
@@ -1999,59 +2189,48 @@ def prepare_copy_source(
             buffer_bytes=policy.buffer_bytes,
             encrypt=policy.encrypt_spools,
         )
-        neutral_fp = neutral_handle.stream
         neutral_path = neutral_handle.path
         with _close_preserving_primary(
-            neutral_fp, description=f'neutral COPY spool {neutral_path}',
-        ):
+            neutral_handle.stream,
+            description=f'neutral COPY spool {neutral_path}',
+        ) as neutral_fp:
             write_neutral_preamble(neutral_fp, columns=columns_tuple)
             for row in row_source:
-                if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
-                    raise DbPublishError(
-                        f'row source yielded non-sequence {type(row).__name__}'
-                    )
-                row_tuple = tuple(_normalize_value(value) for value in row)
-                if len(row_tuple) != len(columns_tuple):
-                    raise DbPublishError(
-                        f'row width {len(row_tuple)} does not match column '
-                        f'count {len(columns_tuple)}'
-                    )
+                values = _normalize_copy_row(
+                    row,
+                    expected_width=len(columns_tuple),
+                )
                 source_row_count += 1
-                if state is not None:
-                    state.feed_row(row_tuple)
-                # write_neutral_row re-validates width, but the check here
-                # covers the state.feed_row() call above which would raise
-                # first with a less specific message.
+                state.feed_row(values)
                 write_neutral_row(
-                    neutral_fp, row_tuple, expected_width=len(columns_tuple),
+                    neutral_fp,
+                    values,
+                    expected_width=len(columns_tuple),
                 )
             write_neutral_terminator(neutral_fp)
 
-        # Resolve schema between the passes: after inference is complete,
-        # before copytext serialization begins.
-        if declared_schema is not None:
-            resolved_columns = tuple(declared_schema)
-        else:
-            resolved_types = state.resolve()
-            framework_by_name = {c.name: c for c in framework_tuple}
-            resolved_list = []
-            for index, name in enumerate(columns_tuple):
-                framework = framework_by_name.get(name)
-                if framework is not None:
-                    resolved_list.append(framework)
-                    continue
-                override = _resolve_override(overrides.get(name))
-                resolved_list.append(ResolvedColumn(
-                    name=name,
-                    type=override if override is not None else resolved_types[index],
-                    nullable=name not in not_null,
-                ))
-            resolved_columns = tuple(resolved_list)
+        resolved_types = state.resolve()
+        framework_by_name = {c.name: c for c in framework_tuple}
+        resolved_list = []
+        for index, name in enumerate(columns_tuple):
+            framework = framework_by_name.get(name)
+            if framework is not None:
+                resolved_list.append(framework)
+                continue
+            override = _resolve_override(overrides.get(name))
+            resolved_list.append(ResolvedColumn(
+                name=name,
+                type=override if override is not None else resolved_types[index],
+                nullable=name not in not_null,
+            ))
+        resolved_columns = tuple(resolved_list)
+        serializers = _compile_copy_field_serializers(
+            columns_tuple,
+            resolved_columns,
+            identity.target_table,
+            declared=False,
+        )
 
-        # Pass 2: replay neutral -> copytext. Declared mode applies the
-        # strict declared-value validator. Inferred mode applies the
-        # target-aware widening serializer that matches the accepted INSERT
-        # inference semantics. Both enforce non-nullable columns here.
         copytext_handle = open_spool_for_write(
             directory,
             stage='copytext',
@@ -2059,11 +2238,12 @@ def prepare_copy_source(
             buffer_bytes=policy.buffer_bytes,
             encrypt=policy.encrypt_spools,
         )
-        copytext_fp = copytext_handle.stream
         copytext_path = copytext_handle.path
+        output_buffer = bytearray()
         with _close_preserving_primary(
-            copytext_fp, description=f'COPY-text spool {copytext_path}',
-        ):
+            copytext_handle.stream,
+            description=f'COPY-text spool {copytext_path}',
+        ) as copytext_fp:
             neutral_read = open_spool_for_read(
                 neutral_path,
                 identity=identity,
@@ -2072,36 +2252,32 @@ def prepare_copy_source(
                 key=neutral_handle.key,
             )
             with _close_preserving_primary(
-                neutral_read, description=f'neutral COPY spool reader {neutral_path}',
+                neutral_read,
+                description=f'neutral COPY spool reader {neutral_path}',
             ):
                 preamble = read_neutral_preamble(neutral_read)
                 if preamble != columns_tuple:
-                    # A defensive assertion: the writer above sets this
-                    # value from the same `columns_tuple` the reader
-                    # checks against, so a mismatch here would signal a
-                    # bug in the neutral-spool round-trip itself.
                     raise DbPublishError(
                         f'neutral spool preamble columns {preamble!r} do '
                         f'not match expected {columns_tuple!r}'
                     )
                 row_number = 0
                 while True:
-                    values = read_neutral_row(neutral_read, len(columns_tuple))
+                    values = read_neutral_row(
+                        neutral_read,
+                        len(columns_tuple),
+                    )
                     if values is None:
                         break
                     row_number += 1
-                    row_dict = dict(zip(columns_tuple, values, strict=True))
-                    copytext_fp.write(serialize_row_to_copytext(
-                        row_dict,
-                        resolved_columns,
-                        identity.target_table,
+                    _write_compiled_copytext_row(
+                        copytext_fp,
+                        values,
+                        serializers,
                         row_number,
-                        declared=declared_schema is not None,
-                    ))
+                        output_buffer,
+                    )
 
-        # Success path: reap the neutral spool now that copytext is
-        # committed to disk. Copytext survives for the caller to hand to
-        # the COPY consumer in Phase 5.h.
         failed_neutral_cleanup = cleanup_spool_paths([neutral_path])
         if failed_neutral_cleanup:
             raise DbPublishError(
@@ -2119,12 +2295,6 @@ def prepare_copy_source(
             _key=copytext_handle.key,
         )
     except BaseException:
-        # Any failure -- input rejection, mid-pass source exception,
-        # value-validation error, unlink refusal -- attempts to reap every
-        # spool this call created before the exception propagates. Residual
-        # paths are logged by cleanup_spool_paths without replacing the
-        # primary failure. Files that never got created (path is None) are
-        # skipped; already-missing files count as cleanup success.
         to_cleanup = [p for p in (neutral_path, copytext_path) if p is not None]
         if to_cleanup:
             cleanup_spool_paths(to_cleanup)

@@ -9,6 +9,36 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.9
+
+Optimizes COPY preparation without changing publication or spool-protection
+semantics. Declared schemas now use a direct one-pass final-spool path; both
+schema modes use a compiled positional serializer in the row loop.
+
+### Changed
+- **Declared COPY no longer creates a neutral predecessor spool.** Because the
+  complete target schema is already known, normalized rows are validated and
+  serialized directly into the final COPY-text spool before the database
+  transaction opens. Source traversal, cleanup, encryption and publication
+  guarantees remain unchanged.
+- **COPY row serialization is compiled once per payload.** Source positions and
+  scalar families are resolved before the row loop. Preparation no longer
+  rebuilds a dictionary, output list and type-family lookup for every row.
+- **Task-authoring performance guidance is now explicit.**
+  `docs/task-authoring.md` contains a dedicated chapter covering loader
+  selection, declared versus inferred cost, memory and scratch-disk trade-offs,
+  refill behavior, PostgreSQL tuning boundaries and benchmark methodology.
+
+### Tests
+- Added regressions proving declared preparation opens only the final copytext
+  spool and inferred preparation does not call the mapping-based public row
+  serializer per row. Both tests fail against the 0.6.8 implementation for the
+  intended reason.
+- Phase 8 correctness, failure-injection and final performance acceptance must
+  be rerun against this optimized implementation before a public-release
+  checkpoint.
+
+
 ## 0.6.8
 
 Corrects the first live Phase 8 acceptance findings from PostgreSQL 18.4.

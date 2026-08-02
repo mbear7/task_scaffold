@@ -1,9 +1,10 @@
 # 0011 — Add a bounded-memory `COPY FROM STDIN` loader
 
-Status: accepted in stages. Phases 1-7 are implemented through 0.6.8.
+Status: accepted in stages. Phases 1-7 are implemented through 0.6.9.
 `db_loader='copy'` is a public staging transport with predecessor-spool cleanup
-under the task advisory lock. Phase 8 live PostgreSQL acceptance/performance
-evidence remains pending before ADR 0011 is considered fully closed.
+under the task advisory lock. The 0.6.8 correctness and failure campaigns passed
+on PostgreSQL 18.4; Phase 8 performance acceptance must be rerun against the
+0.6.9 preparation path before ADR 0011 is considered fully closed.
 
 Amended before implementation by ADR 0012: schema source and publication
 strategy are independent. COPY changes staging transport only and must work
@@ -594,14 +595,16 @@ COPY-specific diagnostics rather than placeholders in insert results.
 
 ## Local spool design
 
-A local spool is required even when `output_schema` is declared.
+A final local COPY-text spool is required in both schema modes.
 
 The source must be consumed and all task-core-owned normalization and
 validation must complete before the database preparation transaction opens.
 Otherwise a slow or failing source would extend the transaction and recreate
 the long-transaction problem solved by ADR 0005.
 
-The spool also makes a one-shot source replayable for `COPY FROM STDIN`.
+In inferred mode, a type-neutral predecessor spool also makes the one-shot
+source replayable after the schema becomes known. Declared mode already knows
+the target schema and writes the final COPY-text spool directly.
 
 ### Type-neutral first spool
 
@@ -638,35 +641,43 @@ COPY compatibility corpus.
 
 ### Schema resolution and final COPY spool
 
-COPY preparation uses two bounded passes before opening the database
-transaction:
+COPY preparation has two bounded paths before opening the database
+transaction. Inferred mode requires two passes:
 
 ```text
 source
 → normalize each row
-→ write type-neutral spool
-→ accumulate inferred state or validate declared structure
+→ write type-neutral spool and accumulate inferred state
 → source EOF
 → resolve one ResolvedSchema
-→ replay type-neutral spool
+→ replay type-neutral spool through a compiled positional serializer
 → perform final nullability/type validation
 → serialize PostgreSQL COPY text into final spool
 → delete type-neutral spool
 ```
 
-Declared mode already knows its schema, but it follows the same lifecycle in
-the initial implementation. One shared path is preferred over an early
-optimization that gives declared and inferred COPY different cleanup and
-failure behavior. A later implementation may collapse declared preparation to
-one spool only if equivalence and cleanup guarantees remain unchanged.
+Declared mode knows the complete schema before traversal and uses one pass:
+
+```text
+source
+→ normalize each row
+→ validate against the declared schema
+→ serialize through a compiled positional serializer into the final spool
+```
+
+Both paths retain the same final-spool protection, current-run cleanup and
+predecessor-cleanup guarantees. The declared optimization removes only an
+unnecessary intermediate artifact; it does not move source work into the
+database transaction.
 
 After container decoding, the final spool's logical plaintext body contains
 PostgreSQL COPY text records. The container is opened in binary mode to prevent
 newline translation; it does not mean PostgreSQL binary COPY.
 
-Peak scratch-disk use may temporarily approach the sum of the type-neutral and
-final serialized spools. That cost is explicit. COPY replaces `O(rows)` Python
-memory with `O(serialized rows)` local scratch disk.
+In inferred mode, peak scratch-disk use may temporarily approach the sum of
+the type-neutral and final serialized spools. Declared mode needs only the
+final spool. COPY replaces `O(rows)` Python memory with `O(serialized rows)`
+local scratch disk.
 
 ### Spool protection
 

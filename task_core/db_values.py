@@ -509,13 +509,19 @@ def _validate_numeric_value(table_name, column, row_number, value):
             )
 
 
-def _validate_declared_value(table_name, column, row_number, value):
-    """Enforce declared nullability and type rules for one value.
+def _validate_declared_value_family(
+    table_name,
+    column,
+    row_number,
+    value,
+    family,
+):
+    """Validate one declared value when its scalar family is already known.
 
-    Takes `table_name` (not a full payload) so the same kernel serves both
-    the insert path's declared-schema pass in `_resolve_payload_schema` and
-    the COPY path's pass-2 validation in `db_copy.serialize_row_to_copytext`.
-    Keeping this stateless is the entire point of db_values.
+    COPY compiles the family once per column before entering its row loop.
+    INSERT and other callers continue to use `_validate_declared_value`,
+    which resolves the family and delegates here. Keeping the actual rules in
+    one kernel prevents the optimized COPY path from drifting from INSERT.
     """
     if value is None:
         if column.nullable:
@@ -524,8 +530,6 @@ def _validate_declared_value(table_name, column, row_number, value):
             f'{table_name!r}: output row {row_number} contains NULL in '
             f'non-nullable column {column.name!r}'
         )
-
-    family = _declared_type_family(column.type)
 
     if family == 'bool':
         if type(value) is not bool:
@@ -595,6 +599,24 @@ def _validate_declared_value(table_name, column, row_number, value):
 
     raise DbPublishInvariantError(
         f'internal invariant violated -- unsupported declared family {family!r}'
+    )
+
+
+def _validate_declared_value(table_name, column, row_number, value):
+    """Enforce declared nullability and type rules for one value.
+
+    Takes `table_name` (not a full payload) so the same kernel serves both
+    the INSERT path and the COPY path. The COPY preparer can resolve a
+    column's family once and call `_validate_declared_value_family` directly;
+    all other callers retain this stateless convenience boundary.
+    """
+    family = _declared_type_family(column.type)
+    _validate_declared_value_family(
+        table_name,
+        column,
+        row_number,
+        value,
+        family,
     )
 
 

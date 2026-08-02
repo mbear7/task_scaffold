@@ -1879,9 +1879,9 @@ class Test18PrepareCopySourceRoundTripsFromRowSourceToCopyTextSpool(unittest.Tes
 
 
 class Test19PrepareCopySourceUsesDeclaredSchemaWhenProvided(unittest.TestCase):
-    """A declared schema replaces the inference pass. The result's columns
-    are the declared ones; each value is validated against the declared
-    type at serialization time (via serialize_row_to_copytext).
+    """A declared schema replaces inference and enables direct one-pass
+    validation into the final COPY-text spool. The result retains the exact
+    declared columns and wire order.
     """
 
     def test_declared_schema_is_returned_verbatim(self):
@@ -1914,7 +1914,7 @@ class Test19PrepareCopySourceUsesDeclaredSchemaWhenProvided(unittest.TestCase):
                     identity=ident,
                     directory=d,
                 )
-            # Reaped even though the failure was in pass 2.
+            # The partially written final spool is reaped on validation failure.
             self.assertEqual(_list_spools(d), [])
 
     def test_null_in_non_nullable_declared_column_raises(self):
@@ -1931,6 +1931,72 @@ class Test19PrepareCopySourceUsesDeclaredSchemaWhenProvided(unittest.TestCase):
                     directory=d,
                 )
             self.assertEqual(_list_spools(d), [])
+
+
+class Test19bDeclaredPreparationIsOnePassAndSerializationIsCompiled(unittest.TestCase):
+    """Performance fixes must remove work rather than only preserve output.
+
+    The declared path has all target types before traversal, so opening a
+    neutral spool is unnecessary. Both declared and inferred preparation use
+    the positional compiled serializer instead of rebuilding a row mapping
+    and rediscovering scalar families for every output row.
+    """
+
+    def test_declared_path_opens_only_the_final_copytext_spool(self):
+        ident = _make_identity()
+        declared = (
+            ResolvedColumn('name', sa.Text(), False),
+            ResolvedColumn('id', sa.Integer(), False),
+        )
+        stages = []
+        original = db_copy_module.open_spool_for_write
+
+        def recording_open(*args, **kwargs):
+            stages.append(kwargs['stage'])
+            return original(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                'task_core.db_copy.open_spool_for_write',
+                side_effect=recording_open,
+            ):
+                prepared = prepare_copy_source(
+                    row_source=[(1, 'alice'), (2, 'bob')],
+                    columns=['id', 'name'],
+                    declared_schema=declared,
+                    identity=ident,
+                    directory=Path(tmp),
+                )
+            self.assertEqual(
+                stages,
+                ['copytext'],
+                'declared COPY must not create a type-neutral predecessor spool',
+            )
+            self.assertEqual(
+                _read_copytext_body(prepared),
+                b'alice\t1\nbob\t2\n',
+            )
+
+    def test_inferred_path_does_not_call_mapping_serializer_per_row(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                'task_core.db_copy.serialize_row_to_copytext',
+                side_effect=AssertionError(
+                    'prepare_copy_source rebuilt a mapping serializer per row'
+                ),
+            ):
+                prepared = prepare_copy_source(
+                    row_source=[(1, 'alice'), (2, 'bob')],
+                    columns=['id', 'name'],
+                    declared_schema=None,
+                    identity=ident,
+                    directory=Path(tmp),
+                )
+            self.assertEqual(
+                _read_copytext_body(prepared),
+                b'1\talice\n2\tbob\n',
+            )
 
 
 class Test20PrepareCopySourceRejectsSchemaAndInputMismatch(unittest.TestCase):
@@ -2192,7 +2258,7 @@ class Test21PrepareCopySourceReapsSpoolsOnEveryFailurePath(unittest.TestCase):
             # relied on it.
             self.assertEqual(_list_spools(d), [])
 
-    def test_value_validation_exception_in_pass_2_reaps_both_spools(self):
+    def test_declared_value_validation_reaps_the_final_spool(self):
         ident = _make_identity()
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
@@ -2205,8 +2271,8 @@ class Test21PrepareCopySourceReapsSpoolsOnEveryFailurePath(unittest.TestCase):
                     identity=ident,
                     directory=d,
                 )
-            # Pass 1 completed; pass 2 opened copytext then failed on
-            # the first row. Both must be reaped.
+            # Declared mode writes only the final spool; it must be reaped
+            # when the first row fails validation.
             self.assertEqual(_list_spools(d), [])
 
     def test_unsupported_scalar_type_in_pass_1_reaps_neutral_spool(self):
@@ -2326,9 +2392,8 @@ class Test22PrepareCopySourceValidatesInputsBeforeAnyFileIsCreated(unittest.Test
             self.assertTrue(prepared.path.exists())
 
     def test_duplicate_column_names_are_rejected_before_any_file_is_created(self):
-        # Pass 2 replays each row as `dict(zip(columns, values))`, so a
-        # duplicate name would silently collapse and emit stale bytes for
-        # the surviving key. RowProjection blocks duplicates upstream --
+        # Compiled positional lookup requires one unambiguous source index
+        # per name. RowProjection blocks duplicates upstream --
         # this guard is defensive symmetry at the orchestrator boundary.
         ident = _make_identity()
         with tempfile.TemporaryDirectory() as tmp:
