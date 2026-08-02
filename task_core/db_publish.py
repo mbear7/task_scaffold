@@ -27,6 +27,7 @@ from task_core.cleanup import attempt_all_cleanup
 from task_core.db_insert import load_rows_into_staging
 from task_core.db_copy import (
     SpoolIdentity,
+    cleanup_predecessor_spools,
     cleanup_spool_paths,
     load_copy_into_staging,
     prepare_copy_source,
@@ -1444,8 +1445,32 @@ class DbPublisher:
         if not self.try_acquire_task_lock():
             return False
 
+        self._cleanup_predecessor_spools()
         self.cleanup_predecessor_artifacts()
         return True
+
+    def _cleanup_predecessor_spools(self):
+        """Delete positively owned predecessor spools under the task lock.
+
+        A process crash can prevent the current-run cleanup path from running.
+        The next execution cleans the residue only after acquiring the same
+        advisory lock, which proves that no live run of this task can own it.
+        Unknown, malformed and foreign files remain untouched.
+        """
+        self._require_task_lock('clean up predecessor COPY spools')
+        directory = resolve_spool_directory(self.copy_load_policy)
+        deleted, _preserved = cleanup_predecessor_spools(
+            directory,
+            task=self.task_name,
+        )
+        if deleted:
+            self.log.warning(
+                'deleted %s COPY spool(s) left by a previous run of %s: %s',
+                len(deleted),
+                self.task_name,
+                ', '.join(str(path) for path in deleted),
+            )
+        return deleted
 
     def _require_task_lock(self, action):
         """The unconditional-lock contract, enforced by the publisher

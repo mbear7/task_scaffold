@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.6.6. This describes the present system, not
+How `task_core` works as of 0.6.8. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -293,12 +293,18 @@ catalog compatibility and later uses `TRUNCATE` plus `INSERT FROM` staging.
 All source-state work and all refill preflight complete before the first
 live-target lock.
 
-The first 5000 rows are sampled; if the sampled
-answer is one that PostgreSQL could silently widen — `BigInteger` or
-`Date` — the remaining rows are swept with a cheap exact-type check, and
-the column is re-inferred over everything if the sample turns out too
-narrow. If the whole sample is null, the sample is discarded and the full
+The first 5000 rows are sampled. If the sampled answer is one that PostgreSQL
+could silently widen — `BigInteger`, `Date`, or either timestamp awareness —
+the remaining rows are swept with a cheap compatibility check, and the column
+is re-inferred over everything if the sample turns out too narrow or
+ambiguous. If the whole sample is null, the sample is discarded and the full
 column scanned.
+
+Naive datetimes infer `TIMESTAMP`; timezone-aware datetimes infer
+`TIMESTAMPTZ`. A column that mixes aware datetimes with naive datetimes or bare
+dates is rejected before database work because task_core does not assume a
+timezone for values that do not carry one. A date may still widen together
+with naive datetimes to `TIMESTAMP` at midnight.
 
 ### COPY spool protection
 
@@ -320,8 +326,13 @@ path, spools reside under
 `Path(tempfile.gettempdir()) / 'task_core-copy-spool'` on the Python task host,
 not on the PostgreSQL server. Current-run cleanup uses bounded retries and logs
 exact residual paths. Positive predecessor cleanup additionally requires the
-filename token/stage and plaintext header token/stage/task to agree; production
-wiring of that under the advisory lock remains Phase 7.
+filename token/stage and plaintext header token/stage/task to agree. After `begin_run()` acquires the
+task advisory lock, it deletes positively identified spools left by earlier
+executions before preparing new output. This includes residue left when a
+process crash prevented current-run cleanup. Unknown, malformed and foreign
+files remain untouched. If a positively owned predecessor still cannot be
+removed after bounded retries, startup fails rather than knowingly accumulating
+another spool beside it.
 
 See [decisions/0001](decisions/0001-replace-tables-instead-of-truncating.md)
 for why inference is viable at all, and its limitations for tables with
@@ -373,10 +384,11 @@ asserts generated staging names and guards against collisions.
 The source-state table gets the same treatment before its own DDL runs,
 because it is a real table this run creates and writes. `SourceStateStore`
 performs that check itself rather than through a new publisher method —
-`publisher_factory` is an extension seam and has been expanded once by
-accident already. It also compares the existing table's columns against
-what it reads and writes, so a table left by an older version fails at
-startup instead of at the first write, mid-run.
+`publisher_factory` is an advertised extension seam, so protocol growth must
+be deliberate and documented rather than introduced merely to route one
+internal check. It also compares the existing table's columns against what it
+reads and writes, so a table left by an older version fails at startup instead
+of at the first write, mid-run.
 
 Names must match `^[a-z_][a-z0-9_]*$`. Generated SQL still quotes
 identifiers defensively, but the public contract has no quoted-name mode.

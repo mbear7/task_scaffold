@@ -376,7 +376,7 @@ def run_pipelines(
     publisher_config=None,
 ):
     """publisher_config: a frozen PublisherConfig holding publisher_factory,
-    identifier_policy and publication_lock_policy. Defaults to
+    identifier_policy, publication_lock_policy and copy_load_policy. Defaults to
     PublisherConfig(). Resolved once here and read from thereafter, so
     there is no second defaulting point that could diverge from what
     preflight validated against.

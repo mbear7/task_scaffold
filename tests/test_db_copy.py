@@ -1626,6 +1626,31 @@ class Test17PredecessorCleanupDeletesOwnSpoolsPreservesEverythingElse(unittest.T
             self.assertTrue(path_theirs.exists())
             self.assertTrue(other_file.exists())
 
+    def test_owned_spool_that_cannot_be_deleted_is_fatal(self):
+        """Known task data must not be silently left beside a new run.
+
+        Before Phase 7, bounded unlink failure reclassified an owned spool
+        as merely preserved. That made startup continue and allowed residue
+        to accumulate after crashes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            ident = _make_identity(pid=1)
+            fp, path = _open_plain_spool(
+                directory, stage='neutral', identity=ident,
+            )
+            fp.close()
+
+            with patch.object(Path, 'unlink', side_effect=OSError('still busy')):
+                with self.assertRaisesRegex(
+                    DbPublishError,
+                    'could not remove predecessor COPY spool',
+                ):
+                    cleanup_predecessor_spools(
+                        directory, task='hr_task',
+                    )
+            self.assertTrue(path.exists())
+
     def test_non_directory_path_raises_publish_error(self):
         with tempfile.NamedTemporaryFile(delete=False) as tf:
             tmp_file = Path(tf.name)
@@ -2030,6 +2055,62 @@ class Test20bPrepareCopySourceParityCorrections(unittest.TestCase):
                 b'2024-01-01\n2024-01-02 03:04:00\n',
             )
 
+    def test_inferred_aware_datetime_resolves_to_timestamptz(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[
+                    (datetime(2026, 8, 2, 10, 11, 12, tzinfo=timezone.utc),),
+                    (
+                        datetime(
+                            2026, 8, 2, 15, 41, 12,
+                            tzinfo=timezone(timedelta(hours=5, minutes=30)),
+                        ),
+                    ),
+                ],
+                columns=['at'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+            )
+            self.assertIsInstance(prepared.columns[0].type, sa.DateTime)
+            self.assertTrue(
+                prepared.columns[0].type.timezone,
+                'aware COPY inference must create TIMESTAMPTZ',
+            )
+            self.assertEqual(
+                _read_copytext_body(prepared),
+                (
+                    b'2026-08-02 10:11:12+00:00\n'
+                    b'2026-08-02 15:41:12+05:30\n'
+                ),
+            )
+
+    def test_inferred_mixed_datetime_awareness_rejects_and_reaps(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            with self.assertRaisesRegex(
+                DbPublishError,
+                'timezone-aware.*naive',
+            ):
+                prepare_copy_source(
+                    row_source=[
+                        (datetime(2026, 8, 2, 10, 11, 12),),
+                        (
+                            datetime(
+                                2026, 8, 2, 10, 11, 12,
+                                tzinfo=timezone.utc,
+                            ),
+                        ),
+                    ],
+                    columns=['at'],
+                    declared_schema=None,
+                    identity=ident,
+                    directory=directory,
+                )
+            self.assertEqual(_list_spools(directory), [])
+
     def test_type_override_and_not_null_are_applied(self):
         ident = _make_identity()
         with tempfile.TemporaryDirectory() as tmp:
@@ -2419,6 +2500,7 @@ class Test19DbapiCopyTransport(unittest.TestCase):
                 self.assertIn('COPY bsr.stage_table (id, name) FROM STDIN', raw.copy_sql)
                 self.assertIn("DELIMITER E'\\t'", raw.copy_sql)
                 self.assertIn("NULL E'\\\\N'", raw.copy_sql)
+                self.assertIn("ENCODING 'UTF8'", raw.copy_sql)
                 self.assertTrue(raw.cursor_instance.closed)
                 self.assertEqual(conn.invalidate_calls, [])
             finally:

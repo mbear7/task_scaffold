@@ -9,6 +9,75 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.8
+
+Corrects the first live Phase 8 acceptance findings from PostgreSQL 18.4.
+Phase 8 remains open until the corrected correctness, failure-injection and
+performance campaigns pass.
+
+### Fixed
+- **Timezone-aware inferred datetimes now resolve to `TIMESTAMPTZ`.** INSERT
+  and COPY previously classified naive and aware Python datetimes as one
+  family and resolved both to `timestamp without time zone`. PostgreSQL then
+  applied session-timezone semantics on INSERT while COPY discarded the
+  offset for the same target type, breaking value equivalence.
+- **Ambiguous inferred temporal columns fail before database work.** A column
+  mixing timezone-aware datetimes with naive datetimes or bare dates is now
+  rejected with a contextual inference error. The scaffold does not invent a
+  timezone for values that do not carry one.
+- **Sample verification includes datetime awareness.** An aware/naive
+  mismatch appearing after the inference sample boundary triggers full
+  re-inference and rejection instead of silently publishing a naive timestamp.
+
+### Tests
+- Added materialized and streaming inference regressions for aware-only,
+  naive/date, mixed-awareness and post-sample temporal columns.
+- Added COPY preparation regressions proving aware inferred columns resolve to
+  `TIMESTAMPTZ` and ambiguous rows fail while removing current-run spools.
+- Updated the external Phase 8 correctness script to assert the exact inferred
+  timestamp types and to suppress localized PostgreSQL `NOTICE` messages in
+  the LATIN1-client test. The first live run remains preserved as failed
+  evidence; a clean rerun is required against 0.6.8.
+
+
+## 0.6.7
+
+Phase 7 of ADR 0011 wires predecessor COPY-spool cleanup into the task
+lifecycle under the PostgreSQL advisory lock. This release also declares the
+spool serializer's UTF-8 encoding explicitly in the COPY statement.
+
+### Added
+- **Predecessor spool cleanup under the task lock.** After `begin_run()` wins
+  the task advisory lock, `DbPublisher` deletes spools that are positively
+  identified as belonging to an earlier execution of that task. Filename
+  token/stage and plaintext header token/stage/task must all agree. This
+  includes residue left when a process crash prevented current-run cleanup;
+  it does not recover task data or resume an interrupted publication.
+- **Fatal known-owned residue.** If bounded unlink retries cannot remove a
+  positively owned predecessor spool, startup fails instead of silently
+  accumulating another spool beside known task data. Unknown, malformed and
+  foreign files remain untouched.
+
+### Fixed
+- **COPY encoding is explicit.** COPY SQL includes `ENCODING 'UTF8'`, matching
+  the serializer's unconditional UTF-8 byte output rather than depending on
+  the connection's current client encoding.
+- **Custom-publisher contract wording is exact.** The documentation no longer
+  claims that `PublisherConfig` made the factory constructor permanently
+  stable. Since 0.6.6, strict custom factories must accept the documented
+  `copy_load_policy` keyword. No compatibility shim is provided.
+
+### Tests
+- Added lifecycle tests proving predecessor spools are deleted only after the
+  task advisory lock is acquired and remain untouched when lock acquisition
+  fails.
+- Added regression coverage for fatal known-owned cleanup failure and explicit
+  UTF-8 COPY SQL. Each independent test was reverted against its fix and
+  confirmed to fail for the intended reason before the fix was restored.
+- Live PostgreSQL acceptance and the performance campaign remain Phase 8 and
+  are not claimed by this release candidate.
+
+
 ## 0.6.6
 
 Phase 6 of ADR 0011 connects the prepared encrypted COPY spool to PostgreSQL

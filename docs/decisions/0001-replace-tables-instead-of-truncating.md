@@ -53,7 +53,9 @@ to catalog operations.
   column whose sample is all integers and whose later rows contain a
   decimal inferred `bigint`, and PostgreSQL's assignment cast silently
   rounded the value on insert. Sampled inference is now verified against
-  the remaining rows for the two types PostgreSQL can silently widen.
+  the remaining rows for silent numeric/date widening and for timestamp
+  awareness changes. Aware datetimes infer `TIMESTAMPTZ`; ambiguous
+  aware/naive or aware/date columns fail before database work.
 
 ## Rejected
 

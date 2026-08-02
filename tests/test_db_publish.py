@@ -35,7 +35,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import date, datetime, timezone as tz
+from datetime import date, datetime, timedelta, timezone as tz
 from decimal import Decimal
 from pathlib import Path
 
@@ -619,7 +619,9 @@ class Test8SampledTypeInferenceIsVerifiedAgainstUnsampledRows(unittest.TestCase)
     sample, and leave the task reporting success with a correct row count.
 
     The fix keeps the sample as the inference window and adds a
-    verification pass over the remaining rows for those two types only.
+    verification pass over the remaining rows for those two exact-type
+    widenings. Timestamp awareness is verified by a parallel branch because
+    aware and naive values are both instances of datetime.
     These tests hold it to producing the identical answer a full scan
     would, which is the property that actually matters -- not merely that
     it differs from the old, sampled-only behavior.
@@ -748,6 +750,80 @@ class Test8SampledTypeInferenceIsVerifiedAgainstUnsampledRows(unittest.TestCase)
         rows = [{'v': i} for i in range(self.SAMPLE)] + [{'v': 3.5}]
         result = _infer_column_type(rows, 'v', sample_size=None)
         self.assertEqual(type(result).__name__, 'Numeric')
+
+    def test_aware_datetime_column_infers_timestamp_with_time_zone(self):
+        rows = [
+            {'v': datetime(2026, 8, 2, 10, 11, 12, tzinfo=tz.utc)},
+            {
+                'v': datetime(
+                    2026, 8, 2, 15, 41, 12,
+                    tzinfo=tz(timedelta(hours=5, minutes=30)),
+                ),
+            },
+        ]
+        inferred = _infer_column_type(rows, 'v', sample_size=None)
+        self.assertIsInstance(inferred, sa.DateTime)
+        self.assertTrue(
+            inferred.timezone,
+            'timezone-aware values must infer TIMESTAMPTZ, not a naive timestamp',
+        )
+
+    def test_naive_datetime_column_remains_timestamp_without_time_zone(self):
+        rows = [
+            {'v': datetime(2026, 8, 2, 10, 11, 12)},
+            {'v': date(2026, 8, 3)},
+        ]
+        inferred = _infer_column_type(rows, 'v', sample_size=None)
+        self.assertIsInstance(inferred, sa.DateTime)
+        self.assertFalse(inferred.timezone)
+
+    def test_mixed_naive_and_aware_datetimes_are_rejected(self):
+        rows = [
+            {'v': datetime(2026, 8, 2, 10, 11, 12)},
+            {'v': datetime(2026, 8, 2, 10, 11, 12, tzinfo=tz.utc)},
+        ]
+        with self.assertRaisesRegex(
+            DbPublishError,
+            'timezone-aware.*naive',
+        ):
+            _infer_column_type(rows, 'v', sample_size=None)
+
+    def test_mixed_date_and_aware_datetime_are_rejected(self):
+        rows = [
+            {'v': date(2026, 8, 2)},
+            {'v': datetime(2026, 8, 3, 10, 11, 12, tzinfo=tz.utc)},
+        ]
+        with self.assertRaisesRegex(
+            DbPublishError,
+            'timezone-aware.*date',
+        ):
+            _infer_column_type(rows, 'v', sample_size=None)
+
+    def test_late_aware_datetime_beyond_sample_is_not_silently_naivized(self):
+        rows = [
+            {'v': datetime(2026, 8, 2, 10, 11, 12)}
+            for _ in range(self.SAMPLE)
+        ]
+        rows.append({
+            'v': datetime(2026, 8, 2, 10, 11, 12, tzinfo=tz.utc),
+        })
+        with self.assertRaisesRegex(
+            DbPublishError,
+            'timezone-aware.*naive',
+        ):
+            _infer_column_type(rows, 'v', sample_size=self.SAMPLE)
+
+    def test_late_naive_datetime_beyond_aware_sample_is_rejected(self):
+        rows = [
+            {'v': datetime(2026, 8, 2, 10, 11, 12, tzinfo=tz.utc)}
+            for _ in range(self.SAMPLE)
+        ]
+        rows.append({'v': datetime(2026, 8, 2, 10, 11, 12)})
+        with self.assertRaisesRegex(
+            DbPublishError,
+            'timezone-aware.*naive',
+        ):
+            _infer_column_type(rows, 'v', sample_size=self.SAMPLE)
 
 
 
@@ -890,6 +966,27 @@ class Test9StreamingInferenceMatchesFullScanInferPerColumn(unittest.TestCase):
     def test_zero_column_state_is_rejected(self):
         with self.assertRaises(tc.DbPublishError):
             _InferenceStreamState(0)
+
+    def test_aware_datetime_stream_resolves_to_timestamp_with_time_zone(self):
+        state = _InferenceStreamState(1)
+        state.feed_row((datetime(2026, 8, 2, tzinfo=tz.utc),))
+        state.feed_row((datetime(
+            2026, 8, 2, 5, 30,
+            tzinfo=tz(timedelta(hours=5, minutes=30)),
+        ),))
+        resolved = state.resolve()[0]
+        self.assertIsInstance(resolved, sa.DateTime)
+        self.assertTrue(resolved.timezone)
+
+    def test_mixed_datetime_awareness_stream_is_rejected(self):
+        state = _InferenceStreamState(1)
+        state.feed_row((datetime(2026, 8, 2),))
+        state.feed_row((datetime(2026, 8, 2, tzinfo=tz.utc),))
+        with self.assertRaisesRegex(
+            DbPublishError,
+            'timezone-aware.*naive',
+        ):
+            state.resolve()
 
 
 
@@ -3118,8 +3215,17 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
         def close(self):
             pass
 
-    def _publisher(self, conn, task_name='demo_task'):
-        publisher = DbPublisher(creds=_CREDS, schema='bsr', task_name=task_name)
+    def _publisher(self, conn, task_name='demo_task', spool_directory=None):
+        from task_core.db_copy import CopyLoadPolicy
+
+        publisher = DbPublisher(
+            creds=_CREDS,
+            schema='bsr',
+            task_name=task_name,
+            copy_load_policy=CopyLoadPolicy(
+                spool_directory=spool_directory,
+            ),
+        )
         publisher._conn = conn
         publisher._engine = type('E', (), {'dispose': lambda self: None})()
         return publisher
@@ -3157,6 +3263,72 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
         self.assertFalse(publisher.begin_run())
         self.assertFalse(publisher.lock_held)
         self.assertEqual(conn.dropped, [], 'cleanup ran without holding the lock')
+
+    def test_begin_run_cleans_predecessor_spool_after_winning_lock(self):
+        """Phase 7 must connect the existing positive-ownership primitive.
+
+        Before the fix the helper was fully tested but never called by the
+        run lifecycle, so a spool left by a crashed process survived.
+        """
+        from task_core.db_copy import SpoolIdentity, open_spool_for_write
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            identity = SpoolIdentity(
+                task='demo_task',
+                target_schema='bsr',
+                target_table='hr_staff',
+                run_start_utc=datetime(2026, 1, 1, tzinfo=tz.utc),
+                pid=1,
+            )
+            handle = open_spool_for_write(
+                directory, stage='copytext', identity=identity,
+            )
+            handle.stream.close()
+
+            conn = self._Conn()
+            publisher = self._publisher(conn, spool_directory=directory)
+
+            self.assertTrue(publisher.begin_run())
+            self.assertFalse(
+                handle.path.exists(),
+                'predecessor spool survived after the task lock was acquired',
+            )
+            self.assertEqual([kind for kind, _ in conn.lock_calls], ['acquire'])
+
+    def test_losing_task_lock_does_not_clean_predecessor_spool(self):
+        from task_core.db_copy import SpoolIdentity, open_spool_for_write
+
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            identity = SpoolIdentity(
+                task='demo_task',
+                target_schema='bsr',
+                target_table='hr_staff',
+                run_start_utc=datetime(2026, 1, 1, tzinfo=tz.utc),
+                pid=1,
+            )
+            handle = open_spool_for_write(
+                directory, stage='neutral', identity=identity,
+            )
+            handle.stream.close()
+
+            conn = self._Conn(lock_granted=False)
+            publisher = self._publisher(conn, spool_directory=directory)
+
+            self.assertFalse(publisher.begin_run())
+            self.assertTrue(
+                handle.path.exists(),
+                "runner that lost the task lock deleted another run's spool",
+            )
+
+    def test_predecessor_spool_cleanup_requires_task_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            publisher = self._publisher(
+                self._Conn(), spool_directory=Path(tmp),
+            )
+            with self.assertRaisesRegex(DbPublishError, 'advisory lock'):
+                publisher._cleanup_predecessor_spools()
 
     def test_the_lock_key_is_namespaced_and_stable(self):
         from task_core.db_publish import advisory_lock_key

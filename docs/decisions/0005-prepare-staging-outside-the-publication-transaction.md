@@ -112,12 +112,12 @@ but the seam is visibly under growth pressure, and `IdentifierPolicy` was
 itself created to stop two independently-defaulted integers drifting
 apart.
 
-**The next parameter that wants in should not be a parameter.** Fold the
-lot into one frozen `PublisherConfig` and the signature stops breaking
-forever. Doing it now would be a gratuitous second break for no present
-benefit; doing it as part of the third addition costs nothing extra. This
-is written down so that addition triggers the change rather than another
-parameter.
+**The next parameter that wants in should not be a loose
+`run_pipelines()` parameter.** Fold publication policy into one frozen
+`PublisherConfig` so the runner call does not keep growing. Doing it now would
+be a gratuitous second break for no present benefit; doing it as part of the
+third addition costs nothing extra. This is written down so that addition
+triggers the change rather than another loose runner parameter.
 
 **Executed in 0.4.0.** `PublicationLockPolicy` (see 0008) was the addition
 that triggered it. `publisher_factory` and `db_max_identifier_bytes` were
@@ -125,6 +125,14 @@ removed from `run_pipelines()` and became fields of a frozen
 `PublisherConfig`, in one deliberate break with no compatibility aliases.
 Per-task facts — `creds`, `pg_schema` — stayed direct arguments: a task
 widening a lock timeout should not have to restate its credentials.
+
+The original sentence that this would stop the factory signature breaking
+"forever" was too broad. The runner resolves policy from `PublisherConfig`,
+but still supplies those resolved values as explicit constructor keywords to
+`publisher_factory`. Adding a policy field can therefore change the advertised
+factory contract. Version 0.6.6 did so deliberately for `copy_load_policy`.
+Strict custom factories must accept the current constructor signature; this
+repository does not carry compatibility shims for earlier signatures.
 
 ## Rejected
 

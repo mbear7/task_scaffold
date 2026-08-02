@@ -16,7 +16,7 @@ created staging table.
 The module is deliberately name-clean of the forbidden transaction and engine
 operations so the architecture tests can enforce that ownership boundary.
 
-Public shape as of 0.6.6:
+Public shape as of 0.6.8:
 
 - `CopyLoadPolicy`               - config dataclass, moved here from
                                     db_publish in 0.6.4 so its home
@@ -34,8 +34,8 @@ Public shape as of 0.6.6:
 
 ADR 0011 §Spool ownership and cleanup requires *both* an exact filename
 grammar and an internal header for positive ownership before predecessor
-cleanup deletes anything. This module provides both primitives; Phase 5.f
-uses them under the task advisory lock.
+cleanup deletes anything. This module provides both primitives; Phase 7
+wires them into ``DbPublisher.begin_run()`` under the task advisory lock.
 """
 
 from __future__ import annotations
@@ -1617,8 +1617,12 @@ def cleanup_predecessor_spools(
     ours"). Any other file -- foreign task, wrong magic, truncated
     header, non-spool filename -- is preserved.
 
-    Returns (deleted, preserved) as sorted lists of Paths. The
-    directory need not exist; a first-run task has nothing to clean.
+    Returns (deleted, preserved) as sorted lists of Paths. Failure to
+    remove a positively identified predecessor spool after bounded retries
+    is fatal: continuing would knowingly leave task data behind and allow
+    another spool to be created beside it.
+
+    The directory need not exist; a first-run task has nothing to clean.
     A non-directory at that path is a DbPublishError: the operator
     configured the spool location to something we cannot manage, and
     proceeding would either fail obscurely later or clobber their file.
@@ -1637,7 +1641,7 @@ def cleanup_predecessor_spools(
             f'spool directory path exists but is not a directory: {directory}'
         )
 
-    deleted: list[Path] = []
+    owned: list[Path] = []
     preserved: list[Path] = []
     for entry in sorted(directory.iterdir()):
         if not entry.is_file():
@@ -1676,11 +1680,18 @@ def cleanup_predecessor_spools(
             # Foreign task. Preserve.
             preserved.append(entry)
             continue
-        failed = cleanup_spool_paths([entry])
-        if failed:
-            preserved.append(entry)
-            continue
-        deleted.append(entry)
+        owned.append(entry)
+
+    failed = cleanup_spool_paths(owned)
+    failed_set = set(failed)
+    deleted = [path for path in owned if path not in failed_set]
+    if failed:
+        residual = ', '.join(str(path) for path in failed)
+        raise DbPublishError(
+            f'could not remove predecessor COPY spool(s) owned by task '
+            f'{task!r}: {residual}. Refusing to continue while known task '
+            f'data remains in the spool directory.'
+        )
     return (deleted, preserved)
 
 
@@ -1714,7 +1725,7 @@ def _build_copy_sql(conn, staging_table, columns: Sequence[ResolvedColumn]) -> s
     # literal text ``\\N`` is escaped as ``\\\\N`` in the row body.
     return (
         f'COPY {table_sql} ({column_sql}) FROM STDIN '
-        "WITH (FORMAT text, DELIMITER E'\\t', NULL E'\\\\N')"
+        "WITH (FORMAT text, DELIMITER E'\\t', NULL E'\\\\N', ENCODING 'UTF8')"
     )
 
 
@@ -1837,14 +1848,14 @@ def prepare_copy_source(
     source column sets must match, but their order may differ: pass 2 emits
     values in declared-schema order, matching the existing INSERT contract.
 
-    `framework_columns` pins the resolved type of technical columns whose
-    value is caller-supplied and constant (e.g. `etl_updated_at`) after
-    inference completes. Necessary because the row-source accumulator has
-    no way to know a constant timezone-aware datetime should stay
-    aware -- inference on the datetime family alone resolves to a naive
-    `sa.DateTime()`. In declared mode this override is a no-op (declared
-    columns already carry their pinned type), but the same framework
-    tuple is accepted and validated for symmetry with the caller.
+    `framework_columns` pins the resolved type and nullability of technical
+    columns whose value is caller-supplied and constant (e.g.
+    `etl_updated_at`) after inference completes. Inferred user columns now
+    distinguish naive from timezone-aware datetimes directly; framework
+    columns remain pinned because their contract is framework-owned rather
+    than inferred from task data. In declared mode this override is a no-op
+    (declared columns already carry their pinned type), but the same
+    framework tuple is accepted and validated for symmetry with the caller.
 
     On success: returns an immutable `PreparedCopySource` carrying the final
     spool, resolved columns, exact row count and on-disk byte count. The
@@ -1853,7 +1864,7 @@ def prepare_copy_source(
     retries; a cleanup failure is logged without replacing the primary
     exception and may be reaped by a later positively-owned cleanup pass.
 
-    In 0.6.6 this preparation result is consumed by the same-connection
+    Since 0.6.6 this preparation result is consumed by the same-connection
     psycopg2 COPY transport. The caller still owns transaction boundaries,
     staging DDL, publication and final spool cleanup.
     """

@@ -82,10 +82,10 @@ _INTEGER_RANGES = {
 }
 
 
-# The only two inferred types PostgreSQL will silently widen a later,
-# unsampled value into, rather than rejecting it -- confirmed directly
-# against a real PostgreSQL instance by the project owner, not assumed
-# from the documentation:
+# The two inferred types whose unsampled compatibility can be checked by one
+# exact Python type. PostgreSQL silently accepts the wider value instead of
+# rejecting it -- confirmed directly against a real PostgreSQL instance by
+# the project owner, not assumed from the documentation:
 #
 #   create temp table t (v bigint);
 #   insert into t values (3.5);      -- succeeds, stores 4 (assignment
@@ -95,12 +95,11 @@ _INTEGER_RANGES = {
 #                                    -- succeeds, stores 2024-01-01
 #                                    -- (the time is silently dropped)
 #
-# Every other narrowing this inference can produce fails loudly at insert
-# time instead ('N/A' or True into bigint both error), so a sampled answer
-# that turns out too narrow is self-announcing for those and needs no
-# verification pass. These two do not announce themselves anywhere: the
-# task reports success, the row count matches, and the corruption is only
-# visible by comparing published values against the source.
+# Timestamp awareness is another silent semantic boundary, but it cannot be
+# represented by one exact Python type because both aware and naive values are
+# datetime instances. `_infer_column_type()` verifies that branch separately.
+# Other narrowings fail loudly at insert time ('N/A' or True into bigint both
+# error), so they do not need a remainder sweep.
 #
 # The paired Python type is the EXACT type a value must have to be
 # consistent with the inferred column type -- `type(value) is int`, not
@@ -796,14 +795,19 @@ def _resolve_families(families):
     if families <= {'int', 'numeric'} and families:
         return sa.Numeric()
 
-    if families == {'date'}:
-        return sa.Date()
-
-    if families == {'datetime'}:
-        return sa.DateTime()
-
-    if families <= {'date', 'datetime'} and families:
-        return sa.DateTime()
+    temporal_families = {'date', 'datetime_naive', 'datetime_aware'}
+    if families <= temporal_families:
+        if families == {'date'}:
+            return sa.Date()
+        if 'datetime_aware' in families:
+            if families != {'datetime_aware'}:
+                raise DbPublishError(
+                    'cannot infer one timestamp type from timezone-aware '
+                    'datetime and naive datetime or date values; normalize '
+                    'the column or declare output_schema explicitly'
+                )
+            return sa.DateTime(timezone=True)
+        return sa.DateTime(timezone=False)
 
     if families == {'text'}:
         return sa.Text()
@@ -881,6 +885,22 @@ def _infer_column_type(
     if sample_size is None or len(rows) <= sample_size:
         return inferred
 
+    if isinstance(inferred, sa.DateTime):
+        wants_timezone = bool(inferred.timezone)
+        for row in islice(rows, sample_size, None):
+            value = row.get(col_name)
+            if value is None:
+                continue
+            if type(value) is date and not wants_timezone:
+                continue
+            if (
+                isinstance(value, datetime)
+                and _is_aware_datetime(value) is wants_timezone
+            ):
+                continue
+            return _infer_from_scan(rows, col_name, sample_size=None)
+        return inferred
+
     exact_type = _silently_widenable_exact_type(inferred)
     if exact_type is None:
         return inferred
@@ -908,7 +928,7 @@ def _value_family(value):
         case bool():
             return 'bool'
         case datetime():
-            return 'datetime'
+            return 'datetime_aware' if _is_aware_datetime(value) else 'datetime_naive'
         case date():
             return 'date'
         case int():

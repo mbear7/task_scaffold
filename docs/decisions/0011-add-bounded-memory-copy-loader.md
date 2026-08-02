@@ -1,9 +1,9 @@
 # 0011 — Add a bounded-memory `COPY FROM STDIN` loader
 
-Status: accepted in stages. Phases 1-6 are implemented through 0.6.6.
-`db_loader='copy'` is now a public staging transport; Phase 7 predecessor-spool
-cleanup wiring and Phase 8 live PostgreSQL acceptance/performance evidence
-remain pending before ADR 0011 is considered fully closed.
+Status: accepted in stages. Phases 1-7 are implemented through 0.6.8.
+`db_loader='copy'` is a public staging transport with predecessor-spool cleanup
+under the task advisory lock. Phase 8 live PostgreSQL acceptance/performance
+evidence remains pending before ADR 0011 is considered fully closed.
 
 Amended before implementation by ADR 0012: schema source and publication
 strategy are independent. COPY changes staging transport only and must work
@@ -223,10 +223,8 @@ class PipelineSpec:
 
 Validation occurs at two boundaries:
 
-1. `PipelineSpec` rejects any value other than an implemented loader; today
-   that means `'copy'` is rejected by name with a message pointing at this
-   ADR, and any other unknown value is rejected generically. When COPY
-   lands, `PipelineSpec` will accept `'insert'` or `'copy'`;
+1. `PipelineSpec` accepts the implemented loaders `'insert'` and `'copy'`
+   and rejects every other value;
 2. structural pipeline validation will reject COPY combined with
    `get_dynamic_db_contract()` before resources are built;
 3. the database payload/publisher boundary repeats loader validation so direct
@@ -735,16 +733,20 @@ a materialized row list. It must preserve the current outcomes for:
 - integer;
 - numeric values;
 - date;
-- datetime;
-- mixed date and datetime;
+- naive datetime;
+- timezone-aware datetime, resolved to `TIMESTAMPTZ`;
+- mixed date and naive datetime, resolved to `TIMESTAMP`;
 - text;
 - bytes;
 - explicit type overrides;
 - values appearing after the former 5000-row sample boundary.
 
 The existing protection against silent `BIGINT` rounding and `DATE` truncation
-remains mandatory. Streaming accumulation may make the sample-specific
-implementation unnecessary, but it must not change the resolved answer.
+remains mandatory. Timezone awareness is also part of the inferred family:
+aware-only columns resolve to `TIMESTAMPTZ`, while aware/naive or aware/date
+mixtures fail before database work instead of assuming a session timezone.
+Streaming accumulation may make the sample-specific implementation
+unnecessary, but it must not change the resolved answer.
 
 If heterogeneous inferred values collapse to `TEXT`, COPY may accept them only
 when the shared semantic layer can prove a value-preserving textual
@@ -1198,8 +1200,16 @@ reported through the existing publisher result properties.
 
 ### Phase 7 - predecessor spool cleanup
 
-Add positive, task-scoped spool cleanup under the advisory lock. Unknown files
-remain untouched.
+Shipped in 0.6.7. After `begin_run()` acquires the task advisory lock, the
+publisher deletes spools that are positively identified as belonging to an
+earlier execution of that task. Filename token/stage and plaintext header
+token/stage/task must all agree. The pass removes residue left when a process
+crash prevented current-run cleanup, but it does not recover task data or
+resume an interrupted publication.
+
+Unknown, malformed and foreign files remain untouched. Failure to remove a
+positively owned predecessor after bounded retries is fatal rather than being
+silently treated as harmless preserved residue.
 
 ### Phase 8 - equivalence, failure and performance acceptance
 
@@ -1565,8 +1575,14 @@ retains ownership of verification, comments, rollback and publication.
 Unit tests prove exact SQL construction, bounded authenticated reader use,
 connection-loss invalidation, current-run cleanup and no runner pre-count.
 Live PostgreSQL acceptance is still Phase 8 evidence, not claimed by 0.6.6.
-Phase 7 wiring of predecessor-spool cleanup under the task advisory lock also
-remains pending.
+
+0.6.7 ships Phase 7: `begin_run()` performs positive, task-scoped predecessor
+spool cleanup only after acquiring the advisory lock. This removes residue left
+when a process crash prevented current-run cleanup; it does not recover task
+data or resume work. Unknown, malformed and foreign files remain untouched,
+and known-owned residue that cannot be deleted is fatal. COPY SQL also declares
+`ENCODING 'UTF8'`, matching the serializer's unconditional UTF-8 bytes. Live
+PostgreSQL acceptance remains Phase 8 evidence and is not claimed by 0.6.7.
 
 0.6.3 corrected the 0.6.2 language that described the
 runner as a "real consumer" of `DbRowSource` — it consumes the *string*

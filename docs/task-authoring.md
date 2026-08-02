@@ -174,8 +174,14 @@ spec = PipelineSpec(
 The opt-out persists spool bodies as plaintext and emits a warning. Spools live
 on the Python task host under the platform temporary directory unless
 `PublisherConfig.copy_load_policy.spool_directory` supplies another local
-path. COPY does not support `get_dynamic_db_contract()` because its final
-positional row shape must be fixed before one-shot traversal begins.
+path. Current-run spools are deleted on ordinary success and handled failure
+paths. If a process crash prevents that cleanup, the next execution deletes
+positively identified predecessor spools only after acquiring the same task
+advisory lock. Unknown, malformed and foreign files are preserved. Failure to
+remove a positively owned predecessor is fatal. This is artifact cleanup only;
+no task output or interrupted publication is recovered. COPY does not support
+`get_dynamic_db_contract()` because its final positional row shape must be
+fixed before one-shot traversal begins.
 
 ### `db_output` is declarative
 
@@ -217,6 +223,13 @@ spec = PipelineSpec(
     db_not_null_columns=('customer_id',),
 )
 ```
+
+In inferred mode, naive Python datetimes resolve to PostgreSQL `TIMESTAMP` and
+timezone-aware datetimes resolve to `TIMESTAMPTZ`. Bare dates may widen with
+naive datetimes to `TIMESTAMP` at midnight. A column that mixes aware
+datetimes with naive datetimes or bare dates is rejected before database work;
+normalize the values to one awareness policy or declare `output_schema`
+explicitly.
 
 For a complete declared user-column contract, declare every user column:
 
