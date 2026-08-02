@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.6.9. This describes the present system, not
+How `task_core` works as of 0.6.10. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -308,8 +308,17 @@ with naive datetimes to `TIMESTAMP` at midnight.
 
 ### COPY spool protection
 
-COPY preparation uses two local, versioned spool containers: `neutral` and
-`copytext`. Their bodies are encrypted by default with independently generated
+
+Declared COPY compiles one family-specific field writer per output column before
+source traversal. For ordinary native Python values, each writer performs
+missing handling, declared validation and COPY-text encoding directly into a
+reused row buffer. The generic pandas/NumPy normalization kernel is retained as
+a fallback only for non-native scalar wrappers. No normalized row tuple is
+allocated on the declared hot path.
+
+COPY preparation uses local, versioned spool containers named `neutral` and
+`copytext`. Inferred mode uses both; declared mode writes only the final
+`copytext` spool. Their bodies are encrypted by default with independently generated
 AES-256-GCM keys that task_core retains only on in-memory preparation objects
 and never intentionally persists. This does not promise exclusion from swap,
 process dumps or library-internal copies. The ownership header remains plaintext so a

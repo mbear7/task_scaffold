@@ -16,7 +16,7 @@ created staging table.
 The module is deliberately name-clean of the forbidden transaction and engine
 operations so the architecture tests can enforce that ownership boundary.
 
-Public shape as of 0.6.9:
+Public shape as of 0.6.10:
 
 - `CopyLoadPolicy`               - config dataclass, moved here from
                                     db_publish in 0.6.4 so its home
@@ -65,11 +65,13 @@ from task_core.db_values import (
     DbPublishError,
     ResolvedColumn,
     _declared_type_family,
+    _declared_value_error,
     _InferenceStreamState,
+    _is_aware_datetime,
     _normalize_value,
     _resolve_override,
     _validate_declared_value,
-    _validate_declared_value_family,
+    _validate_numeric_value,
 )
 from task_core.types import find_duplicates
 
@@ -1112,81 +1114,436 @@ def _serialize_inferred_value_copytext(
     )
 
 
-_CompiledFieldSerializer = tuple[int, Callable[[Any, int], bytes]]
+_CompiledInferredFieldSerializer = tuple[int, Callable[[Any, int], bytes]]
+_CompiledDeclaredFieldWriter = tuple[int, Callable[[Any, int, bytearray], None]]
 
 
-def _compile_copy_field_serializers(
-    source_columns: Sequence[str],
-    resolved_columns: Sequence[ResolvedColumn],
-    table_name: str,
+_DECLARED_INTEGER_RANGES = {
+    'smallint': (-(2 ** 15), (2 ** 15) - 1),
+    'integer': (-(2 ** 31), (2 ** 31) - 1),
+    'bigint': (-(2 ** 63), (2 ** 63) - 1),
+}
+
+
+def _write_declared_null(
     *,
-    declared: bool,
-) -> tuple[_CompiledFieldSerializer, ...]:
-    """Compile source positions and scalar families once per COPY spool.
-
-    The returned callables retain the shared validation and serialization
-    kernels but remove per-row name dictionaries, column-family discovery,
-    and output-order reconstruction. Declared schemas may reorder columns;
-    the positional index captured here preserves that contract.
-    """
-    source_index = {name: index for index, name in enumerate(source_columns)}
-    compiled: list[_CompiledFieldSerializer] = []
-    for column in resolved_columns:
-        index = source_index[column.name]
-        family = _declared_type_family(column.type)
-        if declared:
-            def render_declared(
-                value,
-                row_number,
-                *,
-                column=column,
-                family=family,
-            ):
-                _validate_declared_value_family(
-                    table_name,
-                    column,
-                    row_number,
-                    value,
-                    family,
-                )
-                if value is None:
-                    return b'\\N'
-                return _serialize_value_copytext_family(
-                    value,
-                    column,
-                    family,
-                )
-
-            render = render_declared
-        else:
-            def render_inferred(
-                value,
-                row_number,
-                *,
-                column=column,
-                family=family,
-            ):
-                return _serialize_inferred_value_copytext_family(
-                    value,
-                    column,
-                    table_name,
-                    row_number,
-                    family,
-                )
-
-            render = render_inferred
-        compiled.append((index, render))
-    return tuple(compiled)
-
-
-def _write_compiled_copytext_row(
-    fp: BinaryIO,
-    values: Sequence[Any],
-    serializers: Sequence[_CompiledFieldSerializer],
+    table_name: str,
+    column: ResolvedColumn,
     row_number: int,
     buffer: bytearray,
 ) -> None:
-    """Serialize one positional row into a reusable output buffer."""
+    if not column.nullable:
+        raise DbPublishError(
+            f'{table_name!r}: output row {row_number} contains NULL in '
+            f'non-nullable column {column.name!r}'
+        )
+    buffer.extend(b'\\N')
+
+
+def _compile_declared_copy_field_writers(
+    source_columns: Sequence[str],
+    resolved_columns: Sequence[ResolvedColumn],
+    table_name: str,
+) -> tuple[_CompiledDeclaredFieldWriter, ...]:
+    """Compile direct declared-value writers once per COPY spool.
+
+    Common native Python values stay entirely on a family-specific hot path:
+    missing handling, type validation, declared constraints, and COPY-text
+    encoding happen in one callable. `_normalize_value()` remains the exact
+    compatibility fallback for pandas, NumPy, and other scalar wrappers, but
+    ordinary task rows no longer pay its generic `pd.isna()` and duck-typing
+    cost for every cell.
+    """
+    source_index = {name: index for index, name in enumerate(source_columns)}
+    compiled: list[_CompiledDeclaredFieldWriter] = []
+
+    for column in resolved_columns:
+        index = source_index[column.name]
+        family = _declared_type_family(column.type)
+
+        if family == 'bool':
+            def write_bool(
+                value,
+                row_number,
+                buffer,
+                *,
+                column=column,
+            ):
+                if type(value) is bool:
+                    buffer.append(0x74 if value else 0x66)
+                    return
+                if value is not None:
+                    value = _normalize_value(value)
+                if value is None:
+                    _write_declared_null(
+                        table_name=table_name,
+                        column=column,
+                        row_number=row_number,
+                        buffer=buffer,
+                    )
+                    return
+                if type(value) is not bool:
+                    _declared_value_error(
+                        table_name, column, row_number, 'expected bool',
+                    )
+                buffer.append(0x74 if value else 0x66)
+
+            writer = write_bool
+
+        elif family in _DECLARED_INTEGER_RANGES:
+            lower, upper = _DECLARED_INTEGER_RANGES[family]
+
+            def write_integer(
+                value,
+                row_number,
+                buffer,
+                *,
+                column=column,
+                family=family,
+                lower=lower,
+                upper=upper,
+            ):
+                if type(value) is not int:
+                    if value is not None:
+                        value = _normalize_value(value)
+                    if value is None:
+                        _write_declared_null(
+                            table_name=table_name,
+                            column=column,
+                            row_number=row_number,
+                            buffer=buffer,
+                        )
+                        return
+                    if type(value) is not int:
+                        _declared_value_error(
+                            table_name,
+                            column,
+                            row_number,
+                            'expected int, not bool or another numeric family',
+                        )
+                if not lower <= value <= upper:
+                    _declared_value_error(
+                        table_name,
+                        column,
+                        row_number,
+                        f'value is outside {family} range',
+                    )
+                buffer.extend(str(value).encode('ascii'))
+
+            writer = write_integer
+
+        elif family == 'numeric':
+            def write_numeric(
+                value,
+                row_number,
+                buffer,
+                *,
+                column=column,
+            ):
+                native = type(value) is int or isinstance(value, Decimal)
+                if not native:
+                    if value is not None:
+                        value = _normalize_value(value)
+                    if value is None:
+                        _write_declared_null(
+                            table_name=table_name,
+                            column=column,
+                            row_number=row_number,
+                            buffer=buffer,
+                        )
+                        return
+                elif isinstance(value, Decimal) and value.is_nan():
+                    value = None
+                    _write_declared_null(
+                        table_name=table_name,
+                        column=column,
+                        row_number=row_number,
+                        buffer=buffer,
+                    )
+                    return
+                _validate_numeric_value(
+                    table_name,
+                    column,
+                    row_number,
+                    value,
+                )
+                buffer.extend(str(value).encode('ascii'))
+
+            writer = write_numeric
+
+        elif family == 'float':
+            def write_float(
+                value,
+                row_number,
+                buffer,
+                *,
+                column=column,
+            ):
+                if type(value) is float:
+                    if value != value:
+                        _write_declared_null(
+                            table_name=table_name,
+                            column=column,
+                            row_number=row_number,
+                            buffer=buffer,
+                        )
+                        return
+                else:
+                    if value is not None:
+                        value = _normalize_value(value)
+                    if value is None:
+                        _write_declared_null(
+                            table_name=table_name,
+                            column=column,
+                            row_number=row_number,
+                            buffer=buffer,
+                        )
+                        return
+                    if type(value) is not float:
+                        _declared_value_error(
+                            table_name, column, row_number, 'expected float',
+                        )
+                buffer.extend(_serialize_float_text(value))
+
+            writer = write_float
+
+        elif family == 'text':
+            max_length = column.type.length
+
+            def write_text(
+                value,
+                row_number,
+                buffer,
+                *,
+                column=column,
+                max_length=max_length,
+            ):
+                if type(value) is not str:
+                    if value is not None:
+                        value = _normalize_value(value)
+                    if value is None:
+                        _write_declared_null(
+                            table_name=table_name,
+                            column=column,
+                            row_number=row_number,
+                            buffer=buffer,
+                        )
+                        return
+                    if not isinstance(value, str):
+                        _declared_value_error(
+                            table_name, column, row_number, 'expected str',
+                        )
+                if '\x00' in value:
+                    _declared_value_error(
+                        table_name,
+                        column,
+                        row_number,
+                        'NUL character is not supported in PostgreSQL text',
+                    )
+                if max_length is not None and len(value) > max_length:
+                    _declared_value_error(
+                        table_name,
+                        column,
+                        row_number,
+                        f'text length exceeds VARCHAR({max_length})',
+                    )
+                buffer.extend(_escape_copytext_text(value))
+
+            writer = write_text
+
+        elif family == 'bytes':
+            def write_bytes(
+                value,
+                row_number,
+                buffer,
+                *,
+                column=column,
+            ):
+                if not isinstance(value, (bytes, bytearray, memoryview)):
+                    if value is not None:
+                        value = _normalize_value(value)
+                    if value is None:
+                        _write_declared_null(
+                            table_name=table_name,
+                            column=column,
+                            row_number=row_number,
+                            buffer=buffer,
+                        )
+                        return
+                    if not isinstance(value, (bytes, bytearray, memoryview)):
+                        _declared_value_error(
+                            table_name,
+                            column,
+                            row_number,
+                            'expected bytes-like value',
+                        )
+                payload = (
+                    bytes(value)
+                    if isinstance(value, (bytearray, memoryview))
+                    else value
+                )
+                buffer.extend(b'\\\\x')
+                buffer.extend(payload.hex().encode('ascii'))
+
+            writer = write_bytes
+
+        elif family == 'date':
+            def write_date(
+                value,
+                row_number,
+                buffer,
+                *,
+                column=column,
+            ):
+                if type(value) is not date:
+                    if value is not None:
+                        value = _normalize_value(value)
+                    if value is None:
+                        _write_declared_null(
+                            table_name=table_name,
+                            column=column,
+                            row_number=row_number,
+                            buffer=buffer,
+                        )
+                        return
+                    if type(value) is not date:
+                        _declared_value_error(
+                            table_name,
+                            column,
+                            row_number,
+                            'expected date; datetime-to-DATE conversion is not implicit',
+                        )
+                buffer.extend(value.isoformat().encode('ascii'))
+
+            writer = write_date
+
+        elif family == 'datetime':
+            wants_timezone = bool(column.type.timezone)
+
+            def write_datetime(
+                value,
+                row_number,
+                buffer,
+                *,
+                column=column,
+                wants_timezone=wants_timezone,
+            ):
+                if type(value) is not datetime:
+                    if value is not None:
+                        value = _normalize_value(value)
+                    if value is None:
+                        _write_declared_null(
+                            table_name=table_name,
+                            column=column,
+                            row_number=row_number,
+                            buffer=buffer,
+                        )
+                        return
+                    if not isinstance(value, datetime):
+                        _declared_value_error(
+                            table_name,
+                            column,
+                            row_number,
+                            'expected datetime',
+                        )
+                aware = _is_aware_datetime(value)
+                if wants_timezone and not aware:
+                    _declared_value_error(
+                        table_name,
+                        column,
+                        row_number,
+                        'timezone-aware datetime required',
+                    )
+                if not wants_timezone and aware:
+                    _declared_value_error(
+                        table_name,
+                        column,
+                        row_number,
+                        'timezone-aware datetime cannot be published to timestamp without time zone',
+                    )
+                buffer.extend(value.isoformat(sep=' ').encode('ascii'))
+
+            writer = write_datetime
+
+        else:
+            raise DbPublishError(
+                f'internal invariant violated -- unsupported family '
+                f'{family!r} in declared COPY compiler'
+            )
+
+        compiled.append((index, writer))
+
+    return tuple(compiled)
+
+
+def _compile_inferred_copy_field_serializers(
+    source_columns: Sequence[str],
+    resolved_columns: Sequence[ResolvedColumn],
+    table_name: str,
+) -> tuple[_CompiledInferredFieldSerializer, ...]:
+    """Compile inferred source positions and scalar families once per spool."""
+    source_index = {name: index for index, name in enumerate(source_columns)}
+    compiled: list[_CompiledInferredFieldSerializer] = []
+    for column in resolved_columns:
+        index = source_index[column.name]
+        family = _declared_type_family(column.type)
+
+        def render_inferred(
+            value,
+            row_number,
+            *,
+            column=column,
+            family=family,
+        ):
+            return _serialize_inferred_value_copytext_family(
+                value,
+                column,
+                table_name,
+                row_number,
+                family,
+            )
+
+        compiled.append((index, render_inferred))
+    return tuple(compiled)
+
+
+def _write_compiled_declared_copytext_row(
+    fp: BinaryIO,
+    row: Sequence[Any],
+    serializers: Sequence[_CompiledDeclaredFieldWriter],
+    row_number: int,
+    buffer: bytearray,
+    *,
+    expected_width: int,
+) -> None:
+    """Validate and serialize one raw declared row without a normalized tuple."""
+    if type(row) not in (tuple, list):
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
+            raise DbPublishError(
+                f'row source yielded non-sequence {type(row).__name__}'
+            )
+    if len(row) != expected_width:
+        raise DbPublishError(
+            f'row width {len(row)} does not match column count {expected_width}'
+        )
+
+    buffer.clear()
+    for field_number, (source_index, write_field) in enumerate(serializers):
+        if field_number:
+            buffer.append(0x09)
+        write_field(row[source_index], row_number, buffer)
+    buffer.append(0x0A)
+    fp.write(buffer)
+
+
+def _write_compiled_inferred_copytext_row(
+    fp: BinaryIO,
+    values: Sequence[Any],
+    serializers: Sequence[_CompiledInferredFieldSerializer],
+    row_number: int,
+    buffer: bytearray,
+) -> None:
+    """Serialize one normalized inferred row into a reusable output buffer."""
     buffer.clear()
     for field_number, (source_index, render) in enumerate(serializers):
         if field_number:
@@ -1194,7 +1551,6 @@ def _write_compiled_copytext_row(
         buffer.extend(render(values[source_index], row_number))
     buffer.append(0x0A)
     fp.write(buffer)
-
 
 def serialize_row_to_copytext(
     row: Mapping[str, Any],
@@ -1957,11 +2313,10 @@ def _prepare_declared_copy_source_one_pass(
     """
     copytext_path: Path | None = None
     try:
-        serializers = _compile_copy_field_serializers(
+        serializers = _compile_declared_copy_field_writers(
             source_columns,
             resolved_columns,
             identity.target_table,
-            declared=True,
         )
         handle = open_spool_for_write(
             directory,
@@ -1978,17 +2333,14 @@ def _prepare_declared_copy_source_one_pass(
             description=f'COPY-text spool {copytext_path}',
         ) as copytext_fp:
             for row in row_source:
-                values = _normalize_copy_row(
-                    row,
-                    expected_width=len(source_columns),
-                )
                 row_count += 1
-                _write_compiled_copytext_row(
+                _write_compiled_declared_copytext_row(
                     copytext_fp,
-                    values,
+                    row,
                     serializers,
                     row_count,
                     output_buffer,
+                    expected_width=len(source_columns),
                 )
         return PreparedCopySource(
             path=copytext_path,
@@ -2224,11 +2576,10 @@ def prepare_copy_source(
                 nullable=name not in not_null,
             ))
         resolved_columns = tuple(resolved_list)
-        serializers = _compile_copy_field_serializers(
+        serializers = _compile_inferred_copy_field_serializers(
             columns_tuple,
             resolved_columns,
             identity.target_table,
-            declared=False,
         )
 
         copytext_handle = open_spool_for_write(
@@ -2270,7 +2621,7 @@ def prepare_copy_source(
                     if values is None:
                         break
                     row_number += 1
-                    _write_compiled_copytext_row(
+                    _write_compiled_inferred_copytext_row(
                         copytext_fp,
                         values,
                         serializers,

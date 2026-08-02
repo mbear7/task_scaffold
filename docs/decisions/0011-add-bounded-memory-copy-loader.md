@@ -1,10 +1,10 @@
 # 0011 — Add a bounded-memory `COPY FROM STDIN` loader
 
-Status: accepted in stages. Phases 1-7 are implemented through 0.6.9.
+Status: accepted in stages. Phases 1-7 are implemented through 0.6.10.
 `db_loader='copy'` is a public staging transport with predecessor-spool cleanup
 under the task advisory lock. The 0.6.8 correctness and failure campaigns passed
 on PostgreSQL 18.4; Phase 8 performance acceptance must be rerun against the
-0.6.9 preparation path before ADR 0011 is considered fully closed.
+0.6.10 preparation path before ADR 0011 is considered fully closed.
 
 Amended before implementation by ADR 0012: schema source and publication
 strategy are independent. COPY changes staging transport only and must work
@@ -660,15 +660,16 @@ Declared mode knows the complete schema before traversal and uses one pass:
 
 ```text
 source
-→ normalize each row
-→ validate against the declared schema
-→ serialize through a compiled positional serializer into the final spool
+→ validate and normalize each field through a compiled family writer
+→ serialize directly into a reused row buffer and the final spool
 ```
 
 Both paths retain the same final-spool protection, current-run cleanup and
-predecessor-cleanup guarantees. The declared optimization removes only an
-unnecessary intermediate artifact; it does not move source work into the
-database transaction.
+predecessor-cleanup guarantees. The declared optimizations remove the
+unnecessary intermediate artifact and the generic per-cell normalization /
+validation / serialization chain. Native Python values are handled directly;
+pandas, NumPy and other scalar wrappers still use the shared normalization
+fallback. No source work moves into the database transaction.
 
 After container decoding, the final spool's logical plaintext body contains
 PostgreSQL COPY text records. The container is opened in binary mode to prevent

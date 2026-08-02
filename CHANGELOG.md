@@ -9,6 +9,38 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.10
+
+Optimizes the declared one-pass COPY row loop identified by the 0.6.9 live
+cProfile campaign. Publication, spool protection, bounded-memory behavior and
+the inferred two-pass path are unchanged.
+
+### Changed
+- **Declared COPY uses compiled direct field writers.** One writer per output
+  column now combines native missing handling, declared validation and
+  COPY-text encoding directly into the reusable row buffer. Ordinary Python
+  `bool`, integer, `Decimal`, float, text, bytes, date and datetime values no
+  longer pass through the generic pandas-aware normalization stack.
+- **Scalar-wrapper compatibility remains explicit.** pandas, NumPy and other
+  non-native scalar wrappers still fall back to the shared `_normalize_value()`
+  kernel before the same declared constraints are enforced.
+- **Declared COPY no longer allocates a normalized row tuple.** Source width is
+  checked first and declared wire-order fields are written directly from the
+  source row.
+
+### Tests
+- Added a regression proving native declared values do not call the generic
+  normalizer, generic declared validator or generic family serializer. The test
+  fails against 0.6.9 at `_normalize_copy_row()` for the intended reason.
+- Added coverage proving NumPy/pandas scalar wrappers use the normalization
+  fallback and that native float/Decimal NaN markers retain declared NULL
+  semantics.
+- A source-only 100k-row, five-column diagnostic reduced median final-spool
+  preparation from 0.748 s to 0.261 s for plaintext and from 0.782 s to
+  0.265 s for AES-256-GCM in this environment. These are local diagnostic
+  measurements, not live PostgreSQL release acceptance.
+
+
 ## 0.6.9
 
 Optimizes COPY preparation without changing publication or spool-protection

@@ -80,6 +80,34 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
              'db_publication_strategy', 'db_loader', 'db_copy_spool_encryption'},
         )
 
+    def test_task_authoring_contains_the_database_output_mode_matrix(self):
+        """The loader/schema/publication choice is an author-facing contract.
+
+        The matrix was added after live 0.6.10 evidence showed that broad
+        statements such as "COPY is slower" or "COPY is faster" both hide
+        the real choice.  Protect the supported combinations, the unsupported
+        inferred/refill combination and the warning that measurements are not
+        universal guarantees.
+        """
+        text = Path('docs/task-authoring.md').read_text(encoding='utf-8')
+        normalized = re.sub(r'\s+', ' ', text)
+        expected_rows = (
+            '| Inferred | INSERT | `replace` |',
+            '| Inferred | encrypted COPY | `replace` |',
+            '| Declared | INSERT | `replace` |',
+            '| Declared | encrypted COPY | `replace` |',
+            '| Declared | INSERT | `refill` |',
+            '| Declared | encrypted COPY | `refill` |',
+            '| Inferred | any | `refill` | Never. |',
+        )
+        for row in expected_rows:
+            with self.subTest(row=row):
+                self.assertIn(row, text)
+        self.assertIn('Plaintext COPY is omitted deliberately', text)
+        self.assertIn('not a performance contract', normalized)
+        self.assertIn('keep INSERT as the global default', normalized)
+        self.assertIn('prefer declared encrypted COPY + `replace`', normalized)
+
     def test_result_shapes_are_as_documented(self):
         self.assertEqual(
             {f.name for f in dataclasses.fields(tc.RunResult)},

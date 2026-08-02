@@ -1999,6 +1999,140 @@ class Test19bDeclaredPreparationIsOnePassAndSerializationIsCompiled(unittest.Tes
             )
 
 
+class Test19cDeclaredDirectSerializerHotPath(unittest.TestCase):
+    """Declared COPY must fuse normalization, validation, and encoding.
+
+    The 0.6.9 one-pass path still sent every ordinary Python cell through
+    `_normalize_value()`, the generic declared validator, and the generic
+    family serializer. A one-million-row, five-column profile measured five
+    million calls through each layer. These tests protect the direct compiled
+    path and its scalar-wrapper fallback separately.
+    """
+
+    def test_native_values_bypass_generic_value_pipeline(self):
+        ident = _make_identity()
+        declared = (
+            ResolvedColumn('flag', sa.Boolean(), False),
+            ResolvedColumn('small', sa.SmallInteger(), False),
+            ResolvedColumn('integer', sa.Integer(), False),
+            ResolvedColumn('big', sa.BigInteger(), False),
+            ResolvedColumn('amount', sa.Numeric(10, 2), False),
+            ResolvedColumn('ratio', sa.Float(), False),
+            ResolvedColumn('label', sa.String(20), False),
+            ResolvedColumn('payload', sa.LargeBinary(), False),
+            ResolvedColumn('day', sa.Date(), False),
+            ResolvedColumn('local_at', sa.DateTime(), False),
+            ResolvedColumn('utc_at', sa.DateTime(timezone=True), False),
+        )
+        row = (
+            True,
+            -7,
+            8,
+            9,
+            Decimal('12.30'),
+            3.5,
+            'x\ty',
+            b'\x00\xff',
+            date(2026, 8, 2),
+            datetime(2026, 8, 2, 10, 11, 12),
+            datetime(2026, 8, 2, 10, 11, 12, tzinfo=timezone.utc),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch(
+                    'task_core.db_copy._normalize_value',
+                    side_effect=AssertionError(
+                        'native declared COPY called generic normalization'
+                    ),
+                ),
+                patch(
+                    'task_core.db_copy._validate_declared_value_family',
+                    side_effect=AssertionError(
+                        'native declared COPY called generic validation'
+                    ),
+                    create=True,
+                ),
+                patch(
+                    'task_core.db_copy._serialize_value_copytext_family',
+                    side_effect=AssertionError(
+                        'native declared COPY called generic serialization'
+                    ),
+                ),
+            ):
+                prepared = prepare_copy_source(
+                    row_source=[row],
+                    columns=[column.name for column in declared],
+                    declared_schema=declared,
+                    identity=ident,
+                    directory=Path(tmp),
+                )
+            self.assertEqual(
+                _read_copytext_body(prepared),
+                (
+                    b't\t-7\t8\t9\t12.30\t3.5\tx\\ty\t'
+                    b'\\\\x00ff\t2026-08-02\t2026-08-02 10:11:12\t'
+                    b'2026-08-02 10:11:12+00:00\n'
+                ),
+            )
+
+    def test_non_native_scalars_use_exact_normalization_fallback(self):
+        import numpy as np
+        import pandas as pd
+
+        ident = _make_identity()
+        declared = (
+            ResolvedColumn('id', sa.BigInteger(), False),
+            ResolvedColumn('flag', sa.Boolean(), False),
+            ResolvedColumn('at', sa.DateTime(), False),
+            ResolvedColumn('missing', sa.Text(), True),
+        )
+        original = db_copy_module._normalize_value
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                'task_core.db_copy._normalize_value',
+                wraps=original,
+            ) as normalize:
+                prepared = prepare_copy_source(
+                    row_source=[(
+                        np.int64(7),
+                        np.bool_(True),
+                        pd.Timestamp('2026-08-02 10:11:12'),
+                        pd.NA,
+                    )],
+                    columns=[column.name for column in declared],
+                    declared_schema=declared,
+                    identity=ident,
+                    directory=Path(tmp),
+                )
+            self.assertEqual(normalize.call_count, 4)
+            self.assertEqual(
+                _read_copytext_body(prepared),
+                b'7\tt\t2026-08-02 10:11:12\t\\N\n',
+            )
+
+    def test_native_nan_markers_keep_declared_null_semantics(self):
+        ident = _make_identity()
+        declared = (
+            ResolvedColumn('ratio', sa.Float(), True),
+            ResolvedColumn('amount', sa.Numeric(), True),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                'task_core.db_copy._normalize_value',
+                side_effect=AssertionError(
+                    'native NaN markers called generic normalization'
+                ),
+            ):
+                prepared = prepare_copy_source(
+                    row_source=[(float('nan'), Decimal('NaN'))],
+                    columns=['ratio', 'amount'],
+                    declared_schema=declared,
+                    identity=ident,
+                    directory=Path(tmp),
+                )
+            self.assertEqual(_read_copytext_body(prepared), b'\\N\t\\N\n')
+
+
 class Test20PrepareCopySourceRejectsSchemaAndInputMismatch(unittest.TestCase):
     """Configuration errors are caught at the orchestrator boundary --
     before any file is created where possible, and before pass 2 in the

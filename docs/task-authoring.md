@@ -509,14 +509,68 @@ Do not select COPY from a blanket claim that it is faster. The 0.6.8 Phase 8
 baseline showed much faster PostgreSQL ingestion and lower WAL, but Python-side
 serialization and spool construction offset most or all of that gain in several
 profiles. Version 0.6.9 removes the unnecessary neutral-spool pass for declared
-schemas; benchmark representative tasks again rather than carrying the 0.6.8
-crossover forward as a guarantee.
+schemas. Version 0.6.10 additionally compiles family-specific field writers
+that bypass the generic pandas/NumPy normalization stack for ordinary native
+Python values. Benchmark representative tasks again rather than carrying any
+earlier crossover forward as a guarantee.
+
+
+### Database output mode matrix
+
+Use this matrix to choose the initial configuration. It is a starting point for
+measurement, not a substitute for a representative benchmark.
+
+| Schema | Loader | Publication | Use when | Principal trade-off |
+|---|---|---|---|---|
+| Inferred | INSERT | `replace` | The output contract is exploratory or genuinely variable and sufficient memory is available. | No spool, but materialized row mappings can grow with output size. |
+| Inferred | encrypted COPY | `replace` | Schema inference is required and the source is one-shot or must remain bounded-memory. | Requires a neutral inference spool plus the final COPY-text spool; this is the highest-preparation-cost supported mode. |
+| Declared | INSERT | `replace` | The contract is stable, output is small or moderate, and avoiding a local spool matters more than memory or staging WAL. | Simple path and short publication lock, but memory grows with the materialized payload. |
+| Declared | encrypted COPY | `replace` | The contract is stable and the output is large, one-shot, memory-sensitive or WAL-sensitive. | One-pass final spool, bounded memory and short publication lock; this is the strongest measured 0.6.10 combination. |
+| Declared | INSERT | `refill` | Table identity and attached objects must survive, sufficient memory is available, and the output is not large enough to justify COPY. | Materialized payload plus a full target rewrite under `ACCESS EXCLUSIVE`; highest measured memory and WAL. |
+| Declared | encrypted COPY | `refill` | Table identity must survive and bounded memory or faster staging matters. | COPY accelerates staging, but the target-side `TRUNCATE` and `INSERT FROM staging` still dominate lock duration and can vary with checkpoints. |
+| Inferred | any | `refill` | Never. | Unsupported: `refill` requires `output_schema` so the stable target can be checked before it is truncated. |
+
+Plaintext COPY is omitted deliberately. It is a diagnostic benchmark for
+separating serialization, filesystem and encryption cost, not the production
+recommendation.
+
+### Measured 0.6.10 reference point
+
+The accepted development evidence used one million declared rows on PostgreSQL
+18.4 with default server configuration. Two randomized campaigns produced six
+measurements per mode and publication strategy:
+
+| Publication | Loader | Median end-to-end | Median peak RSS | Median WAL |
+|---|---|---:|---:|---:|
+| `replace` | INSERT | 32.40 s | 469.1 MiB | 122.5 MiB |
+| `replace` | encrypted COPY | 10.00 s | 131.2 MiB | 77.4 MiB |
+| `refill` | INSERT | 41.00 s | 469.2 MiB | 245.1 MiB |
+| `refill` | encrypted COPY | 21.57 s | 131.3 MiB | 199.8 MiB |
+
+These measurements support four task-authoring conclusions for 0.6.10:
+
+- keep INSERT as the global default because small outputs avoid spool setup and
+  no universal crossover is promised;
+- prefer declared encrypted COPY + `replace` for large stable outputs unless a
+  representative task benchmark contradicts it;
+- choose `refill` only to preserve table identity and attached objects, not as a
+  performance optimization;
+- treat refill timings as more variable than replacement because publication
+  rewrites the live target and is sensitive to WAL and checkpoint timing.
+
+The figures are evidence from one development environment, not a performance
+contract. Preserve the raw campaign outside the project tree and rerun when row
+width, scalar families, hardware, PostgreSQL configuration or task behavior
+changes materially.
 
 ### Prefer declared schemas for stable production outputs
 
 A declared schema gives the loader its target types and wire order before the
 source is traversed. COPY can validate and serialize directly into the final
-spool in one pass. Inferred COPY must retain a type-neutral first spool, resolve
+spool in one pass. The declared hot path uses one compiled writer per column,
+combining missing-value handling, type validation and COPY-text encoding while
+retaining the generic normalizer only for pandas, NumPy and other scalar
+wrappers. Inferred COPY must retain a type-neutral first spool, resolve
 the schema at EOF and replay the normalized values into the final spool.
 
 Use inference for exploratory or genuinely variable outputs. Use
@@ -587,11 +641,12 @@ publication blocking and artifact protection.
 
 ### Practical decision rule
 
-Start with INSERT. Move to declared encrypted COPY when memory, one-shot input
-or WAL pressure justifies the spool, then measure. Keep inferred COPY only when
-schema inference is itself required. Use refill only to preserve table identity
-and attached objects. The correct combination is the one supported by the
-representative campaign, not the one with the most sophisticated transport.
+Keep INSERT as the global default. For small or moderate outputs, and for
+inferred outputs where memory is sufficient, begin with INSERT. For a large
+stable declared output, begin with encrypted COPY and `replace` unless table
+identity or attached objects require `refill`. Keep inferred COPY only when
+schema inference and bounded-memory traversal are both required. Benchmark the
+representative task before treating any crossover as permanent.
 
 
 ## Source-change checking
