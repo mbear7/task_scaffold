@@ -118,6 +118,7 @@ class Test3DbLoaderVocabulary(unittest.TestCase):
     def test_default_is_insert(self):
         spec = tc.PipelineSpec(db_table='t')
         self.assertEqual(spec.db_loader, 'insert')
+        self.assertIsNone(spec.db_copy_spool_encryption)
 
     def test_explicit_insert_is_accepted(self):
         spec = tc.PipelineSpec(db_table='t', db_loader='insert')
@@ -143,6 +144,22 @@ class Test3DbLoaderVocabulary(unittest.TestCase):
     def test_a_non_string_is_rejected(self):
         with self.assertRaises(ValueError):
             tc.PipelineSpec(db_table='t', db_loader=None)
+
+
+class Test3bCopySpoolEncryptionOverride(unittest.TestCase):
+    def test_accepts_none_true_and_false(self):
+        for value in (None, True, False):
+            with self.subTest(value=value):
+                self.assertIs(
+                    tc.PipelineSpec(db_copy_spool_encryption=value).db_copy_spool_encryption,
+                    value,
+                )
+
+    def test_rejects_non_bool_values(self):
+        for value in (0, 1, 'false', [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    tc.PipelineSpec(db_copy_spool_encryption=value)
 
 
 class Test4OldPositionalPipelineSpecConstructionKeepsItsMeaning(unittest.TestCase):

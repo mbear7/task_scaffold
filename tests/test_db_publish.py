@@ -2582,13 +2582,13 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
     spec, target schema and task name, it wires
     adapter.to_row_source() -> RowProjection.build() ->
     _ProjectedRowSource -> prepare_copy_source() into a target-aware
-    COPY-text spool.
+    spool container whose plaintext body is COPY text.
 
     Lives in test_db_publish.py rather than a runner-specific file for
     the same reason Test17dRunnerCopyBranching does: the composition
     IS the row-source contract in motion, and the row-source contract
     is what this file tests. db_loader='copy' remains publicly rejected
-    at every spec/payload boundary in 0.6.4, so the helper is
+    at every spec/payload boundary in 0.6.5, so the helper is
     exercised by direct calls here.
     """
 
@@ -2614,16 +2614,16 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
         # spools behind for the next test to trip on.
         with tempfile.TemporaryDirectory() as tmp:
             policy = CopyLoadPolicy(spool_directory=Path(tmp))
-            path, resolved = _prepare_copy_source_for_pipeline(
+            prepared = _prepare_copy_source_for_pipeline(
                 task_cls, tbl, spec, 'bsr',
                 policy=policy,
                 **kwargs,
             )
-            # Return the resolved payload plus the file contents,
-            # because the file will be reaped when the tempdir goes
-            # away at the end of this with-block.
-            body = path.read_bytes() if path.exists() else b''
-            return path, tuple(resolved), body
+            # Return the resolved payload plus decrypted COPY-text bytes,
+            # because the file will be reaped when the tempdir goes away.
+            with prepared.open_reader() as reader:
+                body = reader.read()
+            return prepared.path, tuple(prepared.columns), body
 
     def _pipeline_cls(self):
         # Minimal shape validate_pipeline_class expects; only
@@ -2756,6 +2756,26 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
         tbl = self._petl_table(('id',), (1,))
         with self.assertRaises(tc.PipelineContractError):
             self._run_helper(cls, tbl, spec)
+
+
+    def test_task_level_encryption_override_wins_over_policy_default(self):
+        cls = self._pipeline_cls()
+        spec = self._make_spec(db_copy_spool_encryption=False)
+        tbl = [('id',), (1,)]
+        from task_core.export import _prepare_copy_source_for_pipeline
+        from task_core.db_copy import CopyLoadPolicy, PROTECTION_NONE
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = _prepare_copy_source_for_pipeline(
+                cls, tbl, spec, 'bsr',
+                task_name='t_task',
+                run_started_at=datetime(2026, 5, 6, tzinfo=tz.utc),
+                policy=CopyLoadPolicy(
+                    spool_directory=Path(tmp), encrypt_spools=True,
+                ),
+            )
+            self.assertEqual(prepared.protection, PROTECTION_NONE)
+            with prepared.open_reader() as reader:
+                self.assertEqual(reader.read(), b'1\n')
 
 
 class Test18ConnectionLossIsFatal(unittest.TestCase):
@@ -4367,7 +4387,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
 
 class Test29CopyLoadPolicyValidation(unittest.TestCase):
     """CopyLoadPolicy is the public knob set for the COPY loader's
-    spool machinery. In 0.6.4 its defaults have no observable effect --
+    spool machinery. In 0.6.5 its defaults have no observable effect --
     db_loader='copy' is still publicly rejected -- but the validation
     still has to fire now, because a bad configuration must be visible
     before any resource is built (same rule IdentifierPolicy and
@@ -4410,6 +4430,13 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
                 with self.assertRaises(DbPublishError):
                     CopyLoadPolicy(buffer_bytes=bad)
 
+    def test_encrypt_spools_must_be_bool(self):
+        from task_core.db_publish import CopyLoadPolicy
+        for bad in (None, 0, 1, 'true'):
+            with self.subTest(value=bad):
+                with self.assertRaises(DbPublishError):
+                    CopyLoadPolicy(encrypt_spools=bad)
+
     def test_publisher_config_rejects_a_non_policy_value(self):
         # Same shape as test_the_config_rejects_a_missing_policy above
         # for the other two policy fields: PublisherConfig substituting
@@ -4426,6 +4453,7 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
         cfg = PublisherConfig()
         self.assertIsInstance(cfg.copy_load_policy, CopyLoadPolicy)
         self.assertIsNone(cfg.copy_load_policy.spool_directory)
+        self.assertTrue(cfg.copy_load_policy.encrypt_spools)
 
     def test_the_facade_reexports_copyloadpolicy(self):
         # Every public config class is reachable from `task_core`

@@ -9,6 +9,58 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.5
+
+Phase 5 of ADR 0011 was corrected and hardened before DBAPI COPY integration.
+The internal COPY-preparation path now matches the accepted INSERT data
+contract for normalization, inferred widening, overrides, nullability and
+declared-column ordering. Spool bodies are encrypted by default; public
+`db_loader='copy'` activation remains deferred to Phase 6.
+
+### Fixed
+- **COPY preparation now normalizes every source value exactly once during
+  the neutral pass**, using the same `_normalize_value` kernel as INSERT.
+  NumPy/Pandas scalars become native Python values and missing markers become
+  `None` before inference and spooling.
+- **Inferred COPY serialization now preserves widening semantics instead of
+  applying declared-mode validation to every inferred cell.** Mixed numeric,
+  date/datetime and fallback-to-text families produce the same resolved schema
+  and value semantics as the INSERT baseline; declared mode remains strict.
+- **`db_type_overrides` and `db_not_null_columns` now reach COPY preparation.**
+  Declared schemas may differ from source order and are emitted in declaration
+  order, matching INSERT.
+- **`prepare_copy_source()` now returns `PreparedCopySource`**, carrying the
+  final path, resolved columns, exact one-pass row count, on-disk byte count,
+  ownership identity and bounded reader configuration.
+- **COPY policy propagation is complete.** The runner-side composition uses
+  `PublisherConfig.copy_load_policy`; a task-level encryption override wins
+  only for that pipeline.
+
+### Security and cleanup
+- **Both neutral and final spool bodies use AES-256-GCM by default.** Each
+  spool receives a fresh key that is never intentionally persisted by
+  task_core; only the plaintext ownership header (including the nonce),
+  ciphertext and authentication tag are stored. The final
+  spool is exposed through a bounded decrypting reader, so no decrypted
+  temporary file is created.
+- **Task-level opt-out:** `PipelineSpec.db_copy_spool_encryption=False` writes
+  plaintext bodies using the same versioned container and cleanup rules. The
+  opt-out emits a warning. `CopyLoadPolicy.encrypt_spools=True` is the
+  deployment default.
+- **Cleanup now retries transient unlink failures and logs every residual path
+  exactly.** Header/filename token and stage must agree before predecessor
+  cleanup considers a file positively owned. File-creation/header failures
+  attempt to remove the path immediately.
+- Added the `cryptography` runtime dependency for streaming AES-GCM.
+
+### Tests
+- Added end-to-end COPY-preparation parity for pandas/NumPy normalization,
+  inferred widening, type overrides, non-null constraints, declared ordering,
+  exact row counts and policy propagation.
+- Added encrypted/plaintext equivalence, wrong-key, corruption, truncation,
+  ownership-consistency and cleanup fault-injection coverage.
+
+
 ## 0.6.4
 
 Phase 5 of ADR 0011 landed as one flat commit: the internal row-source →
@@ -30,8 +82,8 @@ default `db_loader='insert'` observe no API or behavioral change.
   `prepare_copy_source`, `cleanup_spool_paths`. Internal:
   type-neutral binary spool grammar (write + read), streaming inference
   accumulator (`_InferenceStreamState` in `db_values.py`), target-aware
-  COPY-text serializer with pass-2 declared-value validation shared with
-  the INSERT path, and success + failure-path cleanup. See ADR 0011
+  COPY-text serializer, and current-run cleanup helpers. The 0.6.5 correction
+  completed INSERT/COPY semantic parity and hardened cleanup. See ADR 0011
   §Implementation sequence Phase 5.
 - **`_prepare_copy_source_for_pipeline`** in `task_core/export.py` --
   runner-side composition of the row-source chain: reads

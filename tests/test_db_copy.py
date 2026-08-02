@@ -20,14 +20,19 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import task_core.db_copy as db_copy_module
 
 from task_core.db_copy import (
     CopyLoadPolicy,
     DEFAULT_SPOOL_SUBDIR,
     FORMAT_VERSION,
     MAGIC,
+    PROTECTION_AES256_GCM,
+    PROTECTION_NONE,
     SPOOL_FILENAME_RE,
     SPOOL_STAGES,
     SpoolFormatError,
@@ -484,7 +489,7 @@ class Test5ConstantsAreStable(unittest.TestCase):
         self.assertEqual(len(MAGIC), 6)
 
     def test_format_version(self):
-        self.assertEqual(FORMAT_VERSION, 1)
+        self.assertEqual(FORMAT_VERSION, 2)
 
     def test_stages(self):
         self.assertEqual(SPOOL_STAGES, ('neutral', 'copytext'))
@@ -1202,6 +1207,15 @@ def _make_identity(**overrides):
     return SpoolIdentity(**args)
 
 
+def _open_plain_spool(directory, *, stage, identity, **kwargs):
+    """Low-level framing tests opt out explicitly; secure defaults are
+    exercised separately by Test17EncryptedSpoolContainer."""
+    handle = open_spool_for_write(
+        directory, stage=stage, identity=identity, encrypt=False, **kwargs,
+    )
+    return handle.stream, handle.path
+
+
 class Test13SpoolIdentityBundlesTheFiveOwnershipIngredientsWithDerivedToken(unittest.TestCase):
     """SpoolIdentity should freeze the five ingredients + derived token
     together so that no caller can pass a token that disagrees with its
@@ -1250,7 +1264,7 @@ class Test14SpoolFilesAreCreatedAtomicallyUnderExclusiveOpen(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             ident = _make_identity()
-            fp, path = open_spool_for_write(
+            fp, path = _open_plain_spool(
                 directory, stage='neutral', identity=ident,
             )
             try:
@@ -1266,7 +1280,7 @@ class Test14SpoolFilesAreCreatedAtomicallyUnderExclusiveOpen(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             ident = _make_identity()
-            fp, path = open_spool_for_write(
+            fp, path = _open_plain_spool(
                 directory, stage='copytext', identity=ident,
             )
             fp.close()
@@ -1278,6 +1292,7 @@ class Test14SpoolFilesAreCreatedAtomicallyUnderExclusiveOpen(unittest.TestCase):
             self.assertEqual(header['token'], ident.token)
             self.assertEqual(header['stage'], 'copytext')
             self.assertEqual(header['pid'], ident.pid)
+            self.assertEqual(header['protection'], PROTECTION_NONE)
 
     def test_o_excl_blocks_silent_overwrite_of_existing_file(self):
         # This is the teeth test for O_EXCL. Predecessor cleanup runs
@@ -1289,7 +1304,7 @@ class Test14SpoolFilesAreCreatedAtomicallyUnderExclusiveOpen(unittest.TestCase):
             filename = f'task_core-copy-{ident.token}-neutral.spool'
             (directory / filename).write_bytes(b'preexisting bytes')
             with self.assertRaises(FileExistsError):
-                open_spool_for_write(
+                _open_plain_spool(
                     directory, stage='neutral', identity=ident,
                 )
             # And the original bytes must still be there -- no truncate.
@@ -1303,7 +1318,7 @@ class Test14SpoolFilesAreCreatedAtomicallyUnderExclusiveOpen(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             ident = _make_identity()
-            fp, path = open_spool_for_write(
+            fp, path = _open_plain_spool(
                 directory, stage='neutral', identity=ident,
             )
             try:
@@ -1316,21 +1331,21 @@ class Test14SpoolFilesAreCreatedAtomicallyUnderExclusiveOpen(unittest.TestCase):
     def test_rejects_bad_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(DbPublishError):
-                open_spool_for_write(
+                _open_plain_spool(
                     Path(tmp), stage='bogus', identity=_make_identity(),
                 )
 
     def test_rejects_non_path_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(DbPublishError):
-                open_spool_for_write(
+                _open_plain_spool(
                     tmp, stage='neutral', identity=_make_identity(),  # type: ignore[arg-type]
                 )
 
     def test_rejects_non_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(DbPublishError):
-                open_spool_for_write(
+                _open_plain_spool(
                     Path(tmp), stage='neutral',
                     identity=dict(_INGREDIENTS),  # type: ignore[arg-type]
                 )
@@ -1338,7 +1353,7 @@ class Test14SpoolFilesAreCreatedAtomicallyUnderExclusiveOpen(unittest.TestCase):
     def test_rejects_non_positive_buffer(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(DbPublishError):
-                open_spool_for_write(
+                _open_plain_spool(
                     Path(tmp), stage='neutral',
                     identity=_make_identity(), buffer_bytes=0,
                 )
@@ -1354,12 +1369,14 @@ class Test15SpoolReadValidatesHeaderAgainstIdentity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             ident = _make_identity()
-            wp, path = open_spool_for_write(
+            handle = open_spool_for_write(
                 directory, stage='neutral', identity=ident,
             )
-            wp.write(b'BODY-BYTES')
-            wp.close()
-            rp = open_spool_for_read(path, identity=ident, stage='neutral')
+            handle.stream.write(b'BODY-BYTES')
+            handle.stream.close()
+            rp = open_spool_for_read(
+                handle.path, identity=ident, stage='neutral', key=handle.key,
+            )
             try:
                 self.assertEqual(rp.read(), b'BODY-BYTES')
             finally:
@@ -1369,7 +1386,7 @@ class Test15SpoolReadValidatesHeaderAgainstIdentity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             ident = _make_identity()
-            wp, path = open_spool_for_write(
+            wp, path = _open_plain_spool(
                 directory, stage='neutral', identity=ident,
             )
             wp.close()
@@ -1382,7 +1399,7 @@ class Test15SpoolReadValidatesHeaderAgainstIdentity(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             ours = _make_identity()
-            wp, path = open_spool_for_write(
+            wp, path = _open_plain_spool(
                 directory, stage='neutral', identity=ours,
             )
             wp.close()
@@ -1424,6 +1441,28 @@ class Test16CleanupSpoolPathsIsBestEffortAndNeverRaises(unittest.TestCase):
     def test_empty_input_is_success(self):
         self.assertEqual(cleanup_spool_paths([]), [])
 
+    def test_transient_unlink_failure_is_retried(self):
+        path = Path('/tmp/retry-me')
+        with patch.object(
+            Path, 'unlink', side_effect=[OSError('busy'), OSError('busy'), None],
+        ) as unlink:
+            failed = cleanup_spool_paths(
+                [path], attempts=3, retry_delay_seconds=0,
+            )
+        self.assertEqual(failed, [])
+        self.assertEqual(unlink.call_count, 3)
+
+    def test_residual_path_is_returned_and_logged_exactly(self):
+        path = Path('/tmp/cannot-remove-this-spool')
+        with patch.object(Path, 'unlink', side_effect=OSError('still open')):
+            with self.assertLogs('task_core.db_copy', level='WARNING') as captured:
+                failed = cleanup_spool_paths(
+                    [path], attempts=2, retry_delay_seconds=0,
+                )
+        self.assertEqual(failed, [path])
+        self.assertIn(str(path), '\n'.join(captured.output))
+        self.assertIn('still open', '\n'.join(captured.output))
+
 
 class Test17PredecessorCleanupDeletesOwnSpoolsPreservesEverythingElse(unittest.TestCase):
     """cleanup_predecessor_spools is the reap-under-lock pass. It must
@@ -1451,7 +1490,7 @@ class Test17PredecessorCleanupDeletesOwnSpoolsPreservesEverythingElse(unittest.T
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             prior = _make_identity(pid=1)
-            fp, path = open_spool_for_write(
+            fp, path = _open_plain_spool(
                 directory, stage='neutral', identity=prior,
             )
             fp.close()
@@ -1469,7 +1508,7 @@ class Test17PredecessorCleanupDeletesOwnSpoolsPreservesEverythingElse(unittest.T
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             theirs = _make_identity(task='ops_task')
-            fp, path = open_spool_for_write(
+            fp, path = _open_plain_spool(
                 directory, stage='neutral', identity=theirs,
             )
             fp.close()
@@ -1495,6 +1534,47 @@ class Test17PredecessorCleanupDeletesOwnSpoolsPreservesEverythingElse(unittest.T
             self.assertEqual(deleted, [])
             self.assertEqual(preserved, [path])
             self.assertTrue(path.exists())
+
+    def test_preserves_valid_header_under_mismatched_filename_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            original = _make_identity(pid=1)
+            handle = open_spool_for_write(
+                directory, stage='neutral', identity=original,
+            )
+            handle.stream.close()
+            other = _make_identity(pid=2)
+            renamed = directory / compose_spool_filename(
+                token=other.token, stage='neutral',
+            )
+            handle.path.rename(renamed)
+
+            deleted, preserved = cleanup_predecessor_spools(
+                directory, task='hr_task',
+            )
+            self.assertEqual(deleted, [])
+            self.assertEqual(preserved, [renamed])
+            self.assertTrue(renamed.exists())
+
+    def test_preserves_valid_header_under_mismatched_filename_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            ident = _make_identity(pid=1)
+            handle = open_spool_for_write(
+                directory, stage='neutral', identity=ident,
+            )
+            handle.stream.close()
+            renamed = directory / compose_spool_filename(
+                token=ident.token, stage='copytext',
+            )
+            handle.path.rename(renamed)
+
+            deleted, preserved = cleanup_predecessor_spools(
+                directory, task='hr_task',
+            )
+            self.assertEqual(deleted, [])
+            self.assertEqual(preserved, [renamed])
+            self.assertTrue(renamed.exists())
 
     def test_preserves_non_spool_filenames(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1525,11 +1605,11 @@ class Test17PredecessorCleanupDeletesOwnSpoolsPreservesEverythingElse(unittest.T
             directory = Path(tmp)
             ours = _make_identity(pid=1)
             theirs = _make_identity(task='ops_task')
-            fp_ours, path_ours = open_spool_for_write(
+            fp_ours, path_ours = _open_plain_spool(
                 directory, stage='neutral', identity=ours,
             )
             fp_ours.close()
-            fp_theirs, path_theirs = open_spool_for_write(
+            fp_theirs, path_theirs = _open_plain_spool(
                 directory, stage='neutral', identity=theirs,
             )
             fp_theirs.close()
@@ -1560,13 +1640,110 @@ class Test17PredecessorCleanupDeletesOwnSpoolsPreservesEverythingElse(unittest.T
                 cleanup_predecessor_spools(Path(tmp), task='')
 
 
+class Test17EncryptedSpoolContainer(unittest.TestCase):
+    def test_prepare_encrypts_both_spool_stages_by_default(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(1, 'secret-value')],
+                columns=['id', 'name'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+            )
+            self.assertEqual(prepared.protection, PROTECTION_AES256_GCM)
+            raw = prepared.path.read_bytes()
+            self.assertNotIn(b'secret-value', raw)
+            with prepared.path.open('rb') as fp:
+                header = read_spool_header(fp)
+            self.assertEqual(header['protection'], PROTECTION_AES256_GCM)
+            with prepared.open_reader() as reader:
+                self.assertEqual(reader.read(), b'1\tsecret-value\n')
+
+    def test_task_policy_can_disable_encryption_without_changing_reader_contract(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(1, 'visible')],
+                columns=['id', 'name'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+                policy=CopyLoadPolicy(encrypt_spools=False),
+            )
+            self.assertEqual(prepared.protection, PROTECTION_NONE)
+            raw = prepared.path.read_bytes()
+            self.assertIn(b'visible', raw)
+            with prepared.open_reader() as reader:
+                self.assertEqual(reader.read(), b'1\tvisible\n')
+
+    def test_wrong_key_is_detected_at_authentication(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(1,)], columns=['id'], declared_schema=None,
+                identity=ident, directory=Path(tmp),
+            )
+            with self.assertRaisesRegex(SpoolFormatError, 'authentication failed'):
+                with open_spool_for_read(
+                    prepared.path,
+                    identity=ident,
+                    stage='copytext',
+                    key=b'x' * 32,
+                ) as reader:
+                    reader.read()
+
+    def test_ciphertext_corruption_is_detected(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(1, 'secret')], columns=['id', 'name'],
+                declared_schema=None, identity=ident, directory=Path(tmp),
+            )
+            with prepared.path.open('r+b') as fp:
+                read_spool_header(fp)
+                body_pos = fp.tell()
+                byte = fp.read(1)
+                self.assertTrue(byte)
+                fp.seek(body_pos)
+                fp.write(bytes([byte[0] ^ 0x01]))
+            with self.assertRaisesRegex(SpoolFormatError, 'authentication failed'):
+                with prepared.open_reader() as reader:
+                    reader.read()
+
+    def test_truncated_footer_is_rejected(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(1,)], columns=['id'], declared_schema=None,
+                identity=ident, directory=Path(tmp),
+            )
+            size = prepared.path.stat().st_size
+            with prepared.path.open('r+b') as fp:
+                fp.truncate(size - 5)
+            with self.assertRaises(SpoolFormatError):
+                prepared.open_reader()
+
+    def test_fdopen_failure_reaps_the_created_path(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            path = directory / compose_spool_filename(
+                token=ident.token, stage='neutral',
+            )
+            with patch('task_core.db_copy.os.fdopen', side_effect=RuntimeError('boom')):
+                with self.assertRaisesRegex(RuntimeError, 'boom'):
+                    open_spool_for_write(
+                        directory, stage='neutral', identity=ident,
+                    )
+            self.assertFalse(path.exists())
+
+
 # --- prepare_copy_source orchestrator ---------------------------------
 
-def _read_copytext_body(path):
-    """Return the COPY-text body of a spool file, skipping the ownership
-    header. Used by tests that assert on wire bytes."""
-    with open(path, 'rb') as f:
-        read_spool_header(f)  # consumes the header, positions fp at body
+def _read_copytext_body(prepared):
+    """Return the decrypted/plain COPY-text body from a preparation result."""
+    with prepared.open_reader() as f:
         return f.read()
 
 
@@ -1582,10 +1759,10 @@ def _list_spools(directory):
 
 class Test18PrepareCopySourceRoundTripsFromRowSourceToCopyTextSpool(unittest.TestCase):
     """The orchestrator drives pass 1 (neutral spool + inference) and
-    pass 2 (copytext), reaps the neutral on success, and returns the
-    copytext path plus resolved columns. This is the shape Phase 5.h
-    will call from the runner, so the round-trip contract must be
-    completely nailed down at this layer.
+    pass 2 (copytext), reaps the neutral on success, and returns an immutable
+    preparation result with the final path, resolved columns, exact count and
+    bounded reader. This is the shape Phase 6 will hand to the database
+    transport, so the round-trip contract must be nailed down here.
     """
 
     def test_success_path_returns_copytext_path_and_resolved_columns(self):
@@ -1593,28 +1770,30 @@ class Test18PrepareCopySourceRoundTripsFromRowSourceToCopyTextSpool(unittest.Tes
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             rows = [(1, 'alice', True), (2, 'bob', False), (3, None, True)]
-            path, resolved = prepare_copy_source(
+            prepared = prepare_copy_source(
                 row_source=iter(rows),
                 columns=['id', 'name', 'active'],
                 declared_schema=None,
                 identity=ident,
                 directory=d,
             )
-            self.assertTrue(path.exists())
-            self.assertEqual(path.name, compose_spool_filename(
+            self.assertTrue(prepared.path.exists())
+            self.assertEqual(prepared.path.name, compose_spool_filename(
                 token=ident.token, stage='copytext',
             ))
-            self.assertEqual([c.name for c in resolved], ['id', 'name', 'active'])
+            self.assertEqual(
+                [c.name for c in prepared.columns], ['id', 'name', 'active'],
+            )
             # Inference default for a column with no not-null constraint
             # is nullable=True (ADR 0011 -- prepare_copy_source has no
             # not_null concept; the higher-level publisher owns that).
-            self.assertTrue(all(c.nullable for c in resolved))
+            self.assertTrue(all(c.nullable for c in prepared.columns))
 
     def test_neutral_spool_is_reaped_on_success(self):
         ident = _make_identity()
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            path, _ = prepare_copy_source(
+            prepared = prepare_copy_source(
                 row_source=[('x',)],
                 columns=['name'],
                 declared_schema=None,
@@ -1622,7 +1801,7 @@ class Test18PrepareCopySourceRoundTripsFromRowSourceToCopyTextSpool(unittest.Tes
                 directory=d,
             )
             remaining = _list_spools(d)
-            self.assertEqual(remaining, [path.name])
+            self.assertEqual(remaining, [prepared.path.name])
             self.assertNotIn(compose_spool_filename(
                 token=ident.token, stage='neutral',
             ), remaining)
@@ -1632,21 +1811,21 @@ class Test18PrepareCopySourceRoundTripsFromRowSourceToCopyTextSpool(unittest.Tes
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             rows = [(1, 'alice'), (2, 'bob\twith\ttabs')]
-            path, resolved = prepare_copy_source(
+            prepared = prepare_copy_source(
                 row_source=rows,
                 columns=['id', 'name'],
                 declared_schema=None,
                 identity=ident,
                 directory=d,
             )
-            body = _read_copytext_body(path)
+            body = _read_copytext_body(prepared)
             expected = (
                 serialize_row_to_copytext(
-                    {'id': 1, 'name': 'alice'}, resolved,
+                    {'id': 1, 'name': 'alice'}, prepared.columns,
                     ident.target_table, 1,
                 )
                 + serialize_row_to_copytext(
-                    {'id': 2, 'name': 'bob\twith\ttabs'}, resolved,
+                    {'id': 2, 'name': 'bob\twith\ttabs'}, prepared.columns,
                     ident.target_table, 2,
                 )
             )
@@ -1656,26 +1835,26 @@ class Test18PrepareCopySourceRoundTripsFromRowSourceToCopyTextSpool(unittest.Tes
         ident = _make_identity()
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            path, resolved = prepare_copy_source(
+            prepared = prepare_copy_source(
                 row_source=iter(()),
                 columns=['id'],
                 declared_schema=None,
                 identity=ident,
                 directory=d,
             )
-            self.assertTrue(path.exists())
-            body = _read_copytext_body(path)
+            self.assertTrue(prepared.path.exists())
+            body = _read_copytext_body(prepared)
             self.assertEqual(body, b'')
             # With no rows, inference sees nothing and resolves to Text
             # per _resolve_families(empty_set) -> Text. Locking that in
             # here so a future accumulator change surfaces at the
             # orchestrator boundary too.
-            self.assertEqual([c.name for c in resolved], ['id'])
+            self.assertEqual([c.name for c in prepared.columns], ['id'])
 
 
 class Test19PrepareCopySourceUsesDeclaredSchemaWhenProvided(unittest.TestCase):
-    """A declared schema replaces the inference pass. The returned tuple
-    is the declared one; each value is validated against the declared
+    """A declared schema replaces the inference pass. The result's columns
+    are the declared ones; each value is validated against the declared
     type at serialization time (via serialize_row_to_copytext).
     """
 
@@ -1687,14 +1866,14 @@ class Test19PrepareCopySourceUsesDeclaredSchemaWhenProvided(unittest.TestCase):
                 ResolvedColumn('id', sa.Integer(), False),
                 ResolvedColumn('name', sa.Text(), True),
             )
-            _, resolved = prepare_copy_source(
+            prepared = prepare_copy_source(
                 row_source=[(1, 'alice')],
                 columns=['id', 'name'],
                 declared_schema=declared,
                 identity=ident,
                 directory=d,
             )
-            self.assertEqual(resolved, declared)
+            self.assertEqual(prepared.columns, declared)
 
     def test_value_type_mismatch_against_declared_schema_raises(self):
         ident = _make_identity()
@@ -1755,8 +1934,9 @@ class Test20PrepareCopySourceRejectsSchemaAndInputMismatch(unittest.TestCase):
             # Rejected before pass 1: no spool files touched.
             self.assertEqual(list(d.iterdir()), [])
 
-    def test_declared_schema_reorder_raises(self):
-        # Same names, different order -- the check is positional.
+    def test_declared_schema_reorders_wire_columns(self):
+        # Declared INSERT permits source order to differ from declaration
+        # order. COPY must emit fields in declared order too.
         ident = _make_identity()
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
@@ -1764,15 +1944,15 @@ class Test20PrepareCopySourceRejectsSchemaAndInputMismatch(unittest.TestCase):
                 ResolvedColumn('name', sa.Text(), True),
                 ResolvedColumn('id', sa.Integer(), False),
             )
-            with self.assertRaises(DbPublishError):
-                prepare_copy_source(
-                    row_source=[(1, 'alice')],
-                    columns=['id', 'name'],
-                    declared_schema=declared,
-                    identity=ident,
-                    directory=d,
-                )
-            self.assertEqual(list(d.iterdir()), [])
+            prepared = prepare_copy_source(
+                row_source=[(1, 'alice')],
+                columns=['id', 'name'],
+                declared_schema=declared,
+                identity=ident,
+                directory=d,
+            )
+            self.assertEqual(prepared.columns, declared)
+            self.assertEqual(_read_copytext_body(prepared), b'alice\t1\n')
 
     def test_row_width_mismatch_raises_and_reaps(self):
         ident = _make_identity()
@@ -1803,11 +1983,103 @@ class Test20PrepareCopySourceRejectsSchemaAndInputMismatch(unittest.TestCase):
             self.assertEqual(list(d.iterdir()), [])
 
 
+class Test20bPrepareCopySourceParityCorrections(unittest.TestCase):
+    def test_normalizes_numpy_and_pandas_scalars_once(self):
+        import numpy as np
+        import pandas as pd
+
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(np.int64(7), pd.NA, np.nan)],
+                columns=['id', 'missing_a', 'missing_b'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+            )
+            self.assertEqual(prepared.row_count, 1)
+            self.assertEqual(_read_copytext_body(prepared), b'7\t\\N\t\\N\n')
+
+    def test_inferred_numeric_widening_accepts_float_and_decimal(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(1,), (3.5,), (Decimal('2.30'),)],
+                columns=['amount'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+            )
+            self.assertIsInstance(prepared.columns[0].type, sa.Numeric)
+            self.assertEqual(_read_copytext_body(prepared), b'1\n3.5\n2.30\n')
+
+    def test_inferred_date_datetime_widening_accepts_both(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(date(2024, 1, 1),), (datetime(2024, 1, 2, 3, 4),)],
+                columns=['at'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+            )
+            self.assertIsInstance(prepared.columns[0].type, sa.DateTime)
+            self.assertEqual(
+                _read_copytext_body(prepared),
+                b'2024-01-01\n2024-01-02 03:04:00\n',
+            )
+
+    def test_type_override_and_not_null_are_applied(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(1,)],
+                columns=['value'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+                type_overrides={'value': 'TEXT'},
+                not_null_columns=('value',),
+            )
+            self.assertIsInstance(prepared.columns[0].type, sa.Text)
+            self.assertFalse(prepared.columns[0].nullable)
+            self.assertEqual(_read_copytext_body(prepared), b'1\n')
+
+    def test_not_null_rejects_normalized_missing_value(self):
+        import pandas as pd
+
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(DbPublishError, 'non-nullable'):
+                prepare_copy_source(
+                    row_source=[(pd.NA,)],
+                    columns=['value'],
+                    declared_schema=None,
+                    identity=ident,
+                    directory=Path(tmp),
+                    not_null_columns=('value',),
+                )
+
+    def test_prepared_result_carries_exact_count_and_size(self):
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=[(1,), (2,)],
+                columns=['id'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+            )
+            self.assertEqual(prepared.row_count, 2)
+            self.assertEqual(prepared.spool_bytes, prepared.path.stat().st_size)
+
+
 class Test21PrepareCopySourceReapsSpoolsOnEveryFailurePath(unittest.TestCase):
     """The `finally`-like cleanup path is the invariant Phase 5.h leans
-    on: after prepare_copy_source() raises, this run leaves no spool
-    files behind. Both the mid-pass-1 (source raises) and mid-pass-2
-    (validation raises) cases must satisfy it.
+    on: when unlink succeeds, prepare_copy_source() removes its current-run
+    spools before propagating an error. Both the mid-pass-1 (source raises)
+    and mid-pass-2 (validation raises) cases must satisfy it. Separate fault
+    injection covers the residual-path behavior when unlink itself fails.
 
     Teeth for both: remove the cleanup, confirm files survive; restore.
     Recorded here rather than left as an inline comment because the
@@ -1962,14 +2234,14 @@ class Test22PrepareCopySourceValidatesInputsBeforeAnyFileIsCreated(unittest.Test
         ident = _make_identity()
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            path, _ = prepare_copy_source(
+            prepared = prepare_copy_source(
                 row_source=[(1,)],
                 columns=['id'],
                 declared_schema=None,
                 identity=ident,
                 directory=d,
             )
-            self.assertTrue(path.exists())
+            self.assertTrue(prepared.path.exists())
 
     def test_duplicate_column_names_are_rejected_before_any_file_is_created(self):
         # Pass 2 replays each row as `dict(zip(columns, values))`, so a
@@ -1992,6 +2264,54 @@ class Test22PrepareCopySourceValidatesInputsBeforeAnyFileIsCreated(unittest.Test
                 list(d.iterdir()), [],
                 'duplicate-name rejection must happen before any spool is created',
             )
+
+
+class Test24CloseAndWriteFailureSemantics(unittest.TestCase):
+    """Low-level spool I/O must preserve the primary failure."""
+
+    class _CloseFails:
+        def close(self):
+            raise OSError('close failed')
+
+    class _ShortWriter:
+        def __init__(self):
+            self.data = bytearray()
+
+        def write(self, data):
+            chunk = bytes(data[:1])
+            self.data.extend(chunk)
+            return len(chunk)
+
+    def test_close_failure_surfaces_on_success_path(self):
+        stream = self._CloseFails()
+        with self.assertRaisesRegex(OSError, 'close failed'):
+            with db_copy_module._close_preserving_primary(
+                stream, description='test spool',
+            ):
+                pass
+
+    def test_close_failure_does_not_replace_primary_failure(self):
+        stream = self._CloseFails()
+        with self.assertLogs('task_core.db_copy', level='ERROR') as logs:
+            with self.assertRaisesRegex(RuntimeError, 'primary failed'):
+                with db_copy_module._close_preserving_primary(
+                    stream, description='test spool',
+                ):
+                    raise RuntimeError('primary failed')
+        self.assertIn('secondary error while closing test spool', '\n'.join(logs.output))
+
+    def test_write_all_retries_short_writes(self):
+        writer = self._ShortWriter()
+        db_copy_module._write_all(writer, b'abcdef')
+        self.assertEqual(bytes(writer.data), b'abcdef')
+
+    def test_write_all_rejects_zero_progress(self):
+        class ZeroWriter:
+            def write(self, data):
+                return 0
+
+        with self.assertRaisesRegex(OSError, 'short write'):
+            db_copy_module._write_all(ZeroWriter(), b'x')
 
 
 if __name__ == '__main__':

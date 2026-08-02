@@ -21,11 +21,16 @@ enforced structurally, not by convention. The one deliberately dynamic
 exception is db_contract, via the get_dynamic_db_contract hook below.
 """
 
+from dataclasses import replace
 from datetime import datetime, timezone
+import logging
 import os
 
 from task_core.types import OutputColumn, PipelineContractError, get_pipeline_spec
 from task_core.table_adapters import get_table_adapter
+
+
+log = logging.getLogger(__name__)
 
 
 def _build_framework_columns(spec):
@@ -140,21 +145,23 @@ def _prepare_copy_source_for_pipeline(
 ):
     """Compose the Phase 5 COPY chain for one pipeline: adapter row-source
     reshaped by db_contract + framework columns, spooled through
-    prepare_copy_source() into a target-aware COPY-text file.
+    prepare_copy_source() into a target-aware spool container whose plaintext
+    body is PostgreSQL COPY text.
 
     Sits at level 2 alongside _build_db_payload_with_spec because both
     turn (task_cls, out_tbl, spec, pg_schema) into a publish-ready
     artefact; runner.py stays engine-neutral by delegating both.
 
     ``db_loader='copy'`` remains publicly rejected by validate_db_loader
-    at both spec and payload boundaries in 0.6.4, so this helper has no
-    non-test caller yet. Phase 6 will lift that gate, add the real
+    at both spec and payload boundaries in 0.6.5, so this helper is only
+    reachable through the gated runner branch and direct tests. Phase 6 will
+    lift that gate, add the real
     copy_expert() transport, and integrate this composition into
     publisher.publish(); the runner branch that calls this today is
     scaffolding for that landing point.
 
-    Returns (copytext_path, resolved_columns). The caller owns the
-    spool from the moment this returns.
+    Returns a PreparedCopySource. The caller owns its spool path from
+    the moment this returns.
     """
     # Deferred imports keep export.py's module-level dependency surface
     # minimal (db_copy is level 2 alongside export; the imports are
@@ -187,6 +194,15 @@ def _prepare_copy_source_for_pipeline(
 
     if policy is None:
         policy = CopyLoadPolicy()
+    if spec.db_copy_spool_encryption is not None:
+        policy = replace(
+            policy, encrypt_spools=spec.db_copy_spool_encryption,
+        )
+        if not policy.encrypt_spools:
+            log.warning(
+                'COPY spool encryption disabled by PipelineSpec for pipeline %s',
+                getattr(task_cls, '__name__', repr(task_cls)),
+            )
     if run_started_at is None:
         run_started_at = datetime.now(timezone.utc)
 
@@ -253,4 +269,6 @@ def _prepare_copy_source_for_pipeline(
         directory=directory,
         policy=policy,
         framework_columns=resolved_framework_columns,
+        type_overrides=spec.db_type_overrides,
+        not_null_columns=spec.db_not_null_columns or (),
     )

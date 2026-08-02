@@ -245,6 +245,7 @@ arguments:
 class CopyLoadPolicy:
     spool_directory: Path | None = None
     buffer_bytes: int = 1_048_576
+    encrypt_spools: bool = True
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,11 @@ class PublisherConfig:
 Only settings proven useful by implementation or benchmark evidence become
 public. Driver cursor details, serialization grammar and SQLSTATE handling
 remain implementation details.
+
+Tasks may explicitly override only spool protection through the append-only
+`PipelineSpec.db_copy_spool_encryption: bool | None` field. `None` inherits the
+publisher policy; `False` is a visible per-task opt-out. Connection details,
+key material and cipher selection are not task configuration.
 
 ## Bounded-memory contract
 
@@ -520,6 +526,7 @@ comments or publish targets.
 - local spool creation and ownership;
 - bounded buffers;
 - spool encoding and decoding;
+- default authenticated spool encryption and bounded decryption;
 - streaming schema-state accumulation through `db_values`;
 - target-aware COPY text serialization;
 - DBAPI `COPY FROM STDIN` execution;
@@ -602,7 +609,7 @@ The spool also makes a one-shot source replayable for `COPY FROM STDIN`.
 
 ### Type-neutral first spool
 
-The first spool is a private, versioned, length-framed binary format that
+The first spool body is a private, versioned, length-framed binary format that
 losslessly represents the normalized scalar families supported by COPY:
 
 - `NULL`;
@@ -657,13 +664,41 @@ optimization that gives declared and inferred COPY different cleanup and
 failure behavior. A later implementation may collapse declared preparation to
 one spool only if equivalence and cleanup guarantees remain unchanged.
 
-The final spool is opened in binary mode but contains PostgreSQL COPY text
-records. Binary file mode prevents newline translation; it does not mean
-PostgreSQL binary COPY.
+After container decoding, the final spool's logical plaintext body contains
+PostgreSQL COPY text records. The container is opened in binary mode to prevent
+newline translation; it does not mean PostgreSQL binary COPY.
 
 Peak scratch-disk use may temporarily approach the sum of the type-neutral and
 final serialized spools. That cost is explicit. COPY replaces `O(rows)` Python
 memory with `O(serialized rows)` local scratch disk.
+
+### Spool protection
+
+Both spool bodies are protected by default with independently generated
+AES-256-GCM keys. Key material is never intentionally persisted: it exists on
+the in-memory write/preparation handle only for the lifetime of that spool.
+The implementation does not claim physical zeroization, exclusion from swap,
+or exclusion from process dumps.
+
+The outer ownership header remains plaintext and contains no business row
+data. It records the version, task/target/run ownership fields, stage,
+protection mode and nonce. The exact header bytes are authenticated as GCM
+associated data. The body is ciphertext followed by an authentication tag.
+Corruption, truncation or a wrong key fails when the bounded reader reaches
+EOF; Phase 6 must keep COPY inside the preparation transaction so such a late
+failure rolls back the staging load.
+
+The final spool is never decrypted into another temporary file. Phase 6 feeds
+`copy_expert()` from the decrypting file-like reader. After process death, a
+successor task_core run has no intentionally persisted key with which to decrypt
+the abandoned spool; successor cleanup therefore identifies it from the
+plaintext ownership header and deletes it without decryption. This is not a
+claim against memory forensics, swap or process dumps.
+
+`PipelineSpec.db_copy_spool_encryption=False` explicitly opts one task out.
+Plaintext mode uses the same outer container, permissions, ownership checks,
+bounded I/O and cleanup lifecycle. It emits a warning and does not create key
+material. Cipher-suite selection is deliberately not public configuration.
 
 ### Final serialization
 
@@ -1142,7 +1177,8 @@ Create `db_copy.py` and implement:
 - ownership header and filename grammar;
 - streaming normalization and schema state;
 - final target-aware COPY text spool;
-- all cleanup paths.
+- authenticated encrypted spool bodies by default, with explicit task opt-out;
+- current-run cleanup paths and positive-ownership cleanup primitives.
 
 Wire the runner into it: `runner.py` calls `adapter.to_row_source()`,
 composes the `RowProjection` from `db_contract` + framework columns,
@@ -1519,7 +1555,7 @@ for small outputs.
 
 ## Verification status
 
-No COPY implementation exists yet. Phases 1 and 2 shipped in 0.6.0 (commit
+No database COPY transport exists yet. Phases 1 and 2 shipped in 0.6.0 (commit
 `1c55a42`), as did Phase 3a (see the amended Phase 3 above). 0.6.2 shipped
 the Phase 3b helpers (`DbRowSource` protocol, `to_row_source()` producers
 on both adapters, `RowProjection` + `_ProjectedRowSource` composer) and
@@ -1532,14 +1568,24 @@ remains rejected at every public boundary, and the helpers are dormant
 production code exercised only by direct unit tests. 0.6.4 shipped
 Phase 5 as `task_core/db_copy.py` (policy, spool directory, filename
 grammar + header, type-neutral spool format, streaming inference-state
-accumulator, target-aware COPY-text serializer, all cleanup paths, and
+accumulator, target-aware COPY-text serializer, current-run cleanup and
+positive-ownership cleanup primitives, and
 `prepare_copy_source()` orchestrator) and wired the runner into it via
 the new `_prepare_copy_source_for_pipeline` helper in `export.py`;
 `db_loader='copy'` remains rejected at every public boundary, so the
 composition is exercised only by helper-level tests. Phase 6 integrates
 `copy_expert()` against the publisher's DBAPI connection and activates
 `'copy'` publicly, at which point those helpers become reachable from a
-real pipeline run for the first time. 0.6.3 corrected the 0.6.2 language that described the
+real pipeline run for the first time. 0.6.5 corrected defects found in the
+first Phase 5 review: raw pandas/NumPy values now pass through the accepted
+normalization kernel; inferred pass-2 serialization preserves widening rather
+than applying declared-only strict validation; `db_type_overrides`,
+`db_not_null_columns`, declared-column ordering, exact row counts and the
+configured `CopyLoadPolicy` all reach the composed path. It also replaced raw
+spool bodies with a versioned container whose bodies use AES-256-GCM by
+default, added the per-task plaintext opt-out, and hardened current-run and
+positive-ownership cleanup. Phase 6 remains the first database execution of
+COPY. 0.6.3 corrected the 0.6.2 language that described the
 runner as a "real consumer" of `DbRowSource` — it consumes the *string*
 `'copy'`, not a `DbRowSource` object — and tightened four correctness
 gaps found by external review: `_PetlRawRowSource` walking the

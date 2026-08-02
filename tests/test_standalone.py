@@ -34,7 +34,10 @@ _TASK_CORE_DIR = os.path.join(_PROJECT_ROOT, 'task_core')
 
 # The genuine, real third-party packages task_core depends on -- see
 # requirements.txt. Not task-level modules, not standard library.
-_ALLOWED_THIRD_PARTY = {'petl', 'pandas', 'numpy', 'openpyxl', 'sqlalchemy', 'lxml', 'psycopg2', 'smbclient'}
+_ALLOWED_THIRD_PARTY = {
+    'petl', 'pandas', 'numpy', 'openpyxl', 'sqlalchemy', 'lxml',
+    'psycopg2', 'smbclient', 'cryptography',
+}
 
 
 def _iter_py_files(root):

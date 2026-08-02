@@ -16,7 +16,7 @@ The module is deliberately name-clean of those forbidden identifiers even
 in comments, so the Phase 5.i AST-based architecture tests can enforce
 the boundary by simple grep-of-Import + grep-of-Attribute.
 
-Public shape as of 0.6.4 (still test-only until Phase 6 lifts the public
+Public shape as of 0.6.5 (still gated until Phase 6 lifts the public
 rejection of `db_loader='copy'`):
 
 - `CopyLoadPolicy`               - config dataclass, moved here from
@@ -42,27 +42,39 @@ uses them under the task advisory lock.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import io
 import json
+import logging
 import os
 import re
+import secrets
 import struct
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, BinaryIO
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from task_core.db_values import (
     DbPublishError,
     ResolvedColumn,
     _declared_type_family,
     _InferenceStreamState,
+    _normalize_value,
+    _resolve_override,
     _validate_declared_value,
 )
 from task_core.types import find_duplicates
+
+
+log = logging.getLogger(__name__)
 
 
 # --- Config ------------------------------------------------------------
@@ -71,9 +83,9 @@ from task_core.types import find_duplicates
 class CopyLoadPolicy:
     """Where and how the COPY loader spools rows before database transport.
 
-    Two settings, both with defaults that keep every existing insert-path
+    Three settings, all with defaults that keep every existing insert-path
     caller unchanged: `db_loader='copy'` remains publicly rejected in
-    0.6.4, so this object has no observable effect yet. Phase 6 lifts
+    0.6.5, so this object has no observable effect yet. Phase 6 lifts
     the rejection and turns these defaults into the ones tasks inherit
     when they set `db_loader='copy'` without overriding anything.
 
@@ -92,10 +104,18 @@ class CopyLoadPolicy:
     accept and hard to be strict about later, and the boundary between
     "the config value" and "a filesystem path" is worth keeping crisp.
     A caller with a string can spell Path(s) themselves.
+
+    `encrypt_spools=True` protects both spool bodies with independently
+    generated AES-256-GCM keys. The ownership header remains plaintext so
+    a successor run can identify and delete abandoned files after the key
+    has disappeared. A task may explicitly opt out through
+    `PipelineSpec.db_copy_spool_encryption=False`; the outer container and
+    cleanup rules remain the same.
     """
 
     spool_directory: Path | None = None
     buffer_bytes: int = 1_048_576
+    encrypt_spools: bool = True
 
     def __post_init__(self):
         if self.spool_directory is not None and not isinstance(self.spool_directory, Path):
@@ -110,6 +130,10 @@ class CopyLoadPolicy:
         if type(self.buffer_bytes) is not int or self.buffer_bytes < 1:
             raise DbPublishError(
                 f'buffer_bytes must be a positive integer, got {self.buffer_bytes!r}'
+            )
+        if type(self.encrypt_spools) is not bool:
+            raise DbPublishError(
+                f'encrypt_spools must be bool, got {self.encrypt_spools!r}'
             )
 
 
@@ -136,7 +160,7 @@ MAGIC = b'TCCPY\x00'
 # uint16, big-endian. Bumping this is the only way to change the header
 # payload shape. Old readers refuse (SpoolFormatError) rather than
 # guess -- see read_spool_header.
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # The two stages a run produces, per ADR 0011 §Schema resolution and
 # final COPY spool:
@@ -145,6 +169,16 @@ FORMAT_VERSION = 1
 # Deletion of the neutral spool after copytext is written is part of the
 # lifecycle, not this module's concern.
 SPOOL_STAGES = ('neutral', 'copytext')
+
+PROTECTION_NONE = 'none'
+PROTECTION_AES256_GCM = 'aes-256-gcm'
+SPOOL_PROTECTIONS = (PROTECTION_NONE, PROTECTION_AES256_GCM)
+
+_AES_KEY_BYTES = 32
+_GCM_NONCE_BYTES = 12
+_GCM_TAG_BYTES = 16
+_GCM_FOOTER_MAGIC = b'TCGM'
+_GCM_FOOTER = struct.Struct('>4s16s')
 
 
 # --- Filename grammar --------------------------------------------------
@@ -280,8 +314,7 @@ _HEADER_PREFIX = struct.Struct('>6sHI')
 _MAX_HEADER_PAYLOAD_BYTES = 64 * 1024
 
 
-def write_spool_header(
-    fp: BinaryIO,
+def _encode_spool_header(
     *,
     task: str,
     target_schema: str,
@@ -290,22 +323,28 @@ def write_spool_header(
     pid: int,
     token: str,
     stage: str,
-) -> None:
-    """Serialize magic + version + JSON ownership payload at the current
-    position of `fp`. Called once at spool creation, before any row
-    bytes. Does not seek; the caller decides the file's position.
-
-    The payload duplicates fields already digested into `token`. That
-    duplication is intentional: predecessor cleanup compares the header
-    payload against the values it computes for the current run
-    (task, schema, table, run_start_utc, pid, token) before deleting.
-    The filename alone -- which is only the token -- is not enough
-    positive ownership per ADR 0011 §Spool ownership.
-    """
+    protection: str,
+    nonce: bytes | None,
+) -> bytes:
     if stage not in SPOOL_STAGES:
         raise DbPublishError(
             f'stage must be one of {SPOOL_STAGES}, got {stage!r}'
         )
+    if protection not in SPOOL_PROTECTIONS:
+        raise DbPublishError(
+            f'protection must be one of {SPOOL_PROTECTIONS}, got {protection!r}'
+        )
+    if protection == PROTECTION_AES256_GCM:
+        if not isinstance(nonce, bytes) or len(nonce) != _GCM_NONCE_BYTES:
+            raise DbPublishError(
+                f'{PROTECTION_AES256_GCM} requires a {_GCM_NONCE_BYTES}-byte nonce'
+            )
+        nonce_hex = nonce.hex()
+    else:
+        if nonce is not None:
+            raise DbPublishError('plaintext spool protection must not carry a nonce')
+        nonce_hex = None
+
     expected_token = compose_ownership_token(
         task=task,
         target_schema=target_schema,
@@ -314,9 +353,6 @@ def write_spool_header(
         pid=pid,
     )
     if token != expected_token:
-        # Refuse to write a header whose token disagrees with its own
-        # ingredients. That combination would leave the file self-
-        # inconsistent and defeat predecessor cleanup.
         raise DbPublishError(
             f'token {token!r} does not match ingredients (expected {expected_token!r})'
         )
@@ -329,30 +365,54 @@ def write_spool_header(
         'pid': pid,
         'token': token,
         'stage': stage,
+        'protection': protection,
+        'nonce': nonce_hex,
     }
-    # sort_keys so byte-identical inputs produce byte-identical headers.
-    # ensure_ascii to keep the on-disk header in a single-byte-per-char
-    # subset; task/schema/table names are ASCII per PORTABLE_IDENTIFIER_RE
-    # anyway, so this constrains nothing real.
-    payload_bytes = json.dumps(payload, sort_keys=True, ensure_ascii=True).encode('ascii')
+    payload_bytes = json.dumps(
+        payload, sort_keys=True, ensure_ascii=True, separators=(',', ':'),
+    ).encode('ascii')
     if len(payload_bytes) > _MAX_HEADER_PAYLOAD_BYTES:
         raise DbPublishError(
             f'header payload too large: {len(payload_bytes)} bytes '
             f'(limit {_MAX_HEADER_PAYLOAD_BYTES})'
         )
-    fp.write(_HEADER_PREFIX.pack(MAGIC, FORMAT_VERSION, len(payload_bytes)))
-    fp.write(payload_bytes)
+    return _HEADER_PREFIX.pack(MAGIC, FORMAT_VERSION, len(payload_bytes)) + payload_bytes
 
 
-def read_spool_header(fp: BinaryIO) -> dict[str, Any]:
-    """Deserialize the header at the current position of `fp` and
-    return the payload dict. Raises SpoolFormatError on any deviation
-    (short read, wrong magic, unknown version, oversized length,
-    malformed JSON, missing required key).
+def write_spool_header(
+    fp: BinaryIO,
+    *,
+    task: str,
+    target_schema: str,
+    target_table: str,
+    run_start_utc: datetime,
+    pid: int,
+    token: str,
+    stage: str,
+    protection: str = PROTECTION_NONE,
+    nonce: bytes | None = None,
+) -> bytes:
+    """Write and return the exact versioned ownership header bytes.
 
-    Predecessor cleanup treats SpoolFormatError as "not ours, leave
-    alone". Any other exception type would be a bug in this module.
+    The returned bytes are also authenticated as AEAD associated data for
+    encrypted spools. Business data never appears in this plaintext header.
     """
+    header_bytes = _encode_spool_header(
+        task=task,
+        target_schema=target_schema,
+        target_table=target_table,
+        run_start_utc=run_start_utc,
+        pid=pid,
+        token=token,
+        stage=stage,
+        protection=protection,
+        nonce=nonce,
+    )
+    _write_all(fp, header_bytes)
+    return header_bytes
+
+
+def _read_spool_header_with_bytes(fp: BinaryIO) -> tuple[dict[str, Any], bytes]:
     prefix = fp.read(_HEADER_PREFIX.size)
     if len(prefix) != _HEADER_PREFIX.size:
         raise SpoolFormatError(
@@ -384,8 +444,10 @@ def read_spool_header(fp: BinaryIO) -> dict[str, Any]:
         raise SpoolFormatError(
             f'header payload must decode to a mapping, got {type(payload).__name__}'
         )
-    required = ('task', 'target_schema', 'target_table',
-                'run_start_utc', 'pid', 'token', 'stage')
+    required = (
+        'task', 'target_schema', 'target_table', 'run_start_utc', 'pid',
+        'token', 'stage', 'protection', 'nonce',
+    )
     missing = [key for key in required if key not in payload]
     if missing:
         raise SpoolFormatError(f'header payload missing keys: {missing}')
@@ -393,8 +455,54 @@ def read_spool_header(fp: BinaryIO) -> dict[str, Any]:
         raise SpoolFormatError(
             f'header payload stage {payload["stage"]!r} not in {SPOOL_STAGES}'
         )
-    # Return a plain dict so callers can mutate safely.
-    return dict(payload)
+    if payload['protection'] not in SPOOL_PROTECTIONS:
+        raise SpoolFormatError(
+            f'header payload protection {payload["protection"]!r} not in '
+            f'{SPOOL_PROTECTIONS}'
+        )
+    if payload['protection'] == PROTECTION_AES256_GCM:
+        nonce_hex = payload['nonce']
+        if not isinstance(nonce_hex, str):
+            raise SpoolFormatError('encrypted spool header nonce must be hex text')
+        try:
+            nonce = bytes.fromhex(nonce_hex)
+        except ValueError as exc:
+            raise SpoolFormatError('encrypted spool header nonce is not valid hex') from exc
+        if len(nonce) != _GCM_NONCE_BYTES:
+            raise SpoolFormatError(
+                f'encrypted spool nonce has {len(nonce)} bytes, '
+                f'expected {_GCM_NONCE_BYTES}'
+            )
+    elif payload['nonce'] is not None:
+        raise SpoolFormatError('plaintext spool header must not carry a nonce')
+
+    try:
+        parsed_run_start = datetime.fromisoformat(payload['run_start_utc'])
+        expected_token = compose_ownership_token(
+            task=payload['task'],
+            target_schema=payload['target_schema'],
+            target_table=payload['target_table'],
+            run_start_utc=parsed_run_start,
+            pid=payload['pid'],
+        )
+    except (TypeError, ValueError, DbPublishError) as exc:
+        raise SpoolFormatError(f'header ownership fields are invalid: {exc}') from exc
+    if payload['token'] != expected_token:
+        raise SpoolFormatError(
+            f'header token {payload["token"]!r} does not match its ownership fields'
+        )
+
+    return dict(payload), prefix + payload_bytes
+
+
+def read_spool_header(fp: BinaryIO) -> dict[str, Any]:
+    """Read the public plaintext ownership header only.
+
+    The encrypted body remains unreadable without the in-memory key, but a
+    successor run can still identify and delete positively owned residue.
+    """
+    payload, _ = _read_spool_header_with_bytes(fp)
+    return payload
 
 
 # --- Directory resolution ---------------------------------------------
@@ -819,66 +927,172 @@ def _escape_copytext_text(text: str) -> bytes:
     return escaped.encode('utf-8')
 
 
-def _serialize_value_copytext(value: Any, column) -> bytes:
-    """Serialize one non-None value to its COPY text field payload.
+def _serialize_float_text(value: float) -> bytes:
+    if value != value:
+        return b'NaN'
+    if value == float('inf'):
+        return b'Infinity'
+    if value == float('-inf'):
+        return b'-Infinity'
+    return repr(value).encode('ascii')
 
-    Callers must handle `value is None` themselves (the row serializer
-    does, emitting the two-byte NULL marker without dispatching here).
-    Everything else is dispatched on the declared type family, which
-    `_validate_declared_value` has already checked matches the value's
-    Python type.
-    """
+
+def _serialize_value_copytext(value: Any, column) -> bytes:
+    """Serialize one value already validated against a declared schema."""
     family = _declared_type_family(column.type)
 
     if family == 'bool':
         return b't' if value else b'f'
+    if family in {'smallint', 'integer', 'bigint'}:
+        return str(value).encode('ascii')
+    if family == 'numeric':
+        return str(value).encode('ascii')
+    if family == 'float':
+        return _serialize_float_text(value)
+    if family == 'text':
+        return _escape_copytext_text(value)
+    if family == 'bytes':
+        payload = bytes(value) if isinstance(value, (bytearray, memoryview)) else value
+        return b'\\\\x' + payload.hex().encode('ascii')
+    if family == 'date':
+        return value.isoformat().encode('ascii')
+    if family == 'datetime':
+        return value.isoformat(sep=' ').encode('ascii')
+    raise DbPublishError(
+        f'internal invariant violated -- unsupported family {family!r} in copy serializer'
+    )
+
+
+def _serialize_inferred_value_copytext(
+    value: Any,
+    column: ResolvedColumn,
+    table_name: str,
+    row_number: int,
+) -> bytes:
+    """Serialize one inferred/override value using PostgreSQL input syntax.
+
+    Declared mode deliberately refuses semantic coercion. Inferred mode is
+    different: its resolved type can represent several observed Python
+    families (int+float -> NUMERIC, date+datetime -> TIMESTAMP, mixed scalar
+    families -> TEXT). COPY must therefore render those observed values in
+    the resolved target type instead of applying the stricter declared-mode
+    validator that INSERT never applies to inferred payloads.
+    """
+    if value is None:
+        if column.nullable:
+            return b'\\N'
+        raise DbPublishError(
+            f'{table_name!r}: output row {row_number} contains NULL in '
+            f'non-nullable column {column.name!r}'
+        )
+
+    family = _declared_type_family(column.type)
+
+    if family == 'bool':
+        if type(value) is not bool:
+            raise DbPublishError(
+                f'{table_name!r}: output row {row_number} column {column.name!r} '
+                f'is incompatible with inferred/overridden type {column.type}: expected bool'
+            )
+        return b't' if value else b'f'
 
     if family in {'smallint', 'integer', 'bigint'}:
+        if type(value) is not int:
+            raise DbPublishError(
+                f'{table_name!r}: output row {row_number} column {column.name!r} '
+                f'is incompatible with inferred/overridden type {column.type}: expected int'
+            )
+        # Reuse the declared range check; it is not coercion and catches a
+        # value PostgreSQL would reject after the expensive spool pass.
+        _validate_declared_value(table_name, column, row_number, value)
         return str(value).encode('ascii')
 
     if family == 'numeric':
-        # str(Decimal) is the exact digit sequence; str(int) is ASCII-safe.
-        # Both round-trip through PostgreSQL NUMERIC parsing.
-        return str(value).encode('ascii')
+        if type(value) is int or isinstance(value, Decimal):
+            return str(value).encode('ascii')
+        if type(value) is float:
+            return _serialize_float_text(value)
+        raise DbPublishError(
+            f'{table_name!r}: output row {row_number} column {column.name!r} '
+            f'is incompatible with inferred/overridden type {column.type}: '
+            'expected int, float, or Decimal'
+        )
 
     if family == 'float':
-        # PostgreSQL accepts NaN, Infinity, and -Infinity in float columns,
-        # but its parser is case-sensitive on those spellings -- str(float)
-        # produces 'nan', 'inf', '-inf', which PostgreSQL rejects. Explicit
-        # branches keep this obvious and testable per-value.
-        if value != value:
-            return b'NaN'
-        if value == float('inf'):
-            return b'Infinity'
-        if value == float('-inf'):
-            return b'-Infinity'
-        return repr(value).encode('ascii')
+        if type(value) is float:
+            return _serialize_float_text(value)
+        if type(value) is int or isinstance(value, Decimal):
+            return str(value).encode('ascii')
+        raise DbPublishError(
+            f'{table_name!r}: output row {row_number} column {column.name!r} '
+            f'is incompatible with inferred/overridden type {column.type}: '
+            'expected int, float, or Decimal'
+        )
 
     if family == 'text':
-        return _escape_copytext_text(value)
+        if isinstance(value, str):
+            text = value
+        elif type(value) is bool:
+            text = 'true' if value else 'false'
+        elif type(value) in {int, float} or isinstance(value, Decimal):
+            if type(value) is float and not (value == value and abs(value) != float('inf')):
+                text = _serialize_float_text(value).decode('ascii')
+            else:
+                text = str(value)
+        elif isinstance(value, datetime):
+            text = value.isoformat(sep=' ')
+        elif type(value) is date:
+            text = value.isoformat()
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            # There is no unambiguous bytea-to-text coercion. Failing here is
+            # safer than inventing a representation that INSERT may not use.
+            raise DbPublishError(
+                f'{table_name!r}: output row {row_number} column {column.name!r} '
+                'cannot render bytes-like data into an inferred TEXT column'
+            )
+        else:
+            text = str(value)
+        if '\x00' in text:
+            raise DbPublishError(
+                f'{table_name!r}: output row {row_number} column {column.name!r} '
+                'contains NUL, which PostgreSQL text does not support'
+            )
+        return _escape_copytext_text(text)
 
     if family == 'bytes':
-        # bytea in COPY text expects the wire field to be `\x<hex>`. The
-        # backslash is COPY's escape character, so the wire must carry
-        # `\\x<hex>` for COPY's unescape pass to yield literal `\x<hex>`
-        # for the bytea input parser.
-        if isinstance(value, (bytearray, memoryview)):
-            payload = bytes(value)
-        else:
-            payload = value
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            raise DbPublishError(
+                f'{table_name!r}: output row {row_number} column {column.name!r} '
+                f'is incompatible with inferred/overridden type {column.type}: '
+                'expected bytes-like value'
+            )
+        payload = bytes(value)
         return b'\\\\x' + payload.hex().encode('ascii')
 
     if family == 'date':
+        if type(value) is not date:
+            raise DbPublishError(
+                f'{table_name!r}: output row {row_number} column {column.name!r} '
+                f'is incompatible with inferred/overridden type {column.type}: expected date'
+            )
         return value.isoformat().encode('ascii')
 
     if family == 'datetime':
-        # `sep=' '` matches PostgreSQL's canonical timestamp text form.
-        # None of the isoformat characters (digits, `-`, `:`, `.`, `+`,
-        # space) are structural for COPY, so no escaping is needed.
-        return value.isoformat(sep=' ').encode('ascii')
+        if isinstance(value, datetime):
+            return value.isoformat(sep=' ').encode('ascii')
+        if type(value) is date:
+            # PostgreSQL TIMESTAMP input accepts a date as midnight. This is
+            # the widening represented by the shared date+datetime inference
+            # rule, not a declared-mode convenience conversion.
+            return value.isoformat().encode('ascii')
+        raise DbPublishError(
+            f'{table_name!r}: output row {row_number} column {column.name!r} '
+            f'is incompatible with inferred/overridden type {column.type}: '
+            'expected date or datetime'
+        )
 
     raise DbPublishError(
-        f'internal invariant violated -- unsupported family {family!r} in copy serializer'
+        f'internal invariant violated -- unsupported family {family!r} in inferred copy serializer'
     )
 
 
@@ -887,13 +1101,15 @@ def serialize_row_to_copytext(
     columns: Sequence,
     table_name: str,
     row_number: int,
+    *,
+    declared: bool = True,
 ) -> bytes:
-    """Convert one validated row to its COPY text wire representation.
+    """Convert one normalized row to its COPY text wire representation.
 
-    Every cell is passed through `_validate_declared_value` first -- the
-    same kernel the insert path uses -- so this function is the single
-    boundary at which a mistyped value or an unexpected NULL in a
-    non-nullable column produces a `DbPublishError`. Escaping exists
+    Declared mode applies `_validate_declared_value`, the same strict kernel
+    used by INSERT. Inferred mode instead renders values through the resolved
+    widening family because INSERT does not apply declared coercion rules to
+    inferred payloads. Both paths reject unexpected NULLs. Escaping exists
     exactly once in the codebase, inside `_escape_copytext_text`.
 
     Returns the wire bytes for the row: fields joined by TAB, terminated
@@ -904,11 +1120,16 @@ def serialize_row_to_copytext(
     fields: list[bytes] = []
     for column in columns:
         value = row[column.name]
-        _validate_declared_value(table_name, column, row_number, value)
-        if value is None:
-            fields.append(b'\\N')
+        if declared:
+            _validate_declared_value(table_name, column, row_number, value)
+            if value is None:
+                fields.append(b'\\N')
+            else:
+                fields.append(_serialize_value_copytext(value, column))
         else:
-            fields.append(_serialize_value_copytext(value, column))
+            fields.append(_serialize_inferred_value_copytext(
+                value, column, table_name, row_number,
+            ))
     return b'\t'.join(fields) + b'\n'
 
 
@@ -921,6 +1142,38 @@ def serialize_row_to_copytext(
 # is computed once, in __post_init__, so any ingredient-level validation
 # error (empty task, non-UTC timestamp, ...) surfaces at construction
 # time -- before any file is created.
+
+@dataclass(frozen=True)
+class PreparedCopySource:
+    """Immutable Phase 5 preparation result.
+
+    The exact row count is captured during the one permitted source
+    traversal. ``spool_bytes`` is the final on-disk COPY-text spool size,
+    including the ownership header. The caller owns ``path`` after return.
+    """
+
+    path: Path
+    columns: tuple[ResolvedColumn, ...]
+    row_count: int
+    spool_bytes: int
+    identity: SpoolIdentity
+    buffer_bytes: int
+    protection: str
+    _key: bytes | None = field(repr=False, compare=False, default=None)
+
+    def open_reader(self) -> BinaryIO:
+        """Return a bounded plaintext reader over the final spool body.
+
+        For encrypted spools the key stays on this in-memory result object;
+        no decrypted temporary file is created.
+        """
+        return open_spool_for_read(
+            self.path,
+            identity=self.identity,
+            stage='copytext',
+            buffer_bytes=self.buffer_bytes,
+            key=self._key,
+        )
 
 @dataclass(frozen=True)
 class SpoolIdentity:
@@ -943,30 +1196,186 @@ class SpoolIdentity:
         object.__setattr__(self, 'token', token)
 
 
+@dataclass(frozen=True)
+class SpoolWriteHandle:
+    stream: BinaryIO
+    path: Path
+    key: bytes | None
+    protection: str
+
+
+def _write_all(fp: BinaryIO, data: bytes) -> None:
+    """Write every byte or fail; do not treat a short raw write as success."""
+    view = memoryview(data)
+    while view:
+        written = fp.write(view)
+        if written is None or written <= 0:
+            raise OSError('short write while writing COPY spool')
+        view = view[written:]
+
+
+@contextmanager
+def _close_preserving_primary(stream: BinaryIO, *, description: str):
+    """Close on every path without letting cleanup replace a primary error.
+
+    A close/finalization failure on the success path is fatal because the
+    spool is incomplete. When the body is already failing, the close error is
+    logged and the original exception remains primary.
+    """
+    try:
+        yield stream
+    except BaseException:
+        try:
+            stream.close()
+        except BaseException:
+            log.exception(
+                'secondary error while closing %s; preserving primary exception',
+                description,
+            )
+        raise
+    else:
+        stream.close()
+
+
+class _AesGcmEncryptingRawWriter(io.RawIOBase):
+    def __init__(self, raw: BinaryIO, *, key: bytes, nonce: bytes, aad: bytes):
+        super().__init__()
+        self._raw = raw
+        self._encryptor = Cipher(
+            algorithms.AES(key), modes.GCM(nonce),
+        ).encryptor()
+        self._encryptor.authenticate_additional_data(aad)
+        self._finalized = False
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        if self.closed:
+            raise ValueError('write to closed spool')
+        payload = bytes(data)
+        encrypted = self._encryptor.update(payload)
+        if encrypted:
+            _write_all(self._raw, encrypted)
+        return len(payload)
+
+    def flush(self):
+        if not self.closed:
+            self._raw.flush()
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            if not self._finalized:
+                tail = self._encryptor.finalize()
+                if tail:
+                    _write_all(self._raw, tail)
+                _write_all(self._raw, _GCM_FOOTER.pack(
+                    _GCM_FOOTER_MAGIC, self._encryptor.tag,
+                ))
+                self._raw.flush()
+                self._finalized = True
+        finally:
+            try:
+                super().close()
+            finally:
+                self._raw.close()
+
+
+class _AesGcmDecryptingRawReader(io.RawIOBase):
+    def __init__(
+        self,
+        raw: BinaryIO,
+        *,
+        key: bytes,
+        nonce: bytes,
+        tag: bytes,
+        aad: bytes,
+        ciphertext_bytes: int,
+    ):
+        super().__init__()
+        self._raw = raw
+        self._remaining = ciphertext_bytes
+        self._decryptor = Cipher(
+            algorithms.AES(key), modes.GCM(nonce, tag),
+        ).decryptor()
+        self._decryptor.authenticate_additional_data(aad)
+        self._pending = bytearray()
+        self._authenticated = False
+
+    def readable(self):
+        return True
+
+    def _fill(self, minimum: int) -> None:
+        while len(self._pending) < minimum and self._remaining > 0:
+            chunk = self._raw.read(min(max(minimum - len(self._pending), 64 * 1024), self._remaining))
+            if not chunk:
+                raise SpoolFormatError(
+                    f'encrypted spool ended with {self._remaining} ciphertext bytes missing'
+                )
+            self._remaining -= len(chunk)
+            self._pending.extend(self._decryptor.update(chunk))
+        if self._remaining == 0 and not self._authenticated:
+            try:
+                self._pending.extend(self._decryptor.finalize())
+            except InvalidTag as exc:
+                raise SpoolFormatError(
+                    'encrypted spool authentication failed (wrong key, corruption, or truncation)'
+                ) from exc
+            self._authenticated = True
+
+    def readinto(self, buffer):
+        if self.closed:
+            return 0
+        target = memoryview(buffer).cast('B')
+        if not target:
+            return 0
+        self._fill(len(target))
+        if not self._pending:
+            return 0
+        count = min(len(target), len(self._pending))
+        target[:count] = self._pending[:count]
+        del self._pending[:count]
+        return count
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            super().close()
+        finally:
+            self._raw.close()
+
+
+def _validate_spool_key(key: bytes | None, *, required: bool) -> bytes | None:
+    if key is None:
+        if required:
+            raise DbPublishError('encrypted spool requires its in-memory session key')
+        return None
+    if not isinstance(key, bytes) or len(key) != _AES_KEY_BYTES:
+        raise DbPublishError(
+            f'spool encryption key must be {_AES_KEY_BYTES} bytes'
+        )
+    return key
+
+
 def open_spool_for_write(
     directory: Path,
     *,
     stage: str,
     identity: SpoolIdentity,
     buffer_bytes: int = 1_048_576,
-) -> tuple[BinaryIO, Path]:
-    """Atomically create the spool file for `stage` and write the header.
+    encrypt: bool = True,
+    key: bytes | None = None,
+) -> SpoolWriteHandle:
+    """Create one owned spool and return a plaintext write stream.
 
-    O_EXCL: opening fails with FileExistsError if a file at that path
-    already exists. Predecessor cleanup runs first under the task
-    advisory lock and removes any prior spool at this path; if one
-    still exists after that pass, either the operator dropped a file
-    in by hand or two runners collided somehow, and silently
-    overwriting either would destroy evidence. Refusing is correct.
-
-    On POSIX, mode 0o600 restricts the file to the owning user; on
-    Windows the mode is ignored and access control comes from the
-    parent directory ACL (per ADR 0011 §Spool ownership).
-
-    Returns (fp, path). The header is written before return, so the
-    file on disk always carries positive ownership from the moment it
-    exists. If the header write raises, we close the fp and unlink the
-    file so a half-created spool cannot outlive this call.
+    By default the stream encrypts every body byte using a fresh
+    AES-256-GCM nonce. The key is generated when omitted and returned only on
+    the in-memory handle; it is never written to disk. With encryption
+    explicitly disabled the same versioned ownership container is used, but
+    the body is plaintext.
     """
     if not isinstance(directory, Path):
         raise DbPublishError(
@@ -984,25 +1393,45 @@ def open_spool_for_write(
         raise DbPublishError(
             f'buffer_bytes must be a positive integer, got {buffer_bytes!r}'
         )
+    if type(encrypt) is not bool:
+        raise DbPublishError(f'encrypt must be bool, got {encrypt!r}')
+
+    protection = PROTECTION_AES256_GCM if encrypt else PROTECTION_NONE
+    if encrypt:
+        key = _validate_spool_key(
+            key if key is not None else secrets.token_bytes(_AES_KEY_BYTES),
+            required=True,
+        )
+        nonce = secrets.token_bytes(_GCM_NONCE_BYTES)
+    else:
+        if key is not None:
+            raise DbPublishError('plaintext spool must not be given an encryption key')
+        nonce = None
 
     filename = compose_spool_filename(token=identity.token, stage=stage)
     path = directory / filename
-
-    # O_BINARY is a Windows-only flag that disables CRLF translation on
-    # the fd. POSIX has no such flag; getattr defaulting to 0 keeps the
-    # bitmask correct on both platforms.
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
     fd = os.open(path, flags, 0o600)
     try:
-        fp = os.fdopen(fd, 'wb', buffering=buffer_bytes)
+        raw = os.fdopen(fd, 'wb', buffering=0)
     except BaseException:
-        # os.fdopen failure leaves the fd unclosed; recover it before
-        # re-raising so this branch cannot leak an fd.
-        os.close(fd)
+        try:
+            try:
+                os.close(fd)
+            except OSError:
+                log.exception(
+                    'secondary error while closing COPY spool descriptor %s; '
+                    'preserving creation exception',
+                    path,
+                )
+        finally:
+            cleanup_spool_paths([path])
         raise
+
+    stream: BinaryIO | None = None
     try:
-        write_spool_header(
-            fp,
+        header_bytes = write_spool_header(
+            raw,
             task=identity.task,
             target_schema=identity.target_schema,
             target_table=identity.target_table,
@@ -1010,22 +1439,39 @@ def open_spool_for_write(
             pid=identity.pid,
             token=identity.token,
             stage=stage,
+            protection=protection,
+            nonce=nonce,
         )
+        if encrypt:
+            protected_raw = _AesGcmEncryptingRawWriter(
+                raw, key=key, nonce=nonce, aad=header_bytes,
+            )
+            stream = io.BufferedWriter(protected_raw, buffer_size=buffer_bytes)
+        else:
+            stream = io.BufferedWriter(raw, buffer_size=buffer_bytes)
     except BaseException:
         try:
-            fp.close()
-        finally:
             try:
-                path.unlink()
-            except OSError:
-                # If we cannot unlink, propagate the original exception
-                # rather than mask it with an unlink failure. The
-                # cleanup pass on the next run will treat the
-                # header-less file as unknown and preserve it, which
-                # is the correct default.
-                pass
+                if stream is not None:
+                    stream.close()
+                else:
+                    raw.close()
+            except BaseException:
+                log.exception(
+                    'secondary error while closing incomplete COPY spool %s; '
+                    'preserving creation exception',
+                    path,
+                )
+        finally:
+            cleanup_spool_paths([path])
         raise
-    return fp, path
+
+    return SpoolWriteHandle(
+        stream=stream,
+        path=path,
+        key=key,
+        protection=protection,
+    )
 
 
 def open_spool_for_read(
@@ -1034,17 +1480,12 @@ def open_spool_for_read(
     identity: SpoolIdentity,
     stage: str,
     buffer_bytes: int = 1_048_576,
+    key: bytes | None = None,
 ) -> BinaryIO:
-    """Open `path` for read and verify the header names this identity+stage.
+    """Open an owned spool and expose only its plaintext body.
 
-    Strict: any framing error propagates as SpoolFormatError (the file
-    is not a well-formed spool); an identity or stage mismatch raises
-    DbPublishError (the file is well-formed but names someone else --
-    a bug if the caller is reading a spool it wrote in this run).
-
-    The distinction matters for predecessor cleanup vs own-spool
-    replay: predecessor cleanup uses read_spool_header directly and
-    tolerates SpoolFormatError, while own-spool replay must not.
+    Encrypted bodies are authenticated at EOF. A wrong key, corrupted body,
+    missing footer, or truncated ciphertext raises ``SpoolFormatError``.
     """
     if not isinstance(path, Path):
         raise DbPublishError(
@@ -1063,45 +1504,98 @@ def open_spool_for_read(
             f'buffer_bytes must be a positive integer, got {buffer_bytes!r}'
         )
 
-    fp = open(path, 'rb', buffering=buffer_bytes)
+    raw = open(path, 'rb', buffering=0)
     try:
-        header = read_spool_header(fp)
+        header, header_bytes = _read_spool_header_with_bytes(raw)
+        if header['token'] != identity.token:
+            raise DbPublishError(
+                f'spool at {path} header token {header["token"]!r} does not match '
+                f'identity token {identity.token!r}'
+            )
+        if header['stage'] != stage:
+            raise DbPublishError(
+                f'spool at {path} header stage {header["stage"]!r} does not match '
+                f'expected stage {stage!r}'
+            )
+
+        protection = header['protection']
+        if protection == PROTECTION_NONE:
+            if key is not None:
+                raise DbPublishError('plaintext spool must not be read with an encryption key')
+            return io.BufferedReader(raw, buffer_size=buffer_bytes)
+
+        key = _validate_spool_key(key, required=True)
+        nonce = bytes.fromhex(header['nonce'])
+        body_start = raw.tell()
+        end = raw.seek(0, os.SEEK_END)
+        if end < body_start + _GCM_FOOTER.size:
+            raise SpoolFormatError('encrypted spool is missing its authentication footer')
+        raw.seek(end - _GCM_FOOTER.size)
+        footer = raw.read(_GCM_FOOTER.size)
+        if len(footer) != _GCM_FOOTER.size:
+            raise SpoolFormatError('short read on encrypted spool footer')
+        footer_magic, tag = _GCM_FOOTER.unpack(footer)
+        if footer_magic != _GCM_FOOTER_MAGIC:
+            raise SpoolFormatError(
+                f'wrong encrypted spool footer magic: {footer_magic!r}'
+            )
+        ciphertext_bytes = end - body_start - _GCM_FOOTER.size
+        raw.seek(body_start)
+        decrypting_raw = _AesGcmDecryptingRawReader(
+            raw,
+            key=key,
+            nonce=nonce,
+            tag=tag,
+            aad=header_bytes,
+            ciphertext_bytes=ciphertext_bytes,
+        )
+        return io.BufferedReader(decrypting_raw, buffer_size=buffer_bytes)
     except BaseException:
-        fp.close()
+        raw.close()
         raise
 
-    if header['token'] != identity.token:
-        fp.close()
-        raise DbPublishError(
-            f'spool at {path} header token {header["token"]!r} does not match '
-            f'identity token {identity.token!r}'
-        )
-    if header['stage'] != stage:
-        fp.close()
-        raise DbPublishError(
-            f'spool at {path} header stage {header["stage"]!r} does not match '
-            f'expected stage {stage!r}'
-        )
-    return fp
 
+def cleanup_spool_paths(
+    paths: Sequence[Path],
+    *,
+    attempts: int = 3,
+    retry_delay_seconds: float = 0.05,
+) -> list[Path]:
+    """Best-effort current-run cleanup with bounded retries and logging.
 
-def cleanup_spool_paths(paths: Sequence[Path]) -> list[Path]:
-    """Best-effort delete every path. Returns the paths that could not
-    be removed (already-missing counts as success).
-
-    Used to reap the spools this run created, in both success and
-    failure paths. Never raises: cleanup happens in `finally` blocks
-    where an exception would mask the original one.
+    Already-missing paths count as success. Every residual path is returned
+    and logged exactly; callers decide whether residue is fatal at that point
+    in the lifecycle.
     """
+    if type(attempts) is not int or attempts < 1:
+        raise DbPublishError(f'attempts must be a positive integer, got {attempts!r}')
+    if not isinstance(retry_delay_seconds, (int, float)) or retry_delay_seconds < 0:
+        raise DbPublishError(
+            f'retry_delay_seconds must be non-negative, got {retry_delay_seconds!r}'
+        )
+
     failed: list[Path] = []
     for path in paths:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            # Already gone -- another cleanup pass, another process,
-            # or the OS reaped it. Success.
-            pass
-        except OSError:
+        removed = False
+        for attempt in range(1, attempts + 1):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                removed = True
+                break
+            except OSError as exc:
+                if attempt == attempts:
+                    log.warning(
+                        'could not remove COPY spool %s after %s attempt(s): %s',
+                        path, attempts, exc,
+                    )
+                    break
+                if retry_delay_seconds:
+                    time.sleep(retry_delay_seconds)
+            else:
+                removed = True
+                break
+        if not removed:
             failed.append(path)
     return failed
 
@@ -1154,7 +1648,8 @@ def cleanup_predecessor_spools(
             # never ours.
             preserved.append(entry)
             continue
-        if parse_spool_filename(entry.name) is None:
+        parsed_name = parse_spool_filename(entry.name)
+        if parsed_name is None:
             # Filename does not match the grammar -- not a spool we
             # would have written.
             preserved.append(entry)
@@ -1172,13 +1667,20 @@ def cleanup_predecessor_spools(
             # Permission denied, disappeared under us, ... preserve.
             preserved.append(entry)
             continue
+        if (
+            header.get('token') != parsed_name['token']
+            or header.get('stage') != parsed_name['stage']
+        ):
+            # A valid header attached to a filename for a different run or
+            # stage is not positive ownership. Preserve rather than guess.
+            preserved.append(entry)
+            continue
         if header.get('task') != task:
             # Foreign task. Preserve.
             preserved.append(entry)
             continue
-        try:
-            entry.unlink()
-        except OSError:
+        failed = cleanup_spool_paths([entry])
+        if failed:
             preserved.append(entry)
             continue
         deleted.append(entry)
@@ -1196,7 +1698,9 @@ def prepare_copy_source(
     directory: Path,
     policy: CopyLoadPolicy | None = None,
     framework_columns: Sequence[ResolvedColumn] = (),
-) -> tuple[Path, tuple[ResolvedColumn, ...]]:
+    type_overrides: Mapping[str, Any] | None = None,
+    not_null_columns: Sequence[str] = (),
+) -> PreparedCopySource:
     """Prepare a COPY-text spool from a positional row source in two passes.
 
     Pass 1 writes the type-neutral spool while (optionally) feeding a
@@ -1204,16 +1708,14 @@ def prepare_copy_source(
     the target-aware COPY-text serializer, resolving each cell against the
     now-known column types.
 
-    `row_source` must yield tuples whose positional order matches `columns`.
-    Values must arrive pre-normalized to native Python scalars (or None) --
-    normalization is the caller's responsibility, per ADR 0011 §Row-source
-    contract. If a raw pandas/petl value reaches here it may misclassify
-    against the inference stream or fail an `_write_value` type check.
+    `row_source` must yield sequences whose positional order matches
+    `columns`. Each value is normalized exactly once during pass 1 using the
+    same normalization kernel as the INSERT path; the normalized value is
+    both observed by inference and written to the neutral spool.
 
-    `declared_schema=None` triggers inference. Otherwise the caller-supplied
-    columns are used verbatim and must line up name-for-name with
-    `columns` -- a mismatch is a configuration error, caught here rather
-    than allowed to produce silently reordered output.
+    `declared_schema=None` triggers inference. Otherwise the declared and
+    source column sets must match, but their order may differ: pass 2 emits
+    values in declared-schema order, matching the existing INSERT contract.
 
     `framework_columns` pins the resolved type of technical columns whose
     value is caller-supplied and constant (e.g. `etl_updated_at`) after
@@ -1224,13 +1726,15 @@ def prepare_copy_source(
     columns already carry their pinned type), but the same framework
     tuple is accepted and validated for symmetry with the caller.
 
-    On success: returns (copytext_path, resolved_columns), and the neutral
-    spool has been reaped. On any exception both spools this call created
-    are best-effort deleted before the exception propagates, so a failed
-    call leaves no trailing spool files.
+    On success: returns an immutable `PreparedCopySource` carrying the final
+    spool, resolved columns, exact row count and on-disk byte count. The
+    neutral spool must be removed before success is returned. On any
+    exception, deletion of every current-run spool is attempted with bounded
+    retries; a cleanup failure is logged without replacing the primary
+    exception and may be reaped by a later positively-owned cleanup pass.
 
-    Test-only in 0.6.4: no public entry point invokes this yet.
-    `db_loader='copy'` remains publicly rejected until Phase 6 lifts the
+    Internally wired in 0.6.5, but `db_loader='copy'` remains publicly
+    rejected until Phase 6 supplies the database transport and lifts the
     gate.
     """
     # --- Input validation (all before any file is created) ------------
@@ -1279,10 +1783,17 @@ def prepare_copy_source(
                     f'got {type(col).__name__}'
                 )
         declared_names = [c.name for c in declared_tuple]
-        if declared_names != list(columns_tuple):
+        declared_duplicates = find_duplicates(declared_names)
+        if declared_duplicates:
             raise DbPublishError(
-                f'declared_schema column names {declared_names!r} do not '
-                f'match columns {list(columns_tuple)!r} in the same order'
+                f'declared_schema contains duplicate column names: {declared_duplicates!r}'
+            )
+        missing = [name for name in declared_names if name not in columns_tuple]
+        unexpected = [name for name in columns_tuple if name not in set(declared_names)]
+        if missing or unexpected:
+            raise DbPublishError(
+                f'declared_schema columns do not match source columns; '
+                f'missing={missing!r}, unexpected={unexpected!r}'
             )
     framework_tuple = tuple(framework_columns)
     for col in framework_tuple:
@@ -1298,6 +1809,40 @@ def prepare_copy_source(
             raise DbPublishError(
                 f'framework_columns include names not present in columns: {unknown!r}'
             )
+    if declared_schema is not None and type_overrides is not None:
+        raise DbPublishError('declared_schema cannot be combined with type_overrides')
+    if declared_schema is not None and tuple(not_null_columns):
+        raise DbPublishError('declared_schema cannot be combined with not_null_columns')
+
+    if type_overrides is not None and not isinstance(type_overrides, Mapping):
+        raise DbPublishError(
+            f'type_overrides must be a mapping or None, got {type(type_overrides).__name__}'
+        )
+    overrides = dict(type_overrides or {})
+    unknown_overrides = [name for name in overrides if name not in columns_tuple]
+    if unknown_overrides:
+        raise DbPublishError(
+            f'type_overrides contains column(s) not present in the output: {unknown_overrides!r}'
+        )
+
+    if not isinstance(not_null_columns, Sequence) or isinstance(
+        not_null_columns, (str, bytes)
+    ):
+        raise DbPublishError('not_null_columns must be a sequence of strings')
+    not_null = tuple(not_null_columns)
+    if not all(isinstance(name, str) for name in not_null):
+        raise DbPublishError('not_null_columns must contain only strings')
+    not_null_duplicates = find_duplicates(not_null)
+    if not_null_duplicates:
+        raise DbPublishError(
+            f'not_null_columns contains duplicate column(s): {not_null_duplicates!r}'
+        )
+    unknown_not_null = [name for name in not_null if name not in columns_tuple]
+    if unknown_not_null:
+        raise DbPublishError(
+            f'not_null_columns contains column(s) not present in the output: {unknown_not_null!r}'
+        )
+
     if row_source is None:
         raise DbPublishError('row_source must not be None')
 
@@ -1315,25 +1860,32 @@ def prepare_copy_source(
         else:
             state = None
 
-        neutral_fp, neutral_path = open_spool_for_write(
+        source_row_count = 0
+        neutral_handle = open_spool_for_write(
             directory,
             stage='neutral',
             identity=identity,
             buffer_bytes=policy.buffer_bytes,
+            encrypt=policy.encrypt_spools,
         )
-        try:
+        neutral_fp = neutral_handle.stream
+        neutral_path = neutral_handle.path
+        with _close_preserving_primary(
+            neutral_fp, description=f'neutral COPY spool {neutral_path}',
+        ):
             write_neutral_preamble(neutral_fp, columns=columns_tuple)
             for row in row_source:
                 if not isinstance(row, Sequence) or isinstance(row, (str, bytes)):
                     raise DbPublishError(
                         f'row source yielded non-sequence {type(row).__name__}'
                     )
-                row_tuple = tuple(row)
+                row_tuple = tuple(_normalize_value(value) for value in row)
                 if len(row_tuple) != len(columns_tuple):
                     raise DbPublishError(
                         f'row width {len(row_tuple)} does not match column '
                         f'count {len(columns_tuple)}'
                     )
+                source_row_count += 1
                 if state is not None:
                     state.feed_row(row_tuple)
                 # write_neutral_row re-validates width, but the check here
@@ -1343,8 +1895,6 @@ def prepare_copy_source(
                     neutral_fp, row_tuple, expected_width=len(columns_tuple),
                 )
             write_neutral_terminator(neutral_fp)
-        finally:
-            neutral_fp.close()
 
         # Resolve schema between the passes: after inference is complete,
         # before copytext serialization begins.
@@ -1352,45 +1902,47 @@ def prepare_copy_source(
             resolved_columns = tuple(declared_schema)
         else:
             resolved_types = state.resolve()
-            resolved_columns = tuple(
-                ResolvedColumn(
-                    name=columns_tuple[i],
-                    type=resolved_types[i],
-                    nullable=True,
-                )
-                for i in range(len(columns_tuple))
-            )
-            # Pin framework-column types. Inference on a constant
-            # timezone-aware datetime resolves to naive DateTime and
-            # would then reject the aware value at serialize time, so
-            # the caller's pinned type wins by name. This mirrors the
-            # INSERT path's framework-column bypass in
-            # _resolve_payload_schema; the two loaders resolve
-            # framework-column types the same way.
-            if framework_tuple:
-                by_name = {c.name: c for c in framework_tuple}
-                resolved_columns = tuple(
-                    by_name.get(c.name, c) for c in resolved_columns
-                )
+            framework_by_name = {c.name: c for c in framework_tuple}
+            resolved_list = []
+            for index, name in enumerate(columns_tuple):
+                framework = framework_by_name.get(name)
+                if framework is not None:
+                    resolved_list.append(framework)
+                    continue
+                override = _resolve_override(overrides.get(name))
+                resolved_list.append(ResolvedColumn(
+                    name=name,
+                    type=override if override is not None else resolved_types[index],
+                    nullable=name not in not_null,
+                ))
+            resolved_columns = tuple(resolved_list)
 
-        # Pass 2: replay neutral -> copytext. Every value goes through
-        # `_validate_declared_value` (inside serialize_row_to_copytext),
-        # which is where a mistyped cell or an unexpected NULL in a
-        # non-nullable column raises DbPublishError.
-        copytext_fp, copytext_path = open_spool_for_write(
+        # Pass 2: replay neutral -> copytext. Declared mode applies the
+        # strict declared-value validator. Inferred mode applies the
+        # target-aware widening serializer that matches the accepted INSERT
+        # inference semantics. Both enforce non-nullable columns here.
+        copytext_handle = open_spool_for_write(
             directory,
             stage='copytext',
             identity=identity,
             buffer_bytes=policy.buffer_bytes,
+            encrypt=policy.encrypt_spools,
         )
-        try:
+        copytext_fp = copytext_handle.stream
+        copytext_path = copytext_handle.path
+        with _close_preserving_primary(
+            copytext_fp, description=f'COPY-text spool {copytext_path}',
+        ):
             neutral_read = open_spool_for_read(
                 neutral_path,
                 identity=identity,
                 stage='neutral',
                 buffer_bytes=policy.buffer_bytes,
+                key=neutral_handle.key,
             )
-            try:
+            with _close_preserving_primary(
+                neutral_read, description=f'neutral COPY spool reader {neutral_path}',
+            ):
                 preamble = read_neutral_preamble(neutral_read)
                 if preamble != columns_tuple:
                     # A defensive assertion: the writer above sets this
@@ -1413,23 +1965,35 @@ def prepare_copy_source(
                         resolved_columns,
                         identity.target_table,
                         row_number,
+                        declared=declared_schema is not None,
                     ))
-            finally:
-                neutral_read.close()
-        finally:
-            copytext_fp.close()
 
         # Success path: reap the neutral spool now that copytext is
         # committed to disk. Copytext survives for the caller to hand to
         # the COPY consumer in Phase 5.h.
-        cleanup_spool_paths([neutral_path])
-        return copytext_path, resolved_columns
+        failed_neutral_cleanup = cleanup_spool_paths([neutral_path])
+        if failed_neutral_cleanup:
+            raise DbPublishError(
+                f'could not remove completed neutral COPY spool(s): '
+                f'{failed_neutral_cleanup!r}'
+            )
+        return PreparedCopySource(
+            path=copytext_path,
+            columns=resolved_columns,
+            row_count=source_row_count,
+            spool_bytes=copytext_path.stat().st_size,
+            identity=identity,
+            buffer_bytes=policy.buffer_bytes,
+            protection=copytext_handle.protection,
+            _key=copytext_handle.key,
+        )
     except BaseException:
         # Any failure -- input rejection, mid-pass source exception,
-        # value-validation error, unlink refusal -- reaps every spool
-        # this call created before the exception propagates. Files that
-        # never got created (path is None) are skipped; already-missing
-        # files are treated as success by cleanup_spool_paths.
+        # value-validation error, unlink refusal -- attempts to reap every
+        # spool this call created before the exception propagates. Residual
+        # paths are logged by cleanup_spool_paths without replacing the
+        # primary failure. Files that never got created (path is None) are
+        # skipped; already-missing files count as cleanup success.
         to_cleanup = [p for p in (neutral_path, copytext_path) if p is not None]
         if to_cleanup:
             cleanup_spool_paths(to_cleanup)
@@ -1442,8 +2006,12 @@ __all__ = [
     'MAGIC',
     'FORMAT_VERSION',
     'SPOOL_STAGES',
+    'PROTECTION_NONE',
+    'PROTECTION_AES256_GCM',
+    'SPOOL_PROTECTIONS',
     'SPOOL_FILENAME_RE',
     'DEFAULT_SPOOL_SUBDIR',
+    'PreparedCopySource',
     'SpoolIdentity',
     'compose_ownership_token',
     'compose_spool_filename',

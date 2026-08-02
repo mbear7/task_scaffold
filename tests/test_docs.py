@@ -77,7 +77,7 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
             {'excel_name', 'db_table', 'db_output', 'db_contract', 'db_type_overrides',
              'db_not_null_columns', 'output_schema', 'db_table_id_pix',
              'db_updated_at', 'publish_result', 'debug_display', 'table_adapter',
-             'db_publication_strategy', 'db_loader'},
+             'db_publication_strategy', 'db_loader', 'db_copy_spool_encryption'},
         )
 
     def test_result_shapes_are_as_documented(self):

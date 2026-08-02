@@ -151,6 +151,7 @@ class derived:
 | `table_adapter` | `None` | `'petl'`, `'pandas'`, or `None` to infer. |
 | `db_publication_strategy` | `None` | `'replace'` (default) or `'refill'`. See below. |
 | `db_loader` | `'insert'` | Staging loader. Only `'insert'` is implemented; `'copy'` is reserved by ADR 0011 but rejected at construction until it lands. |
+| `db_copy_spool_encryption` | `None` | COPY only. `None` inherits the secure `CopyLoadPolicy` default; `False` explicitly stores spool bodies as plaintext and emits a warning. Has no effect while `db_loader='copy'` remains gated. |
 
 ### `db_output` is declarative
 

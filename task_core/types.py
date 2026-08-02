@@ -290,6 +290,10 @@ class PipelineSpec:
     # rather than silently accepted -- see ADR 0011. Appended after every
     # 0.5.1 field for the same API-hygiene reason.
     db_loader: str = 'insert'
+    # Secure default is inherited from PublisherConfig.copy_load_policy.
+    # A task may explicitly opt out for controlled, non-sensitive workloads.
+    # Appended after db_loader to preserve every older positional meaning.
+    db_copy_spool_encryption: bool | None = None
 
     def __post_init__(self):
         if self.excel_name is not None and not isinstance(self.excel_name, str):
@@ -306,6 +310,11 @@ class PipelineSpec:
         )
 
         validate_db_loader(self.db_loader, field_name='db_loader')
+
+        if self.db_copy_spool_encryption is not None and type(
+            self.db_copy_spool_encryption
+        ) is not bool:
+            raise TypeError('db_copy_spool_encryption must be bool or None')
 
         if self.db_output is not None:
             # Require the declared contract (list[str] | tuple[str, ...] |

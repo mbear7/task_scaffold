@@ -109,7 +109,7 @@ def validate_pipeline_class(task_cls, *, pipeline_name=None):
     # out its source columns -- there is no coherent semantics for it.
     # Rejected structurally, mirroring the output_schema rejection above.
     # ADR 0011 §Tests requires this even though db_loader='copy' is still
-    # rejected at every public boundary in 0.6.4 -- Phase 6 lifts the
+    # rejected at every public boundary in 0.6.5 -- Phase 6 lifts the
     # loader gate and this check then guards the newly-reachable
     # combination without needing to be introduced at that time.
     if spec.db_loader == 'copy' and has_dynamic_contract:
@@ -678,12 +678,19 @@ def run_pipelines(
                     # by direct helper tests, matching the pattern
                     # already established by Test17dRunnerCopyBranching.
                     from task_core.db_copy import cleanup_spool_paths
-                    copytext_path, _ = _prepare_copy_source_for_pipeline(
+                    prepared = _prepare_copy_source_for_pipeline(
                         pipeline_cls, out_tbl, spec, pg_schema,
                         task_name=ctx.task_name,
                         run_started_at=run_started_at,
+                        policy=config.copy_load_policy,
                     )
-                    cleanup_spool_paths([copytext_path])
+                    failed_cleanup = cleanup_spool_paths([prepared.path])
+                    if failed_cleanup:
+                        raise RuntimeError(
+                            'could not remove completed COPY spool(s): '
+                            f'{failed_cleanup!r}'
+                        )
+                    pipeline_rows[pipeline_name] = prepared.row_count
                 else:
                     payload = _build_db_payload_with_spec(pipeline_cls, out_tbl, spec, pg_schema, run_started_at=run_started_at)
                     publisher.publish(payload)

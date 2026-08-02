@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.6.4. This describes the present system, not
+How `task_core` works as of 0.6.5. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -265,6 +265,12 @@ Values are normalized on the way in: pandas and numpy scalars become
 plain Python objects, and every flavour of missing value becomes `None`.
 Containers are left alone — a one-element list is a value, not a scalar.
 
+The internal COPY-preparation path applies the same normalization once while
+consuming its one-shot positional row source. It writes a type-neutral local
+spool while accumulating schema state, resolves one schema at EOF, then
+replays into a final PostgreSQL COPY-text body. This path is wired and tested
+but remains publicly gated until Phase 6 integrates `copy_expert()`.
+
 ### Type inference
 
 Column types are inferred from the data unless pinned with
@@ -291,6 +297,29 @@ answer is one that PostgreSQL could silently widen — `BigInteger` or
 the column is re-inferred over everything if the sample turns out too
 narrow. If the whole sample is null, the sample is discarded and the full
 column scanned.
+
+### COPY spool protection
+
+COPY preparation uses two local, versioned spool containers: `neutral` and
+`copytext`. Their bodies are encrypted by default with independently generated
+AES-256-GCM keys that task_core retains only on in-memory preparation objects
+and never intentionally persists. This does not promise exclusion from swap,
+process dumps or library-internal copies. The ownership header remains plaintext so a
+later run can identify abandoned files without recovering their contents.
+
+`PipelineSpec.db_copy_spool_encryption=False` is an explicit per-task opt-out;
+it keeps the same container, permissions, ownership checks and cleanup rules
+but stores the body in plaintext and emits a warning. The final encrypted body
+is read through a bounded decrypting stream. No decrypted spool file is
+created.
+
+Unless `PublisherConfig.copy_load_policy.spool_directory` supplies another
+path, spools reside under
+`Path(tempfile.gettempdir()) / 'task_core-copy-spool'` on the Python task host,
+not on the PostgreSQL server. Current-run cleanup uses bounded retries and logs
+exact residual paths. Positive predecessor cleanup additionally requires the
+filename token/stage and plaintext header token/stage/task to agree; production
+wiring of that under the advisory lock remains Phase 7.
 
 See [decisions/0001](decisions/0001-replace-tables-instead-of-truncating.md)
 for why inference is viable at all, and its limitations for tables with
