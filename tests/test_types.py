@@ -101,40 +101,24 @@ if __name__ == '__main__':
 
 
 class Test3DbLoaderVocabulary(unittest.TestCase):
-    """PipelineSpec.db_loader landed in 0.6.0 as the public configuration
-    surface for the loader described by ADR 0011. Until COPY is
-    implemented the only accepted value is 'insert' -- 'copy' is named in
-    the validator and rejected with a message that says why: the project
-    rejects reserved-and-rejected vocabulary."""
+    """PipelineSpec exposes exactly the two implemented staging loaders."""
 
-    def test_the_vocabulary_lists_only_the_implemented_loader(self):
-        # If a value ever appears here that has no implementation behind
-        # it, the drift check in db_publish.py fails at import. This
-        # assertion documents the current vocabulary in test form so a
-        # future addition without a matching loader also fails here.
+    def test_the_vocabulary_lists_both_implemented_loaders(self):
         from task_core.types import DB_LOADERS
-        self.assertEqual(DB_LOADERS, ('insert',))
+        self.assertEqual(DB_LOADERS, ('insert', 'copy'))
 
     def test_default_is_insert(self):
         spec = tc.PipelineSpec(db_table='t')
         self.assertEqual(spec.db_loader, 'insert')
         self.assertIsNone(spec.db_copy_spool_encryption)
 
-    def test_explicit_insert_is_accepted(self):
-        spec = tc.PipelineSpec(db_table='t', db_loader='insert')
-        self.assertEqual(spec.db_loader, 'insert')
-
-    def test_copy_is_rejected_by_name_not_by_generic_message(self):
-        # An accepted vocabulary value that raises NotImplementedError is
-        # a lie. So is a generic 'unknown value' error for a value the
-        # ADR names explicitly. The message must say "not implemented"
-        # and point at the ADR so a task author who tries 'copy' knows
-        # what happened, not just that they typed something wrong.
-        with self.assertRaises(ValueError) as caught:
-            tc.PipelineSpec(db_table='t', db_loader='copy')
-        message = str(caught.exception)
-        self.assertIn('not implemented', message)
-        self.assertIn('0011', message)
+    def test_explicit_insert_and_copy_are_accepted(self):
+        for value in ('insert', 'copy'):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    tc.PipelineSpec(db_table='t', db_loader=value).db_loader,
+                    value,
+                )
 
     def test_an_unknown_value_gets_the_generic_message(self):
         with self.assertRaises(ValueError) as caught:
@@ -243,11 +227,9 @@ class Test6PayloadSourceStateMatrix(unittest.TestCase):
     enforces the exact (loader, rows, row_source) legal states. The
     matrix has four cells; two are valid, two are configuration errors.
 
-    'copy' is still rejected by validate_db_loader at every public
-    payload/spec boundary, so the (copy, ...) legs here are reachable
-    only by calling validate_payload_source_state directly -- exactly
-    what these tests do, so the future db_copy.py transport lands with
-    the state matrix already asserted."""
+    Both loader legs are public in 0.6.6. These tests call the validator
+    directly so the exact rows/row_source state matrix stays independent of
+    adapter and publisher behavior."""
 
     def test_insert_with_rows_and_no_row_source_is_valid(self):
         from task_core.types import validate_payload_source_state

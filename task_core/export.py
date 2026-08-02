@@ -135,8 +135,85 @@ def _build_db_payload_with_spec(task_cls, tbl, spec, pg_schema, *, run_started_a
 
 
 def build_db_payload(task_cls, tbl, pg_schema, *, run_started_at=None):
+    spec = get_pipeline_spec(task_cls)
+    if spec.db_loader == 'copy':
+        return _build_copy_payload_with_spec(
+            task_cls, tbl, spec, pg_schema, run_started_at=run_started_at,
+        )
     return _build_db_payload_with_spec(
-        task_cls, tbl, get_pipeline_spec(task_cls), pg_schema, run_started_at=run_started_at,
+        task_cls, tbl, spec, pg_schema, run_started_at=run_started_at,
+    )
+
+
+def _compose_copy_row_source(task_cls, tbl, spec, *, run_started_at):
+    """Build the final logical one-shot row source shared by Phase 5 tests
+    and the real Phase 6 publisher path.
+
+    COPY deliberately supports only the static ``db_contract`` from the
+    captured PipelineSpec. ``get_dynamic_db_contract()`` may execute
+    arbitrary task code and traverse the lazy table before the one-shot
+    source is claimed, so the combination is rejected structurally and
+    repeated defensively here for direct helper callers.
+    """
+    from task_core.db_publish import RowProjection, _ProjectedRowSource
+
+    dynamic_contract_fn = getattr(task_cls, 'get_dynamic_db_contract', None)
+    if callable(dynamic_contract_fn):
+        raise PipelineContractError(
+            f'{getattr(task_cls, "__name__", repr(task_cls))}: '
+            f"db_loader='copy' cannot be combined with "
+            f'get_dynamic_db_contract(); COPY resolves its output columns '
+            f'once before consuming the one-shot source'
+        )
+
+    adapter = get_table_adapter(spec.table_adapter)
+    source_columns, raw_source = adapter.to_row_source(tbl)
+    framework_columns = _build_framework_columns(spec)
+    projection = RowProjection.build(
+        source_columns,
+        db_contract=spec.db_contract,
+        framework_columns=framework_columns,
+        run_started_at=run_started_at,
+    )
+    return projection, _ProjectedRowSource(raw_source, projection), framework_columns
+
+
+def _build_copy_payload_with_spec(
+    task_cls, tbl, spec, pg_schema, *, run_started_at=None,
+):
+    """Build the real Phase 6 COPY DbPayload without materializing rows.
+
+    Spool preparation remains inside ``DbPublisher.publish()`` so the
+    publisher owns the complete preparation lifecycle: schema resolution,
+    staging DDL, selected transport, verification, comment, commit, and
+    cleanup of the final spool on every exit path.
+    """
+    from task_core.db_publish import DbPayload
+
+    if not spec.db_table:
+        return None
+    if run_started_at is None:
+        run_started_at = datetime.now(timezone.utc)
+
+    projection, projected_source, framework_columns = _compose_copy_row_source(
+        task_cls, tbl, spec, run_started_at=run_started_at,
+    )
+    return DbPayload(
+        table_name=spec.db_table,
+        schema=pg_schema,
+        columns=list(projection.output_columns),
+        rows=None,
+        type_overrides=spec.db_type_overrides,
+        db_table_id_pix=spec.db_table_id_pix,
+        not_null_columns=tuple(spec.db_not_null_columns or ()),
+        output_schema=(
+            tuple(spec.output_schema) if spec.output_schema is not None else None
+        ),
+        framework_columns=framework_columns,
+        publication_strategy=spec.db_publication_strategy or 'replace',
+        db_loader='copy',
+        row_source=projected_source,
+        copy_spool_encryption=spec.db_copy_spool_encryption,
     )
 
 
@@ -152,13 +229,9 @@ def _prepare_copy_source_for_pipeline(
     turn (task_cls, out_tbl, spec, pg_schema) into a publish-ready
     artefact; runner.py stays engine-neutral by delegating both.
 
-    ``db_loader='copy'`` remains publicly rejected by validate_db_loader
-    at both spec and payload boundaries in 0.6.5, so this helper is only
-    reachable through the gated runner branch and direct tests. Phase 6 will
-    lift that gate, add the real
-    copy_expert() transport, and integrate this composition into
-    publisher.publish(); the runner branch that calls this today is
-    scaffolding for that landing point.
+    This remains a direct preparation helper for tests and diagnostics.
+    The real Phase 6 runner path builds a one-shot DbPayload and lets
+    ``DbPublisher.publish()`` own spool preparation and database transport.
 
     Returns a PreparedCopySource. The caller owns its spool path from
     the moment this returns.
@@ -168,7 +241,6 @@ def _prepare_copy_source_for_pipeline(
     # acyclic but noisy at the top of the file) and mirror the
     # dependency direction the tests enforce: nothing at level 2 pulls
     # in db_copy unconditionally.
-    from task_core.db_publish import RowProjection, _ProjectedRowSource
     from task_core.db_copy import (
         CopyLoadPolicy, SpoolIdentity, prepare_copy_source,
         resolve_spool_directory,
@@ -179,18 +251,6 @@ def _prepare_copy_source_for_pipeline(
         raise PipelineContractError(
             '_prepare_copy_source_for_pipeline requires spec.db_table'
         )
-
-    # Same rule as _build_db_payload_with_spec: get_dynamic_db_contract
-    # is captured against the pipeline's actual output while every other
-    # field comes from the pre-.run() spec. output_schema + dynamic
-    # contract is rejected upstream at validate_pipeline_class; a
-    # duplicate check here would fire on the same input and is left to
-    # that single owner.
-    dynamic_contract_fn = getattr(task_cls, 'get_dynamic_db_contract', None)
-    if callable(dynamic_contract_fn):
-        db_contract = dynamic_contract_fn(tbl)
-    else:
-        db_contract = spec.db_contract
 
     if policy is None:
         policy = CopyLoadPolicy()
@@ -206,17 +266,9 @@ def _prepare_copy_source_for_pipeline(
     if run_started_at is None:
         run_started_at = datetime.now(timezone.utc)
 
-    adapter = get_table_adapter(spec.table_adapter)
-    source_columns, raw_source = adapter.to_row_source(tbl)
-
-    framework_columns = _build_framework_columns(spec)
-    projection = RowProjection.build(
-        source_columns,
-        db_contract=db_contract,
-        framework_columns=framework_columns,
-        run_started_at=run_started_at,
+    projection, projected_source, framework_columns = _compose_copy_row_source(
+        task_cls, tbl, spec, run_started_at=run_started_at,
     )
-    projected_source = _ProjectedRowSource(raw_source, projection)
 
     # Framework columns as ResolvedColumn using the same OutputColumn
     # -> concrete TypeEngine converter db_values uses on the INSERT
@@ -249,7 +301,7 @@ def _prepare_copy_source_for_pipeline(
 
     identity = SpoolIdentity(
         task=task_name,
-        target_schema=pg_schema,
+        target_schema=pg_schema or '<default-schema>',
         target_table=spec.db_table,
         run_start_utc=run_started_at,
         pid=os.getpid(),

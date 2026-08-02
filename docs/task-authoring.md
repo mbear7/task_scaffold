@@ -150,8 +150,32 @@ class derived:
 | `debug_display` | `False` | Print the table during the run. |
 | `table_adapter` | `None` | `'petl'`, `'pandas'`, or `None` to infer. |
 | `db_publication_strategy` | `None` | `'replace'` (default) or `'refill'`. See below. |
-| `db_loader` | `'insert'` | Staging loader. Only `'insert'` is implemented; `'copy'` is reserved by ADR 0011 but rejected at construction until it lands. |
-| `db_copy_spool_encryption` | `None` | COPY only. `None` inherits the secure `CopyLoadPolicy` default; `False` explicitly stores spool bodies as plaintext and emits a warning. Has no effect while `db_loader='copy'` remains gated. |
+| `db_loader` | `'insert'` | Staging loader: `'insert'` for materialized SQLAlchemy INSERT batches or `'copy'` for bounded local spooling followed by PostgreSQL `COPY FROM STDIN`. |
+| `db_copy_spool_encryption` | `None` | COPY only. `None` inherits the secure `CopyLoadPolicy` default; `False` explicitly stores spool bodies as plaintext and emits a warning. |
+
+### Choosing the database loader
+
+`db_loader='insert'` preserves the established materialized mapping path.
+`db_loader='copy'` consumes the adapter output once, prepares bounded local
+spools, and streams the final COPY-text body through PostgreSQL `COPY FROM
+STDIN` on the publisher's existing connection. Both loaders use the same
+resolved schema and publication protocol.
+
+COPY spools are encrypted by default. A task may explicitly opt out:
+
+```python
+spec = PipelineSpec(
+    db_table='large_output',
+    db_loader='copy',
+    db_copy_spool_encryption=False,
+)
+```
+
+The opt-out persists spool bodies as plaintext and emits a warning. Spools live
+on the Python task host under the platform temporary directory unless
+`PublisherConfig.copy_load_policy.spool_directory` supplies another local
+path. COPY does not support `get_dynamic_db_contract()` because its final
+positional row shape must be fixed before one-shot traversal begins.
 
 ### `db_output` is declarative
 
@@ -374,6 +398,7 @@ run_pipelines(
 | `publisher_factory` | `DbPublisher` | Extension seam; see [architecture.md](architecture.md#extension-points). |
 | `identifier_policy` | `IdentifierPolicy()` | Identifier rules, currently the byte limit. |
 | `publication_lock_policy` | `PublicationLockPolicy()` | How long publication may wait for its target locks. |
+| `copy_load_policy` | `CopyLoadPolicy()` | COPY spool directory, bounded I/O buffer size and deployment-wide encryption default. |
 
 `PublicationLockPolicy` bounds the `ACCESS EXCLUSIVE` wait during
 publication, so a long-running reader cannot turn one publication into a

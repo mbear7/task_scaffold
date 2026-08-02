@@ -1,11 +1,9 @@
 # 0011 — Add a bounded-memory `COPY FROM STDIN` loader
 
-Status: proposed. The `db_loader` configuration surface landed in 0.6.0 with
-`'insert'` as the only accepted value; `'copy'` is rejected by name at every
-public boundary until the transport lands, because the project does not
-reserve vocabulary it has not implemented.
-
-Not implemented in 0.6.0.
+Status: accepted in stages. Phases 1-6 are implemented through 0.6.6.
+`db_loader='copy'` is now a public staging transport; Phase 7 predecessor-spool
+cleanup wiring and Phase 8 live PostgreSQL acceptance/performance evidence
+remain pending before ADR 0011 is considered fully closed.
 
 Amended before implementation by ADR 0012: schema source and publication
 strategy are independent. COPY changes staging transport only and must work
@@ -1105,15 +1103,12 @@ tasks remain unchanged.
 `DbPayload.row_source: DbRowSource | None`, the exact `rows`/`row_source`
 state matrix, and the one-shot adapters (`_PetlAdapter.to_row_source`,
 `_PandasAdapter.to_row_source`) that expose the source without
-materializing. The helpers shipped in 0.6.2 (tightened in 0.6.3) with
-`db_loader='copy'` still rejected at every public boundary. Phase 5
-completes the internal row-source → spool-preparation chain (runner
-calls `to_row_source()`, builds the `RowProjection`, and hands the
-resulting `_ProjectedRowSource` to the Phase 5 spool code in
-`db_copy.py`). Phase 6 then integrates `copy_expert()` against the
-publisher's DBAPI connection, lifts the public `'copy'` rejection, and
-completes the real end-to-end pipeline path. Until Phase 6, the internal
-chain is exercisable from tests only; no shipped caller can reach it.
+materializing. The helpers shipped in 0.6.2 (tightened in 0.6.3) while
+`db_loader='copy'` was still rejected at every public boundary. Phase 5
+completed the internal row-source → spool-preparation chain. Phase 6 then
+integrated `copy_expert()` against the publisher's DBAPI connection, lifted
+the public `'copy'` rejection, and completed the end-to-end pipeline path.
+Before Phase 6, the internal chain was exercisable from tests only.
 
 Also shipped in 0.6.2: `RowProjection` + `_ProjectedRowSource`, the one
 transport-neutral mechanism that composes `db_contract` renaming/projection
@@ -1148,22 +1143,18 @@ without materializing.
 
 Shipped in 0.6.2 (relabelled honestly in 0.6.3) as the *planning skeleton*
 `_plan_pipeline_output_handling` in `task_core.runner`, a helper taking
-`db_loader` as a parameter (so tests exercise the branch directly, since
-`db_loader='copy'` is still rejected at every public boundary). On the
+`db_loader` as a parameter. Before 0.6.6, tests exercised the branch directly
+because `db_loader='copy'` was still rejected publicly. On the
 database-only COPY path the helper returns `precount_via_nrows=False`;
 callers are expected to read the row count from `publisher.table_rows`
 after publish rather than call `adapter.nrows()` up front. Stabilization
 is still triggered when another consumer (Excel, `debug_display`, or
 `publish_result`) needs the table traversed more than once. What the 0.6.2
-helper does *not* do -- and the 0.6.2 CHANGELOG and this ADR previously
-overstated -- is actually consume a `DbRowSource` object. It branches on
-the *string* `'copy'` in `spec.db_loader`; nothing in `runner.py` today
-calls `to_row_source()`, constructs a `RowProjection`, or hands a
-`_ProjectedRowSource` to a loader. Phase 5 completes the internal
-producer-consumer wiring (runner → row source → spool preparation in
-`db_copy.py`); Phase 6 then lifts the public `db_loader='copy'`
-rejection and integrates `copy_expert()`, at which point the branch is
-reachable from a real pipeline run.
+helper did *not* do -- and the 0.6.2 CHANGELOG and this ADR previously
+overstated -- was consume a `DbRowSource` object. It branched on the *string*
+`'copy'` in `spec.db_loader`. Phase 5 completed the internal producer-consumer
+wiring; Phase 6 made that chain reachable from a real pipeline run and
+integrated `copy_expert()`.
 
 No database COPY execution is integrated until traversal and row-count tests
 are complete.
@@ -1193,16 +1184,17 @@ chain is exercised via helper-level tests only, not through
 
 ### Phase 6 - integrate DBAPI COPY and activate 'copy' publicly
 
-Load the final spool through the publisher's existing SQLAlchemy/psycopg2
-connection and preparation transaction (via `copy_expert()`). Reuse
-current staging creation, verification, comments, commit and
-pending-publication registration.
+Shipped in 0.6.6. The final prepared spool is streamed through
+`copy_expert()` using a cursor opened on the publisher's existing
+SQLAlchemy/psycopg2 connection and preparation transaction. Staging creation,
+verification, comments, transaction ownership and pending-publication
+registration remain in `DbPublisher`.
 
-Lift the public `db_loader='copy'` rejection at `validate_db_loader`
-(both spec and payload boundaries) and register `'copy'` in the
-`LOADERS` dispatch. This is the phase that completes the real
-end-to-end pipeline path: a `PipelineSpec(db_loader='copy', ...)`
-becomes reachable from `run_pipelines()` for the first time.
+`validate_db_loader` now accepts `'copy'`, the loader is registered in the
+publisher dispatch, and `run_pipelines()` builds a one-shot COPY payload
+without calling `adapter.nrows()` on a database-only COPY path. The exact row
+count captured during spool preparation is verified against staging and
+reported through the existing publisher result properties.
 
 ### Phase 7 - predecessor spool cleanup
 
@@ -1555,37 +1547,28 @@ for small outputs.
 
 ## Verification status
 
-No database COPY transport exists yet. Phases 1 and 2 shipped in 0.6.0 (commit
-`1c55a42`), as did Phase 3a (see the amended Phase 3 above). 0.6.2 shipped
-the Phase 3b helpers (`DbRowSource` protocol, `to_row_source()` producers
-on both adapters, `RowProjection` + `_ProjectedRowSource` composer) and
-the Phase 4 planning skeleton (`_plan_pipeline_output_handling`
-branching on the string `'copy'` in `spec.db_loader`). What did *not*
-land in 0.6.2 was the actual producer-consumer wiring: no path in
-`runner.py` calls `to_row_source()`, constructs a `RowProjection`, or
-hands a `_ProjectedRowSource` to a COPY loader. `db_loader='copy'`
-remains rejected at every public boundary, and the helpers are dormant
-production code exercised only by direct unit tests. 0.6.4 shipped
-Phase 5 as `task_core/db_copy.py` (policy, spool directory, filename
-grammar + header, type-neutral spool format, streaming inference-state
-accumulator, target-aware COPY-text serializer, current-run cleanup and
-positive-ownership cleanup primitives, and
-`prepare_copy_source()` orchestrator) and wired the runner into it via
-the new `_prepare_copy_source_for_pipeline` helper in `export.py`;
-`db_loader='copy'` remains rejected at every public boundary, so the
-composition is exercised only by helper-level tests. Phase 6 integrates
-`copy_expert()` against the publisher's DBAPI connection and activates
-`'copy'` publicly, at which point those helpers become reachable from a
-real pipeline run for the first time. 0.6.5 corrected defects found in the
-first Phase 5 review: raw pandas/NumPy values now pass through the accepted
-normalization kernel; inferred pass-2 serialization preserves widening rather
-than applying declared-only strict validation; `db_type_overrides`,
-`db_not_null_columns`, declared-column ordering, exact row counts and the
-configured `CopyLoadPolicy` all reach the composed path. It also replaced raw
-spool bodies with a versioned container whose bodies use AES-256-GCM by
-default, added the per-task plaintext opt-out, and hardened current-run and
-positive-ownership cleanup. Phase 6 remains the first database execution of
-COPY. 0.6.3 corrected the 0.6.2 language that described the
+Phases 1 and 2 shipped in 0.6.0 (commit `1c55a42`), together with
+Phase 3a. 0.6.2 shipped the Phase 3b row-source/projection helpers and the
+Phase 4 traversal-planning skeleton; 0.6.3 corrected overstatements about
+that skeleton and tightened one-shot and projection invariants. 0.6.4 shipped
+the internal Phase 5 spool-preparation chain. 0.6.5 restored full INSERT/COPY
+preparation parity, added encrypted spool bodies by default with explicit
+per-task opt-out, and hardened current-run and positive-ownership cleanup
+primitives.
+
+0.6.6 ships Phase 6: `db_loader='copy'` is public, `run_pipelines()` builds the
+one-shot payload, `DbPublisher` prepares the spool before its staging
+transaction, and `db_copy.load_copy_into_staging()` streams the authenticated
+COPY-text body through psycopg2 `copy_expert()` on the existing connection.
+The publisher removes the final spool before successful preparation commit and
+retains ownership of verification, comments, rollback and publication.
+Unit tests prove exact SQL construction, bounded authenticated reader use,
+connection-loss invalidation, current-run cleanup and no runner pre-count.
+Live PostgreSQL acceptance is still Phase 8 evidence, not claimed by 0.6.6.
+Phase 7 wiring of predecessor-spool cleanup under the task advisory lock also
+remains pending.
+
+0.6.3 corrected the 0.6.2 language that described the
 runner as a "real consumer" of `DbRowSource` — it consumes the *string*
 `'copy'`, not a `DbRowSource` object — and tightened four correctness
 gaps found by external review: `_PetlRawRowSource` walking the

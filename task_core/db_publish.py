@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
 import logging
 import math
+import os
 import re
 import random
 import time
@@ -24,6 +25,13 @@ from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
 from task_core.db_insert import load_rows_into_staging
+from task_core.db_copy import (
+    SpoolIdentity,
+    cleanup_spool_paths,
+    load_copy_into_staging,
+    prepare_copy_source,
+    resolve_spool_directory,
+)
 from task_core.types import (
     DB_LOADERS, DbRowSource, OutputColumn, PORTABLE_IDENTIFIER_RE,
     find_duplicates, validate_db_loader, validate_payload_source_state,
@@ -81,9 +89,8 @@ class DbPayload:
     schema: str
     columns: list[str]
     # None means "this payload's rows are carried by row_source, not
-    # materialized". Only reachable for db_loader='copy', which is still
-    # rejected publicly by validate_db_loader; see validate_payload_source_state
-    # below and ADR 0011 §Row-source contract.
+    # materialized". Public COPY payloads use this state; INSERT payloads keep
+    # the materialized mapping list. See ADR 0011 §Row-source contract.
     rows: list[dict[str, Any]] | None
     type_overrides: dict[str, Any] | None = None
     db_table_id_pix: Any | None = None
@@ -93,9 +100,8 @@ class DbPayload:
     # 'replace' or 'refill'. Carried from PipelineSpec so publication can
     # select the mechanism without re-deriving it from the schema source.
     publication_strategy: str = 'replace'
-    # 'insert' -- the only implemented loader. Same value repeated on the
-    # payload so a direct DbPayload/from_petl/from_pandas caller cannot
-    # bypass the spec-level validation. See ADR 0011.
+    # 'insert' or 'copy'. Repeated on the payload so direct construction
+    # cannot bypass loader/source-state validation. See ADR 0011.
     db_loader: str = 'insert'
     # Positional-stability rule (same one that added db_publication_strategy
     # after every 0.5.0 field): appended AFTER every 0.6.0 field so any
@@ -103,6 +109,10 @@ class DbPayload:
     # meaning. Only meaningful when db_loader='copy'; None on the insert
     # path. See ADR 0011 §Row-source contract for the state matrix.
     row_source: DbRowSource | None = None
+    # Per-task override for CopyLoadPolicy.encrypt_spools. Appended after
+    # every existing payload field so older positional construction keeps
+    # its meaning. None inherits the publisher policy.
+    copy_spool_encryption: bool | None = None
 
     def __post_init__(self):
         validate_publication_strategy(
@@ -116,6 +126,10 @@ class DbPayload:
             field_name='db_loader',
             error_type=DbPublishError,
         )
+        if self.copy_spool_encryption is not None and type(
+            self.copy_spool_encryption
+        ) is not bool:
+            raise DbPublishError('copy_spool_encryption must be bool or None')
         # Enforced here, not only per-field, because the invariant is on
         # the pair (loader, rows/row_source) and no single field carries
         # enough context to check it alone. Runs after validate_db_loader
@@ -467,7 +481,10 @@ def from_pandas(
 # table_adapters._ADAPTERS, and same reason for `if ... raise` over
 # `assert`: python -O strips asserts and the guarantee would silently
 # disappear in the mode most likely to run in production.
-LOADERS = {'insert': load_rows_into_staging}
+LOADERS = {
+    'insert': load_rows_into_staging,
+    'copy': load_copy_into_staging,
+}
 
 if set(LOADERS) != set(DB_LOADERS):
     raise RuntimeError(
@@ -1141,6 +1158,7 @@ class DbPublisher:
         publication_lock_policy=None,
         publication_plan=None,
         task_name,
+        copy_load_policy=None,
     ):
         self.creds = validate_pg_creds(
             creds,
@@ -1159,6 +1177,12 @@ class DbPublisher:
                 raise DbPublishError('type_infer_sample_size must be a positive integer or None')
         self.identifier_policy = identifier_policy or DEFAULT_IDENTIFIER_POLICY
         self.publication_lock_policy = publication_lock_policy or PublicationLockPolicy()
+        self.copy_load_policy = copy_load_policy or CopyLoadPolicy()
+        if not isinstance(self.copy_load_policy, CopyLoadPolicy):
+            raise DbPublishError(
+                f'copy_load_policy must be a CopyLoadPolicy, '
+                f'got {self.copy_load_policy!r}'
+            )
         self.max_identifier_bytes = self.identifier_policy.max_identifier_bytes
         # Work queued by the runner and executed inside the publication
         # transaction, so the source-state write is atomic with the swaps
@@ -1623,67 +1647,100 @@ class DbPublisher:
             validate_identifier(column, limit, kind='column name', context=context)
             validate_portable_identifier(column, kind='column name', context=context)
 
+    def _prepare_copy_payload(self, payload: DbPayload):
+        """Consume one COPY row source into the final encrypted spool.
+
+        Runs before the preparation transaction opens. The returned schema is
+        authoritative for staging DDL, and the exact row count replaces every
+        former ``len(payload.rows)`` assumption on the COPY path.
+        """
+        if payload.row_source is None:
+            raise DbPublishInvariantError(
+                "internal invariant violated -- COPY payload has no row_source"
+            )
+
+        policy = self.copy_load_policy
+        if payload.copy_spool_encryption is not None:
+            policy = replace(
+                policy, encrypt_spools=payload.copy_spool_encryption,
+            )
+            if not policy.encrypt_spools:
+                self.log.warning(
+                    'COPY spool encryption disabled by DbPayload for %s.%s',
+                    payload.schema, payload.table_name,
+                )
+
+        resolved_framework_columns = tuple(
+            ResolvedColumn(
+                column.name,
+                _resolve_declared_type(column.type),
+                column.nullable,
+            )
+            for column in payload.framework_columns
+        )
+        if payload.output_schema is not None:
+            declared_columns = tuple(
+                ResolvedColumn(
+                    column.name,
+                    _resolve_declared_type(column.type),
+                    column.nullable,
+                )
+                for column in payload.output_schema
+            ) + resolved_framework_columns
+        else:
+            declared_columns = None
+
+        identity = SpoolIdentity(
+            task=self.task_name,
+            target_schema=payload.schema or '<default-schema>',
+            target_table=payload.table_name,
+            run_start_utc=datetime.now(timezone.utc),
+            pid=os.getpid(),
+        )
+        return prepare_copy_source(
+            row_source=payload.row_source.iter_rows(),
+            columns=payload.columns,
+            declared_schema=declared_columns,
+            identity=identity,
+            directory=resolve_spool_directory(policy),
+            policy=policy,
+            framework_columns=resolved_framework_columns,
+            type_overrides=payload.type_overrides,
+            not_null_columns=payload.not_null_columns,
+        )
+
     def publish(self, payload: DbPayload):
         """Prepare one output for publication, in its own committed
         transaction. The live table is not touched.
 
-        This is the preparation half of the staged model. Rows go into a
-        run-owned staging table with the resolved inferred or declared
-        schema; the staging table is validated, marked with ownership metadata, and
-        committed. The live table stays readable and unlocked until
-        commit() publishes every prepared target atomically.
-
-        Preparation can afford O(n) work -- it is already O(n) inserting --
-        which is why validation lives here rather than in the publication
-        phase. Replacement then remains row-independent catalog work. Explicit
-        refill is the deliberate exception: it performs a second O(rows) write
-        while the live target is locked.
-
-        Committing here rather than holding one transaction for the whole
-        run is what bounds transaction duration: WAL accumulation, vacuum
-        delay, catalog lock retention and late-rollback cost all scale with
-        how long a transaction stays open, and a run that reads workbooks
-        over SMB between publishes can stay open for a very long time.
-
-        The cost is that rollback is no longer the cleanup mechanism -- see
-        rollback() and docs/decisions/0005.
+        INSERT resolves from materialized mappings. COPY consumes its one-shot
+        source into a bounded encrypted spool before the transaction opens,
+        then streams that spool through the existing psycopg2 connection into
+        the same ordinary logged staging table. From staging verification
+        onward both loaders use one publication protocol.
         """
         self._require_task_lock('publish')
 
-        # DbPayload is mutable because framework columns are appended after
-        # adapter construction. Revalidate here so a direct caller cannot
-        # construct a valid payload and then mutate the strategy into an
-        # unsupported or incoherent value before publication.
         validate_publication_strategy(
             payload.publication_strategy,
             output_schema=payload.output_schema,
             field_name='publication_strategy',
             error_type=DbPublishError,
         )
-
-        # Revalidated here, not only in DbPayload.__post_init__, because
-        # DbPayload is a plain dataclass (not frozen) -- payload.db_loader
-        # can change between construction and publish(). Placed before
-        # source processing, the preparation transaction and staging DDL,
-        # so a configuration failure never leaves staging DDL or a
-        # transaction behind, per ADR 0011 (a configuration error before
-        # source execution or staging DDL). _require_task_lock() above is
-        # intentionally earlier -- a direct caller who has not acquired
-        # the task lock should still fail with the lock error rather than
-        # the loader error. Same reason validate_publication_strategy is
-        # revalidated a few lines above.
         validate_db_loader(
             payload.db_loader,
             field_name='db_loader',
             error_type=DbPublishError,
         )
+        validate_payload_source_state(
+            payload.db_loader, payload.rows, payload.row_source,
+            error_type=DbPublishError,
+        )
+        if payload.copy_spool_encryption is not None and type(
+            payload.copy_spool_encryption
+        ) is not bool:
+            raise DbPublishError('copy_spool_encryption must be bool or None')
 
-        # Startup cleanup scans exactly one schema -- the publisher's. A
-        # payload prepared into a different one would leave an orphan that
-        # no future run ever scans, which quietly breaks the cleanup
-        # guarantee for that schema. The runner always passes pg_schema, so
-        # this only binds direct and custom callers; the invariant belongs
-        # to the publisher regardless.
         if payload.schema != self.schema:
             raise DbPublishError(
                 f'payload targets schema {payload.schema!r} but this publisher is '
@@ -1698,10 +1755,6 @@ class DbPublisher:
         staging_name = staging_table_name(
             payload.schema, payload.table_name, self._run_token, max_bytes=limit,
         )
-        # Asserted immediately after generation. Should be impossible --
-        # staging_table_name() sizes the prefix to fit -- which is exactly
-        # why it is worth asserting: it protects the guarantee against a
-        # future edit that quietly breaks it.
         validate_identifier(
             staging_name, limit, kind='generated staging name',
             context=f'{payload.table_name!r}: ', invariant=True,
@@ -1713,80 +1766,98 @@ class DbPublisher:
                 f'{payload.schema}.{staging_name} (target {payload.table_name!r})'
             )
 
-        # Resolve and validate the complete schema before the transaction
-        # opens. Inferred mode may scan rows; declared mode validates every
-        # normalized value against the explicit contract. Neither needs a
-        # database transaction.
-        resolved_schema = _resolve_payload_schema(
-            payload, sample_size=self.type_infer_sample_size,
-        )
-        staging_table = self._build_table(
-            payload, resolved_schema=resolved_schema, table_name=staging_name,
-        )
+        prepared_copy = None
+        try:
+            if payload.db_loader == 'copy':
+                prepared_copy = self._prepare_copy_payload(payload)
+                # Declared preparation may reorder columns. The staging table,
+                # verification and later INSERT FROM staging must all use the
+                # authoritative resolved order, not the source projection order.
+                payload.columns = [column.name for column in prepared_copy.columns]
+                resolved_schema = ResolvedSchema(
+                    columns=prepared_copy.columns,
+                    source=(
+                        'declared' if payload.output_schema is not None else 'inferred'
+                    ),
+                )
+                expected_rows = prepared_copy.row_count
+                loader_input = prepared_copy
+            else:
+                resolved_schema = _resolve_payload_schema(
+                    payload, sample_size=self.type_infer_sample_size,
+                )
+                expected_rows = len(payload.rows)
+                loader_input = payload.rows
 
-        conn = self.ensure_connection()
-        self._ensure_transaction()
+            staging_table = self._build_table(
+                payload, resolved_schema=resolved_schema, table_name=staging_name,
+            )
 
-        self.log.info(
-            'preparing %s.%s as %s rows=%s schema=%s',
-            payload.schema, payload.table_name, staging_name, len(payload.rows),
-            resolved_schema.source,
-        )
+            conn = self.ensure_connection()
+            self._ensure_transaction()
 
-        # NO drop-first. `drop(checkfirst=True)` bypassed the cleanup safety
-        # rule completely: an object already at this name -- with no
-        # comment, an invalid one, or another owner -- was erased anyway.
-        # Reproduced directly: a table holding unrelated data was silently
-        # replaced.
-        #
-        # After predecessor cleanup and a fresh run token, an existing exact
-        # name is a collision or an invariant violation, not something to
-        # tidy away. Let PostgreSQL raise 'relation already exists'.
-        staging_table.create(conn)
+            self.log.info(
+                'preparing %s.%s as %s rows=%s schema=%s loader=%s',
+                payload.schema, payload.table_name, staging_name, expected_rows,
+                resolved_schema.source, payload.db_loader,
+            )
 
-        loader = LOADERS[payload.db_loader]
-        loaded = loader(
-            conn, staging_table, payload.rows, self.chunk_size,
-        )
+            # No drop-first: after predecessor cleanup and a fresh run token,
+            # an existing exact name is a collision, not something to erase.
+            staging_table.create(conn)
 
-        self._verify_prepared_table(payload, staging_name, loaded)
-        self._attach_staging_comment(payload, staging_name)
+            loader = LOADERS[payload.db_loader]
+            loaded = loader(
+                conn, staging_table, loader_input, self.chunk_size,
+            )
 
-        # Committed here. A staging table is created, loaded, validated,
-        # commented and committed in ONE transaction, so committed + owned
-        # means publishable -- there is no window in which a committed
-        # staging table is incomplete, and therefore no 'ready' flag to
-        # track. A validation failure rolls this transaction back and
-        # leaves nothing behind.
-        self._commit_transaction()
+            # The final spool contains business data and its key exists only on
+            # PreparedCopySource. Remove it before the staging transaction can
+            # commit. A cleanup failure on the success path is fatal; on a COPY
+            # failure the except block retries cleanup without replacing the
+            # primary exception.
+            if prepared_copy is not None:
+                failed_cleanup = cleanup_spool_paths([prepared_copy.path])
+                if failed_cleanup:
+                    raise DbPublishError(
+                        f'could not remove completed COPY spool(s): '
+                        f'{failed_cleanup!r}'
+                    )
+                prepared_copy = None
 
-        full_name = f'{payload.schema}.{payload.table_name}'
-        table_result = DbTableResult(
-            schema=payload.schema,
-            table_name=payload.table_name,
-            full_name=full_name,
-            rows=len(payload.rows),
-            db_table_id_pix=payload.db_table_id_pix,
-        )
-        # Reported under the FINAL name, never the staging one -- the
-        # RunResult is what tasks log, and a staging identifier appearing
-        # there would be noise at best and misleading at worst.
-        self._generated_names.add(key)
-        self._written_tables.append(table_result)
-        self._table_rows[full_name] = table_result.rows
-        target_key = (payload.schema, payload.table_name)
-        self._resolved_schemas[target_key] = resolved_schema
-        # THE reversal (0.5.1). This was `if resolved_schema.source ==
-        # 'declared'`, which made refill mandatory for every declared
-        # output and the fastest combination -- declared + replace --
-        # unreachable. Schema source and publication strategy are
-        # orthogonal: one says where the shape comes from, the other how
-        # new data replaces old.
-        if payload.publication_strategy == 'refill':
-            self._refill_targets.add(target_key)
-        self._pending_swaps.append((payload.schema, payload.table_name, staging_name, len(payload.rows)))
+            self._verify_prepared_table(
+                payload, staging_name, loaded, expected_rows=expected_rows,
+            )
+            self._attach_staging_comment(payload, staging_name)
+            self._commit_transaction()
 
-    def _verify_prepared_table(self, payload, staging_name, loaded):
+            full_name = f'{payload.schema}.{payload.table_name}'
+            table_result = DbTableResult(
+                schema=payload.schema,
+                table_name=payload.table_name,
+                full_name=full_name,
+                rows=expected_rows,
+                db_table_id_pix=payload.db_table_id_pix,
+            )
+            self._generated_names.add(key)
+            self._written_tables.append(table_result)
+            self._table_rows[full_name] = table_result.rows
+            target_key = (payload.schema, payload.table_name)
+            self._resolved_schemas[target_key] = resolved_schema
+            if payload.publication_strategy == 'refill':
+                self._refill_targets.add(target_key)
+            self._pending_swaps.append((
+                payload.schema, payload.table_name, staging_name, expected_rows,
+            ))
+            return table_result
+        except BaseException:
+            if prepared_copy is not None:
+                cleanup_spool_paths([prepared_copy.path])
+            raise
+
+    def _verify_prepared_table(
+        self, payload, staging_name, loaded, *, expected_rows=None,
+    ):
         """Mechanical integrity of what was just written, inside the same
         transaction that wrote it.
 
@@ -1795,22 +1866,20 @@ class DbPublisher:
         and putting them here would make every task pay for one task's
         rule.
 
-        Row count is authoritative BECAUSE the payload is fully
-        materialized before any insert begins: len(payload.rows) is the
-        exact set of dicts handed to the driver, not an expectation carried
-        from the source. Counted in the chunking loop rather than taken
-        from the driver, because SQLAlchemy reports
-        supports_sane_multi_rowcount=False for psycopg2 -- confirmed
-        directly -- so a driver rowcount after executemany would be
-        measuring the rewritten statement, not the logical rows. This
-        guards our chunking, and says so rather than claiming to guard the
-        database.
+        ``expected_rows`` is the exact logical source count: INSERT uses the
+        materialized mapping length; COPY uses the one-shot count captured
+        while preparing the spool. The loader returns the number it attempted
+        to send, which catches chunking/dispatch drift before commit. This is
+        deliberately not presented as an independent ``COUNT(*)`` check of
+        PostgreSQL storage.
         """
-        if loaded != len(payload.rows):
+        if expected_rows is None:
+            expected_rows = len(payload.rows)
+        if loaded != expected_rows:
             raise DbPublishInvariantError(
                 f'internal invariant violated -- {payload.table_name!r}: loaded '
-                f'{loaded} rows into {staging_name} but the payload held '
-                f'{len(payload.rows)}'
+                f'{loaded} rows into {staging_name} but preparation produced '
+                f'{expected_rows}'
             )
 
         actual = self._reflect_column_names(payload.schema, staging_name)

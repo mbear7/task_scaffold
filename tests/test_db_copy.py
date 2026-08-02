@@ -39,6 +39,7 @@ from task_core.db_copy import (
     SpoolIdentity,
     cleanup_predecessor_spools,
     cleanup_spool_paths,
+    load_copy_into_staging,
     compose_ownership_token,
     compose_spool_filename,
     open_spool_for_read,
@@ -1761,8 +1762,8 @@ class Test18PrepareCopySourceRoundTripsFromRowSourceToCopyTextSpool(unittest.Tes
     """The orchestrator drives pass 1 (neutral spool + inference) and
     pass 2 (copytext), reaps the neutral on success, and returns an immutable
     preparation result with the final path, resolved columns, exact count and
-    bounded reader. This is the shape Phase 6 will hand to the database
-    transport, so the round-trip contract must be nailed down here.
+    bounded reader. Phase 6 hands this shape to the database transport, so
+    the round-trip contract is pinned here independently of PostgreSQL.
     """
 
     def test_success_path_returns_copytext_path_and_resolved_columns(self):
@@ -2316,3 +2317,167 @@ class Test24CloseAndWriteFailureSemantics(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Test19DbapiCopyTransport(unittest.TestCase):
+    class _Cursor:
+        def __init__(self, owner, *, error=None, close_error=None):
+            self.owner = owner
+            self.error = error
+            self.close_error = close_error
+            self.closed = False
+
+        def copy_expert(self, sql, reader, size):
+            self.owner.copy_sql = sql
+            self.owner.copy_size = size
+            if self.error is not None:
+                raise self.error
+            self.owner.copy_body = reader.read()
+
+        def close(self):
+            self.closed = True
+            if self.close_error is not None:
+                raise self.close_error
+
+    class _Raw:
+        def __init__(self, *, error=None, close_error=None):
+            self.error = error
+            self.close_error = close_error
+            self.closed = 0
+            self.cursor_instance = None
+            self.copy_sql = None
+            self.copy_size = None
+            self.copy_body = None
+
+        def cursor(self):
+            self.cursor_instance = Test19DbapiCopyTransport._Cursor(
+                self, error=self.error, close_error=self.close_error,
+            )
+            return self.cursor_instance
+
+    class _Proxy:
+        def __init__(self, raw):
+            self.driver_connection = raw
+
+    class _Conn:
+        def __init__(
+            self, raw, *, postgres=True, driver='psycopg2', disconnect=False,
+        ):
+            from sqlalchemy.dialects.postgresql.base import PGDialect
+            dialect = PGDialect()
+            dialect.name = 'postgresql' if postgres else 'sqlite'
+            dialect.driver = driver
+            dialect.is_disconnect = lambda exc, connection, cursor: disconnect
+            self.dialect = dialect
+            self.connection = Test19DbapiCopyTransport._Proxy(raw)
+            self.invalidate_calls = []
+
+        def invalidate(self, exc=None):
+            self.invalidate_calls.append(exc)
+
+    def _prepared(self, directory, *, encrypt=True):
+        identity = SpoolIdentity(
+            task='copy_transport', target_schema='bsr', target_table='target',
+            run_start_utc=_RUN_START, pid=123,
+        )
+        return prepare_copy_source(
+            row_source=[(1, 'x'), (2, None)],
+            columns=('id', 'name'),
+            declared_schema=(
+                ResolvedColumn('id', sa.BigInteger(), nullable=False),
+                ResolvedColumn('name', sa.Text(), nullable=True),
+            ),
+            identity=identity,
+            directory=Path(directory),
+            policy=CopyLoadPolicy(
+                spool_directory=Path(directory),
+                buffer_bytes=4096,
+                encrypt_spools=encrypt,
+            ),
+        )
+
+    def _table(self):
+        return sa.Table(
+            'stage_table', sa.MetaData(),
+            sa.Column('id', sa.BigInteger(), nullable=False),
+            sa.Column('name', sa.Text()),
+            schema='bsr',
+        )
+
+    def test_streams_authenticated_reader_through_existing_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = self._prepared(tmp, encrypt=True)
+            raw = self._Raw()
+            conn = self._Conn(raw)
+            try:
+                loaded = load_copy_into_staging(
+                    conn, self._table(), prepared, 999,
+                )
+                self.assertEqual(loaded, 2)
+                self.assertEqual(raw.copy_body, b'1\tx\n2\t\\N\n')
+                self.assertEqual(raw.copy_size, 4096)
+                self.assertIn('COPY bsr.stage_table (id, name) FROM STDIN', raw.copy_sql)
+                self.assertIn("DELIMITER E'\\t'", raw.copy_sql)
+                self.assertIn("NULL E'\\\\N'", raw.copy_sql)
+                self.assertTrue(raw.cursor_instance.closed)
+                self.assertEqual(conn.invalidate_calls, [])
+            finally:
+                cleanup_spool_paths([prepared.path])
+
+    def test_rejects_non_postgresql_or_non_psycopg2_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = self._prepared(tmp, encrypt=False)
+            try:
+                with self.assertRaisesRegex(DbPublishError, 'PostgreSQL'):
+                    load_copy_into_staging(
+                        self._Conn(self._Raw(), postgres=False),
+                        self._table(), prepared,
+                    )
+                with self.assertRaisesRegex(DbPublishError, 'psycopg2'):
+                    load_copy_into_staging(
+                        self._Conn(self._Raw(), driver='psycopg'),
+                        self._table(), prepared,
+                    )
+            finally:
+                cleanup_spool_paths([prepared.path])
+
+    def test_closed_driver_connection_invalidates_sqlalchemy_connection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = self._prepared(tmp, encrypt=True)
+            failure = RuntimeError('connection terminated')
+            raw = self._Raw(error=failure)
+            raw.closed = 2
+            conn = self._Conn(raw)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'terminated'):
+                    load_copy_into_staging(conn, self._table(), prepared)
+                self.assertEqual(conn.invalidate_calls, [failure])
+                self.assertTrue(raw.cursor_instance.closed)
+            finally:
+                cleanup_spool_paths([prepared.path])
+
+    def test_dialect_disconnect_detection_invalidates_when_closed_flag_is_clear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = self._prepared(tmp, encrypt=True)
+            failure = RuntimeError('server closed the connection unexpectedly')
+            raw = self._Raw(error=failure)
+            self.assertEqual(raw.closed, 0)
+            conn = self._Conn(raw, disconnect=True)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'unexpectedly'):
+                    load_copy_into_staging(conn, self._table(), prepared)
+                self.assertEqual(conn.invalidate_calls, [failure])
+            finally:
+                cleanup_spool_paths([prepared.path])
+
+    def test_cursor_close_failure_does_not_replace_copy_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = self._prepared(tmp, encrypt=False)
+            primary = RuntimeError('copy failed')
+            raw = self._Raw(error=primary, close_error=OSError('close failed'))
+            conn = self._Conn(raw)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'copy failed'):
+                    load_copy_into_staging(conn, self._table(), prepared)
+            finally:
+                cleanup_spool_paths([prepared.path])

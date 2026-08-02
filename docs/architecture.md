@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.6.5. This describes the present system, not
+How `task_core` works as of 0.6.6. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -27,7 +27,7 @@ level 2   context.py                  task_context: lazy resources, close-once
           binding.py                  ResourceSpec, bind(), wiring
           resources/                  excel, file_set, db
           db_publish.py               DbPublisher, payload construction
-          db_copy.py                  COPY-loader spool preparation
+          db_copy.py                  COPY spool preparation + DBAPI transport
           source_state.py             SourceStateStore
           table_adapters.py           petl / pandas behind one interface
           export.py
@@ -92,11 +92,12 @@ for each pipeline in run_sequence:
     resolve bound resources (lazily constructed on first use)
     run the pipeline
     validate the returned table via the adapter
-    stabilize if it will be traversed more than once
-    count rows
+    stabilize if another consumer requires a second traversal
+    count rows up front except for database-only COPY
     publish_result → store in the context for later pipelines
     export Excel if enabled
-    prepare the DB payload if enabled (its own committed transaction)
+    prepare and load the DB payload if enabled (its own committed transaction)
+    database-only COPY obtains its exact row count during spool preparation
 
 queue the source-state write
 publisher.commit()         publication transaction: verify, write source
@@ -265,11 +266,12 @@ Values are normalized on the way in: pandas and numpy scalars become
 plain Python objects, and every flavour of missing value becomes `None`.
 Containers are left alone — a one-element list is a value, not a scalar.
 
-The internal COPY-preparation path applies the same normalization once while
-consuming its one-shot positional row source. It writes a type-neutral local
-spool while accumulating schema state, resolves one schema at EOF, then
-replays into a final PostgreSQL COPY-text body. This path is wired and tested
-but remains publicly gated until Phase 6 integrates `copy_expert()`.
+The COPY path applies the same normalization once while consuming its
+one-shot positional row source. It writes a type-neutral local spool while
+accumulating schema state, resolves one schema at EOF, replays into a final
+PostgreSQL COPY-text body, and streams that body through psycopg2
+`copy_expert()` on the publisher's existing connection and preparation
+transaction. No decrypted temporary file is created.
 
 ### Type inference
 
@@ -327,9 +329,12 @@ downstream consumers.
 
 ### Staging and publication
 
-`publish()` prepares one output in its own committed transaction: it creates a
-staging table from the resolved inferred or declared schema, loads it, verifies
-it, attaches ownership metadata, and commits. The live table is untouched.
+`publish()` prepares one output in its own committed transaction: it resolves
+or prepares the schema, creates a staging table, loads it through INSERT or
+COPY, verifies it, attaches ownership metadata, and commits. COPY spool
+preparation happens before that transaction; the final spool is removed after
+successful database consumption and before the preparation transaction commits.
+The live table is untouched.
 
 `commit()` is the publication phase. It verifies every prepared artifact,
 preflights only targets explicitly configured for refill, creates and fills an
@@ -496,12 +501,13 @@ anything, so a failure part-way through does not leave it half-open.
 ## Extension points
 
 - **`PublisherConfig`** — one frozen object holding `publisher_factory`,
-  `identifier_policy` and `publication_lock_policy`, passed to
+  `identifier_policy`, `publication_lock_policy` and `copy_load_policy`, passed to
   `run_pipelines()` as `publisher_config`. A factory is anything with
   `publish`, `commit`, `rollback`, `close`, `begin_run`,
   `ensure_connection`, and the four result properties; it is constructed
   with `creds`, `schema`, `logger`, `identifier_policy`,
-  `publication_lock_policy`, `publication_plan` and `task_name`. May optionally provide a `preflight` classmethod; if
+  `publication_lock_policy`, `publication_plan`, `task_name` and
+  `copy_load_policy`. May optionally provide a `preflight` classmethod; if
   it does not, the real `DbPublisher.preflight` is used, so validation
   always runs.
 - **`build_context`** — the task supplies its own, or uses

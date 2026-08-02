@@ -38,9 +38,9 @@ from task_core.types import (
 )
 from task_core.source_state import build_source_state_store, update_source_state
 from task_core.export import (
+    _build_copy_payload_with_spec,
     _build_db_payload_with_spec,
     _export_excel_with_spec,
-    _prepare_copy_source_for_pipeline,
 )
 from task_core.table_adapters import get_table_adapter
 from task_core.binding import PipelineBinding
@@ -108,10 +108,8 @@ def validate_pipeline_class(task_cls, *, pipeline_name=None):
     # to change shape after adapter.to_row_source() has already handed
     # out its source columns -- there is no coherent semantics for it.
     # Rejected structurally, mirroring the output_schema rejection above.
-    # ADR 0011 §Tests requires this even though db_loader='copy' is still
-    # rejected at every public boundary in 0.6.5 -- Phase 6 lifts the
-    # loader gate and this check then guards the newly-reachable
-    # combination without needing to be introduced at that time.
+    # COPY itself is public in 0.6.6; this check guards the still-invalid
+    # dynamic-contract combination before any resource or row source is built.
     if spec.db_loader == 'copy' and has_dynamic_contract:
         raise PipelineContractError(
             f'{name}: db_loader=\'copy\' cannot be combined with '
@@ -292,17 +290,11 @@ def _plan_pipeline_output_handling(
     see different data). Row count is instead read from the publisher's
     result after the source has been streamed.
 
-    ``db_loader='copy'`` is still rejected by ``validate_db_loader`` at
-    every public boundary, so no shipped pipeline reaches the copy
-    branch through normal configuration -- it is exercised in isolation
-    by ``tests/test_db_publish.py``'s ``Test17dRunnerCopyBranching``,
-    which is why the parameter is passed in rather than pulled from
-    ``spec.db_loader`` inline. The 0.6.2 phrasing that this helper made
-    the runner "the real consumer of the row-source contract" was
-    overstated: the branching consumes the *string* ``'copy'``, not a
-    ``DbRowSource`` object -- see the 0.6.3 CHANGELOG note. The actual
-    producer-consumer wiring (``to_row_source`` -> ``RowProjection`` ->
-    a COPY consumer) lands with Phase 5.
+    ``db_loader='copy'`` is public in 0.6.6. This helper still accepts the
+    loader string explicitly because traversal planning depends on whether a
+    database COPY consumer is active, not on the table engine. The real runner
+    path then builds a one-shot row source and obtains the exact count from the
+    publisher after staging preparation.
     """
     # bool() around each ``a and b`` idiom so the returned tuple is
     # (bool, bool) rather than (whatever_truthy_str, bool). Callers use
@@ -321,9 +313,7 @@ def _plan_pipeline_output_handling(
     # consumer will traverse). Without this gate, the post-publish
     # branch in run_pipelines() that reads the row count from
     # publisher.table_rows never runs for a copy pipeline with
-    # output_db=False, and pipeline_rows silently omits it -- a
-    # dormant KeyError today only because db_loader='copy' is still
-    # rejected at every public boundary.
+    # output_db=False, and pipeline_rows would silently omit it.
     copy_publication_active = bool(
         db_loader == 'copy' and output_db and spec.db_table
     )
@@ -518,6 +508,7 @@ def run_pipelines(
                 publication_lock_policy=config.publication_lock_policy,
                 publication_plan=publication_plan,
                 task_name=ctx.task_name,
+                copy_load_policy=config.copy_load_policy,
             )
 
             # The task advisory lock, before anything else touches the
@@ -662,49 +653,24 @@ def run_pipelines(
 
             if output_db and spec.db_table:
                 if spec.db_loader == 'copy':
-                    # Phase 5.h scaffolding: compose the row-source ->
-                    # projection -> spool chain and immediately reap
-                    # the resulting copytext file. Phase 6 replaces
-                    # cleanup_spool_paths([copytext_path]) with the
-                    # real copy_expert() transport via publisher, and
-                    # pipeline_rows will then be populated from
-                    # publisher.table_rows the same way the INSERT
-                    # branch below already does when a row count is
-                    # not pre-counted. See ADR 0011 §Phase 6.
-                    #
-                    # Reachable via public API only after Phase 6 lifts
-                    # the db_loader='copy' rejection in
-                    # validate_db_loader; today the branch is exercised
-                    # by direct helper tests, matching the pattern
-                    # already established by Test17dRunnerCopyBranching.
-                    from task_core.db_copy import cleanup_spool_paths
-                    prepared = _prepare_copy_source_for_pipeline(
+                    payload = _build_copy_payload_with_spec(
                         pipeline_cls, out_tbl, spec, pg_schema,
-                        task_name=ctx.task_name,
                         run_started_at=run_started_at,
-                        policy=config.copy_load_policy,
                     )
-                    failed_cleanup = cleanup_spool_paths([prepared.path])
-                    if failed_cleanup:
-                        raise RuntimeError(
-                            'could not remove completed COPY spool(s): '
-                            f'{failed_cleanup!r}'
-                        )
-                    pipeline_rows[pipeline_name] = prepared.row_count
-                else:
-                    payload = _build_db_payload_with_spec(pipeline_cls, out_tbl, spec, pg_schema, run_started_at=run_started_at)
                     publisher.publish(payload)
-                    # precount_via_nrows is True on every reachable
-                    # INSERT path today (_plan_pipeline_output_handling
-                    # returns False for precount only on the COPY
-                    # branch, which is handled above and never falls
-                    # through to publisher.publish). The row count for
-                    # the log line and RunResult has therefore already
-                    # been recorded before publish; the "read from
-                    # publisher.table_rows after streaming" pattern
-                    # returns in Phase 6 when copy_expert() lands
-                    # inside publisher.publish rather than as a
-                    # separate branch here.
+                    full_name = f'{pg_schema}.{spec.db_table}'
+                    rows = publisher.table_rows[full_name]
+                    pipeline_rows[pipeline_name] = rows
+                    log.info(
+                        'pipeline %s finished, rows=%s',
+                        pipeline_name, rows,
+                    )
+                else:
+                    payload = _build_db_payload_with_spec(
+                        pipeline_cls, out_tbl, spec, pg_schema,
+                        run_started_at=run_started_at,
+                    )
+                    publisher.publish(payload)
 
         if publisher is not None:
             if source_check_enabled:

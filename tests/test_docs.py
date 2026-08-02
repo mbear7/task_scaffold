@@ -95,8 +95,7 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
     def test_the_adapter_interface_is_the_documented_five_plus_validate(self):
         # to_row_source is the COPY-path counterpart to to_db_payload,
         # added in 0.6.2 for ADR 0011 §Row-source contract. It is
-        # exercised only when db_loader='copy' (currently rejected at
-        # every public boundary) but is part of the adapter interface
+        # exercised when db_loader='copy' and part of the adapter interface
         # rather than a hidden helper because the runner reaches for it
         # by name; keeping it in this documented surface makes any
         # future removal or rename fail visibly here.
@@ -548,8 +547,9 @@ class Test8DbCopyBoundary(unittest.TestCase):
     enforcement. A helper reached through a transitive import is not
     caught by grep-of-Import; a `connect()` on an engine variable named
     something exotic is not caught by grep-of-Attribute-name. The current
-    module is pure file/bytes/schema work and clean on both, so the
-    lightweight form is enough today.
+    module performs bounded file/bytes/schema preparation and opens only a
+    cursor on the connection supplied by the publisher; it does not own an
+    engine, connection or transaction. The lightweight form is enough today.
     """
 
     _SOURCE = Path('task_core/db_copy.py').read_text(encoding='utf-8')
@@ -597,18 +597,17 @@ class Test8DbCopyBoundary(unittest.TestCase):
 
     def test_db_copy_never_creates_an_engine_or_second_connection(self):
         forbidden = {'create_engine', 'connect', 'URL'}
-        # Narrower than db_insert's set: db_copy legitimately calls
-        # methods named 'create' on filesystem paths (e.g. Path().touch()
-        # analogues) and on internal dataclasses, and it holds no DBAPI
-        # objects at all. Restricting to the three names that mean 'open
-        # a database connection' keeps this a real tripwire rather than a
-        # noisy one.
+        # Narrower than db_insert's set: db_copy legitimately calls methods
+        # named 'create' on filesystem paths and opens a cursor on the DBAPI
+        # connection passed by the publisher. Restricting the tripwire to
+        # operations that create or obtain another connection keeps the test
+        # aligned with the actual ownership rule.
         calls = set(self._all_attribute_and_name_calls())
         offenders = sorted(forbidden & calls)
         self.assertEqual(
             offenders, [],
-            f'db_copy calls {offenders}: spool preparation is pure '
-            f'file/bytes/schema work; no database connection is opened here',
+            f'db_copy calls {offenders}: it may use the supplied DBAPI '
+            f'connection, but must not create or obtain another one',
         )
 
 

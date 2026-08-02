@@ -1,23 +1,22 @@
 # -*- coding: utf-8 -*-
-"""COPY loader subsystem: local spool preparation for db_loader='copy'.
+"""COPY loader subsystem: bounded spool preparation and DBAPI transport.
 
 Layering (ADR 0011 §Implementation sequence):
 
     db_publish  ->  db_copy  ->  db_values
 
-`db_copy` is one level *below* `db_publish`. It knows nothing about
-publication, staging tables, advisory locks, transactions, or the
-`DbPublisher` class. It cannot import `db_publish`, cannot open or manage
-a database transaction (no `.begin(`, `.commit(`, `.rollback(`), and
-cannot create engines or connections. Everything here is pure
-file/bytes/schema work.
+`db_copy` is one level *below* `db_publish`. It knows nothing about live-table
+publication, advisory locks, transaction boundaries, or the `DbPublisher`
+class. It cannot import `db_publish`, begin/commit/roll back transactions, or
+create an engine or connection. Phase 6 adds one narrow database operation:
+it opens a cursor on the SQLAlchemy connection supplied by the publisher and
+streams a prepared spool through psycopg2 `copy_expert()` into an already
+created staging table.
 
-The module is deliberately name-clean of those forbidden identifiers even
-in comments, so the Phase 5.i AST-based architecture tests can enforce
-the boundary by simple grep-of-Import + grep-of-Attribute.
+The module is deliberately name-clean of the forbidden transaction and engine
+operations so the architecture tests can enforce that ownership boundary.
 
-Public shape as of 0.6.5 (still gated until Phase 6 lifts the public
-rejection of `db_loader='copy'`):
+Public shape as of 0.6.6:
 
 - `CopyLoadPolicy`               - config dataclass, moved here from
                                     db_publish in 0.6.4 so its home
@@ -83,11 +82,9 @@ log = logging.getLogger(__name__)
 class CopyLoadPolicy:
     """Where and how the COPY loader spools rows before database transport.
 
-    Three settings, all with defaults that keep every existing insert-path
-    caller unchanged: `db_loader='copy'` remains publicly rejected in
-    0.6.5, so this object has no observable effect yet. Phase 6 lifts
-    the rejection and turns these defaults into the ones tasks inherit
-    when they set `db_loader='copy'` without overriding anything.
+    Three settings, all with defaults that keep every existing INSERT-path
+    caller unchanged. Tasks using `db_loader='copy'` inherit these settings
+    unless a task-level override is explicitly supplied.
 
     `spool_directory=None` means "resolve at consumption time via the
     platform tempdir". Nothing here creates the directory or touches
@@ -1687,6 +1684,129 @@ def cleanup_predecessor_spools(
     return (deleted, preserved)
 
 
+# --- DBAPI COPY transport ----------------------------------------------
+
+
+def _build_copy_sql(conn, staging_table, columns: Sequence[ResolvedColumn]) -> str:
+    """Build one defensively quoted PostgreSQL COPY FROM STDIN statement.
+
+    The serializer writes text rows with tab delimiters and ``\\N`` as the
+    NULL marker. The SQL must describe that exact grammar; changing one side
+    without the other would silently corrupt values rather than merely reduce
+    performance.
+    """
+    dialect = getattr(conn, 'dialect', None)
+    if dialect is None or getattr(dialect, 'name', None) != 'postgresql':
+        raise DbPublishError(
+            'COPY loader requires a SQLAlchemy PostgreSQL connection'
+        )
+    if getattr(dialect, 'driver', None) not in (None, 'psycopg2'):
+        raise DbPublishError(
+            f"COPY loader requires SQLAlchemy's psycopg2 dialect, got "
+            f"{getattr(dialect, 'driver', None)!r}"
+        )
+
+    preparer = dialect.identifier_preparer
+    table_sql = preparer.format_table(staging_table)
+    column_sql = ', '.join(preparer.quote(column.name) for column in columns)
+    # SQL text E'\\\\N' represents the two-character COPY NULL marker
+    # backslash + N. The input serializer emits that marker only for None;
+    # literal text ``\\N`` is escaped as ``\\\\N`` in the row body.
+    return (
+        f'COPY {table_sql} ({column_sql}) FROM STDIN '
+        "WITH (FORMAT text, DELIMITER E'\\t', NULL E'\\\\N')"
+    )
+
+
+def _get_driver_connection(conn):
+    """Return the existing psycopg2 connection behind SQLAlchemy.
+
+    No engine or second connection is created. SQLAlchemy 2.x exposes the
+    DBAPI connection as ``Connection.connection.driver_connection``. The
+    legacy ``.connection`` fallback keeps the helper usable with older test
+    doubles and SQLAlchemy 2.0 proxy shapes without importing psycopg2.
+    """
+    proxy = getattr(conn, 'connection', None)
+    if proxy is None:
+        raise DbPublishError(
+            'COPY loader could not access the SQLAlchemy DBAPI connection'
+        )
+    raw = getattr(proxy, 'driver_connection', None)
+    if raw is None:
+        raw = getattr(proxy, 'connection', None)
+    if raw is None or not callable(getattr(raw, 'cursor', None)):
+        raise DbPublishError(
+            'COPY loader could not access the existing psycopg2 connection'
+        )
+    return raw
+
+
+def load_copy_into_staging(conn, staging_table, prepared, _chunk_size=None) -> int:
+    """Stream one prepared COPY-text spool into an existing staging table.
+
+    The caller owns the SQLAlchemy transaction, staging DDL, verification,
+    commit/rollback and spool cleanup. This function opens only a cursor on
+    the existing DBAPI connection and returns the exact logical row count
+    captured during Phase 5 preparation.
+    """
+    if not isinstance(prepared, PreparedCopySource):
+        raise DbPublishError(
+            f'COPY loader requires PreparedCopySource, got '
+            f'{type(prepared).__name__}'
+        )
+    copy_sql = _build_copy_sql(conn, staging_table, prepared.columns)
+    raw = _get_driver_connection(conn)
+    cursor = raw.cursor()
+    primary_error = None
+    try:
+        with prepared.open_reader() as reader:
+            # psycopg2 copy_expert() pulls from the file-like object in bounded
+            # chunks. Reading through authenticated EOF is what verifies the
+            # final AES-GCM tag; no decrypted temporary file is created.
+            cursor.copy_expert(copy_sql, reader, size=prepared.buffer_bytes)
+        return prepared.row_count
+    except BaseException as exc:
+        primary_error = exc
+        # Bypassing SQLAlchemy's execute() layer means a psycopg2 exception is
+        # not automatically classified by the dialect or used to invalidate
+        # the SQLAlchemy Connection. Ask the dialect as well as checking the
+        # driver's closed flag: psycopg2 does not set ``closed`` for every
+        # disconnect shape. Invalidating here preserves DbPublisher's fatal
+        # no-reconnect rule for the advisory-lock-owning session.
+        disconnected = bool(getattr(raw, 'closed', 0))
+        if not disconnected and isinstance(exc, Exception):
+            is_disconnect = getattr(conn.dialect, 'is_disconnect', None)
+            if callable(is_disconnect):
+                try:
+                    disconnected = bool(is_disconnect(exc, raw, cursor))
+                except BaseException:
+                    log.exception(
+                        'secondary error while classifying a COPY connection '
+                        'failure; preserving primary exception'
+                    )
+        if disconnected:
+            invalidate = getattr(conn, 'invalidate', None)
+            if callable(invalidate):
+                try:
+                    invalidate(exc)
+                except BaseException:
+                    log.exception(
+                        'secondary error while invalidating a lost COPY '
+                        'connection; preserving primary exception'
+                    )
+        raise
+    finally:
+        try:
+            cursor.close()
+        except BaseException:
+            if primary_error is None:
+                raise
+            log.exception(
+                'secondary error while closing psycopg2 COPY cursor; '
+                'preserving primary exception'
+            )
+
+
 # --- Orchestrator ------------------------------------------------------
 
 def prepare_copy_source(
@@ -1733,9 +1853,9 @@ def prepare_copy_source(
     retries; a cleanup failure is logged without replacing the primary
     exception and may be reaped by a later positively-owned cleanup pass.
 
-    Internally wired in 0.6.5, but `db_loader='copy'` remains publicly
-    rejected until Phase 6 supplies the database transport and lifts the
-    gate.
+    In 0.6.6 this preparation result is consumed by the same-connection
+    psycopg2 COPY transport. The caller still owns transaction boundaries,
+    staging DDL, publication and final spool cleanup.
     """
     # --- Input validation (all before any file is created) ------------
     if policy is None:
@@ -2029,5 +2149,7 @@ __all__ = [
     'open_spool_for_read',
     'cleanup_spool_paths',
     'cleanup_predecessor_spools',
+    '_build_copy_sql',
+    'load_copy_into_staging',
     'prepare_copy_source',
 ]

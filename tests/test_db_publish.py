@@ -1942,15 +1942,14 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
     seam itself -- since the seam only earns its keep if a test can
     prove the loader flows through it."""
 
-    def test_direct_payload_rejects_copy_by_name(self):
+    def test_direct_copy_payload_requires_one_shot_source_not_rows(self):
         with self.assertRaises(DbPublishError) as caught:
             DbPayload(
                 table_name='t', schema=None, columns=['v'],
                 rows=[{'v': 1}], db_loader='copy',
             )
         message = str(caught.exception)
-        self.assertIn('not implemented', message)
-        self.assertIn('0011', message)
+        self.assertIn("requires row_source", message)
 
     def test_direct_payload_rejects_unknown_loader(self):
         with self.assertRaises(DbPublishError) as caught:
@@ -1984,10 +1983,9 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
     def test_mutated_payload_loader_is_revalidated_at_publish_boundary(self):
         # DbPayload is not frozen, so payload.db_loader can be reassigned
         # after construction. Without revalidation at the publish boundary
-        # the LOADERS dispatch would still fail closed (KeyError), but
-        # with the wrong message -- callers would see a Python-level
-        # missing-key trace instead of the "not implemented, see 0011"
-        # explanation the payload boundary exists to deliver. Mirrors
+        # the LOADERS dispatch would receive a materialized payload on the
+        # one-shot path. Revalidation must report the source-state defect
+        # before any staging DDL. Mirrors
         # test_mutated_payload_strategy_is_revalidated_at_publish_boundary
         # in test_declared_schema.py for the same reason.
         #
@@ -2017,8 +2015,7 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         with self.assertRaises(DbPublishError) as caught:
             publisher.publish(payload)
         message = str(caught.exception)
-        self.assertIn('not implemented', message)
-        self.assertIn('0011', message)
+        self.assertIn('requires row_source', message)
 
         added = conn.statements[before_publish:]
         offending = [s for s in added if 'create table' in s.lower()]
@@ -2441,12 +2438,9 @@ class Test17dRunnerCopyBranching(unittest.TestCase):
     Lives in test_db_publish.py rather than a runner-specific file
     because the branching rule is a consequence of the row-source
     contract, and the row-source contract is what this file tests.
-    db_loader='copy' is still rejected at every public spec/payload
-    boundary in 0.6.2, so the (db_loader='copy', ...) legs here are
-    exercised by calling the helper directly -- exactly the pattern
-    the user asked for: dormant production code, exercised by direct
-    helper tests, so the runner is already the real consumer of the
-    row-source contract when the transport lands.
+    COPY is public in 0.6.6. These tests call the planning helper directly so
+    traversal semantics remain isolated from database transport and adapter
+    implementation.
     """
 
     def _spec(self, **overrides):
@@ -2542,8 +2536,7 @@ class Test17dRunnerCopyBranching(unittest.TestCase):
         # `if output_db and spec.db_table:` guard, so with output_db
         # off the row count MUST come from nrows() up front. Without
         # the gate, pipeline_rows silently omits this pipeline: a
-        # dormant KeyError today only because db_loader='copy' is
-        # rejected publicly.
+        # no publisher row count exists when output_db is disabled.
         result = self._call(
             db_loader='copy', spec=self._spec(),
             output_db=False, output_excel=False,
@@ -2576,6 +2569,101 @@ class Test17dRunnerCopyBranching(unittest.TestCase):
         self.assertEqual(result, (False, True))
 
 
+class Test17d2RunnerCopyEndToEnd(unittest.TestCase):
+    def test_copy_path_skips_nrows_and_publishes_one_shot_payload(self):
+        import petl as etl
+        from unittest.mock import patch
+        from task_core.table_adapters import get_table_adapter
+
+        instances = []
+
+        class FakePublisher:
+            @classmethod
+            def preflight(cls, specs, *, schema, **kwargs):
+                return None
+
+            def __init__(self, *, schema, **kwargs):
+                self.schema = schema
+                self._rows = {}
+                self._written = []
+                self._committed = False
+                instances.append(self)
+
+            def begin_run(self):
+                return True
+
+            def publish(self, payload):
+                self.assert_payload(payload)
+                rows = list(payload.row_source.iter_rows())
+                from task_core.db_publish import DbTableResult
+                result = DbTableResult(
+                    schema=payload.schema,
+                    table_name=payload.table_name,
+                    full_name=f'{payload.schema}.{payload.table_name}',
+                    rows=len(rows),
+                )
+                self._rows[result.full_name] = result.rows
+                self._written.append(result)
+                return result
+
+            @staticmethod
+            def assert_payload(payload):
+                if payload.db_loader != 'copy' or payload.rows is not None:
+                    raise AssertionError('runner did not build a COPY row-source payload')
+
+            def commit(self):
+                self._committed = True
+                return []
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+            committed = property(lambda self: self._committed)
+            committed_tables = property(lambda self: [])
+            written_tables = property(lambda self: list(self._written))
+            table_rows = property(lambda self: dict(self._rows))
+
+        class pipeline:
+            spec = tc.PipelineSpec(
+                db_table='target',
+                table_adapter='petl',
+                db_loader='copy',
+                output_schema=(
+                    tc.OutputColumn('id', sa.BigInteger(), nullable=False),
+                ),
+            )
+
+            @classmethod
+            def run(cls, ctx):
+                return etl.wrap([('id',), (1,), (2,)])
+
+        adapter = get_table_adapter('petl')
+        ctx = tc.task_context(task_name='t', loaders={})
+        with patch.object(
+            adapter, 'nrows', side_effect=AssertionError('nrows must not run'),
+        ):
+            result = tc.run_pipelines(
+                task_name='t',
+                build_context=lambda: ctx,
+                pipelines={'p': pipeline},
+                run_sequence=['p'],
+                output_excel=False,
+                output_db=True,
+                creds=_CREDS,
+                pg_schema='bsr',
+                publisher_config=tc.PublisherConfig(
+                    publisher_factory=FakePublisher,
+                ),
+            )
+
+        self.assertEqual(result.pipeline_rows, {'p': 2})
+        self.assertTrue(result.db.committed)
+        self.assertEqual(len(instances), 1)
+
+
 class Test17eComposeCopySourceForPipeline(unittest.TestCase):
     """_prepare_copy_source_for_pipeline (task_core/export.py) is the
     Phase 5.h composition helper: given a task class, its output table,
@@ -2587,9 +2675,8 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
     Lives in test_db_publish.py rather than a runner-specific file for
     the same reason Test17dRunnerCopyBranching does: the composition
     IS the row-source contract in motion, and the row-source contract
-    is what this file tests. db_loader='copy' remains publicly rejected
-    at every spec/payload boundary in 0.6.5, so the helper is
-    exercised by direct calls here.
+    is what this file tests. The public Phase 6 path uses the same composition;
+    direct calls here keep spool preparation testable without PostgreSQL.
     """
 
     def _make_spec(self, **overrides):
@@ -2723,25 +2810,23 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
         # OutputColumn's 'TIMESTAMPTZ' type alias.
         self.assertTrue(resolved[-1].type.timezone)
 
-    def test_dynamic_contract_fn_is_called_and_wins_over_spec(self):
-        # get_dynamic_db_contract at the class level takes precedence
-        # over spec.db_contract on the INSERT path (same rule); the
-        # COPY helper mirrors that. Also verifies the fn is called with
-        # the actual output table, not the class or the spec.
+    def test_dynamic_contract_is_rejected_before_source_consumption(self):
         calls = []
-        spec = self._make_spec(db_contract={'id': 'wrong_from_spec'})
+        spec = self._make_spec(db_contract={'id': 'static_target'})
 
         class pipeline:
             @classmethod
             def get_dynamic_db_contract(cls, tbl):
                 calls.append(tbl)
-                return {'id': 'right_from_fn'}
+                return {'id': 'dynamic_target'}
 
         tbl = self._petl_table(('id',), (1,))
-        path, resolved, body = self._run_helper(pipeline, tbl, spec)
-        self.assertEqual([c.name for c in resolved], ['right_from_fn'])
-        self.assertEqual(len(calls), 1)
-        self.assertIs(calls[0], tbl)
+        with self.assertRaisesRegex(
+            tc.PipelineContractError,
+            r"db_loader='copy'.*get_dynamic_db_contract",
+        ):
+            self._run_helper(pipeline, tbl, spec)
+        self.assertEqual(calls, [])
 
     def test_missing_db_table_raises_pipeline_contract_error(self):
         # The helper is only meaningful when a table will be published;
@@ -2776,6 +2861,107 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
             self.assertEqual(prepared.protection, PROTECTION_NONE)
             with prepared.open_reader() as reader:
                 self.assertEqual(reader.read(), b'1\n')
+
+
+class Test17fPublisherCopyIntegration(unittest.TestCase):
+    class _OneShotSource:
+        def __init__(self, rows):
+            self.rows = list(rows)
+            self.claims = 0
+
+        def iter_rows(self):
+            if self.claims:
+                raise DbPublishError('row source has already been consumed')
+            self.claims += 1
+            yield from self.rows
+
+    def _payload(self, source):
+        return DbPayload(
+            table_name='target',
+            schema=None,
+            columns=['amount', 'id'],
+            rows=None,
+            output_schema=(
+                tc.OutputColumn('id', sa.BigInteger(), nullable=False),
+                tc.OutputColumn('amount', sa.Text(), nullable=True),
+            ),
+            db_loader='copy',
+            row_source=source,
+        )
+
+    def _publisher(self, conn, spool_dir):
+        from task_core.db_copy import CopyLoadPolicy
+        publisher = DbPublisher(
+            creds=_CREDS,
+            schema=None,
+            task_name='copy_task',
+            copy_load_policy=CopyLoadPolicy(
+                spool_directory=Path(spool_dir),
+                buffer_bytes=1024,
+                encrypt_spools=True,
+            ),
+        )
+        publisher._conn = conn
+        publisher._engine = object()
+        publisher.begin_run()
+        return publisher
+
+    def test_prepares_loads_reorders_counts_and_reaps_before_commit(self):
+        from task_core import db_publish as module
+        source = self._OneShotSource([('a', 1), ('b', 2)])
+        conn = Test17PreparationValidationAndOwnership._Conn(
+            columns=['id', 'amount'],
+        )
+        captured = {}
+        original = module.LOADERS['copy']
+
+        def fake_copy_loader(conn_arg, staging_table, prepared, chunk_size):
+            self.assertIs(conn_arg, conn)
+            self.assertTrue(prepared.path.exists())
+            with prepared.open_reader() as reader:
+                captured['body'] = reader.read()
+            captured['columns'] = [column.name for column in prepared.columns]
+            return prepared.row_count
+
+        with tempfile.TemporaryDirectory() as tmp:
+            publisher = self._publisher(conn, tmp)
+            module.LOADERS['copy'] = fake_copy_loader
+            try:
+                result = publisher.publish(self._payload(source))
+            finally:
+                module.LOADERS['copy'] = original
+
+            self.assertEqual(result.rows, 2)
+            self.assertEqual(source.claims, 1)
+            self.assertEqual(captured['columns'], ['id', 'amount'])
+            self.assertEqual(captured['body'], b'1\ta\n2\tb\n')
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            self.assertEqual(publisher.table_rows['None.target'], 2)
+            self.assertEqual(publisher._pending_swaps[-1][-1], 2)
+
+    def test_copy_failure_preserves_primary_and_reaps_final_spool(self):
+        from task_core import db_publish as module
+        source = self._OneShotSource([('a', 1)])
+        conn = Test17PreparationValidationAndOwnership._Conn(
+            columns=['id', 'amount'],
+        )
+        original = module.LOADERS['copy']
+
+        def failing_loader(_conn, _table, prepared, _chunk_size):
+            self.assertTrue(prepared.path.exists())
+            raise RuntimeError('deliberate COPY failure')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            publisher = self._publisher(conn, tmp)
+            module.LOADERS['copy'] = failing_loader
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'deliberate COPY failure'):
+                    publisher.publish(self._payload(source))
+            finally:
+                module.LOADERS['copy'] = original
+                publisher.rollback()
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            self.assertEqual(source.claims, 1)
 
 
 class Test18ConnectionLossIsFatal(unittest.TestCase):
@@ -4386,13 +4572,10 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
 
 
 class Test29CopyLoadPolicyValidation(unittest.TestCase):
-    """CopyLoadPolicy is the public knob set for the COPY loader's
-    spool machinery. In 0.6.5 its defaults have no observable effect --
-    db_loader='copy' is still publicly rejected -- but the validation
-    still has to fire now, because a bad configuration must be visible
-    before any resource is built (same rule IdentifierPolicy and
-    PublicationLockPolicy already follow). ADR 0011 §Local spool design
-    covers the semantics; this file only covers the boundary.
+    """CopyLoadPolicy is the public knob set for the COPY loader's spool
+    machinery. In 0.6.6 its defaults are active for COPY pipelines, and invalid
+    configuration must still fail before any resource is built. ADR 0011
+    §Local spool design covers the semantics; this file covers the boundary.
     """
 
     def test_defaults(self):

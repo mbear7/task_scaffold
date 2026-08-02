@@ -9,6 +9,46 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.6
+
+Phase 6 of ADR 0011 connects the prepared encrypted COPY spool to PostgreSQL
+through psycopg2 `copy_expert()` and makes `db_loader='copy'` a public loader.
+The change preserves `DbPublisher` ownership of the existing connection,
+transaction, staging DDL, verification, comments, rollback and publication.
+
+### Added
+- **Same-connection DBAPI COPY transport.** `db_copy.load_copy_into_staging()`
+  opens only a cursor on the SQLAlchemy connection supplied by the publisher,
+  streams `PreparedCopySource.open_reader()` into `copy_expert()`, and returns
+  the exact row count captured during Phase 5 preparation. It creates no
+  engine or second connection and owns no transaction boundary.
+- **Public COPY pipeline path.** `DB_LOADERS` and publisher dispatch now include
+  `'copy'`; `run_pipelines()` builds a one-shot row-source payload, skips
+  `nrows()` on database-only COPY output, and obtains the exact count from the
+  publisher after preparation.
+- **COPY payload preparation inside `DbPublisher`.** The publisher prepares the
+  spool before opening the staging transaction, creates staging from the
+  authoritative prepared schema, loads and verifies the exact count, removes
+  the final current-run spool, and registers the existing pending-publication
+  artifact.
+
+### Failure handling
+- A raw driver connection reported closed during COPY explicitly invalidates
+  the SQLAlchemy connection so the existing fatal no-reconnect rule remains
+  effective.
+- COPY, authentication and cursor errors preserve the primary exception;
+  current-run spool cleanup is attempted on every path, and successful
+  preparation cannot commit while its final spool remains undeleted.
+
+### Tests
+- Added exact COPY SQL/quoting and bounded-reader tests, lost-connection
+  invalidation, cursor-close precedence, publisher success/failure cleanup,
+  declared reordering through the public path, and a runner test proving COPY
+  does not call `nrows()`.
+- Complete unit suite: 759 tests. Live PostgreSQL acceptance remains Phase 8
+  and is not claimed by this release.
+
+
 ## 0.6.5
 
 Phase 5 of ADR 0011 was corrected and hardened before DBAPI COPY integration.

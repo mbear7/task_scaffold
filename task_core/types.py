@@ -137,13 +137,12 @@ def validate_publication_strategy(
     return value
 
 
-# How rows travel from the fully-materialized payload into the staging
-# table. Same engine-neutral vocabulary rule as PUBLICATION_STRATEGIES:
-# only values that are actually implemented appear here. 'copy' is
-# named separately in validate_db_loader() below so a task author who
-# tries to set it gets the accurate reason ("not implemented") rather
-# than the generic "not one of DB_LOADERS", per ADR 0011.
-DB_LOADERS = ('insert',)
+# How rows enter the staging table. Same engine-neutral vocabulary rule
+# as PUBLICATION_STRATEGIES: only values backed by a complete transport
+# appear here. INSERT consumes materialized mappings; COPY consumes a
+# one-shot positional row source, prepares a bounded local spool, and
+# streams it through PostgreSQL COPY FROM STDIN.
+DB_LOADERS = ('insert', 'copy')
 
 
 def validate_db_loader(
@@ -159,11 +158,6 @@ def validate_db_loader(
     if not isinstance(value, str):
         raise error_type(
             f'{field_name} must be a str, got {type(value).__name__}'
-        )
-    if value == 'copy':
-        raise error_type(
-            f"{field_name}='copy' is not implemented -- only 'insert' is "
-            "accepted. See docs/decisions/0011."
         )
     if value not in DB_LOADERS:
         raise error_type(
@@ -202,10 +196,8 @@ def validate_payload_source_state(
     after ``validate_db_loader`` so ``loader`` is already known to be a
     supported value.
 
-    'copy' is still rejected publicly by ``validate_db_loader``; the
-    ``loader='copy'`` leg here is reachable only by direct callers
-    exercising the state matrix in isolation, and by future code that
-    implements the transport.
+    Both legs are public in 0.6.6. COPY callers must supply the one-shot
+    row source and must not also materialize a row list.
     """
     if loader == 'insert':
         if rows is None:
@@ -286,8 +278,7 @@ class PipelineSpec:
     # 'refill' requires output_schema: it needs the target's physical schema
     # to remain stable across runs, and only a declaration can promise that.
     db_publication_strategy: str | None = None
-    # 'insert' is the only implemented value. 'copy' is rejected by name
-    # rather than silently accepted -- see ADR 0011. Appended after every
+    # Implemented values are 'insert' and 'copy'. Appended after every
     # 0.5.1 field for the same API-hygiene reason.
     db_loader: str = 'insert'
     # Secure default is inherited from PublisherConfig.copy_load_policy.
