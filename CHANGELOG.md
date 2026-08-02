@@ -9,6 +9,108 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.4
+
+Phase 5 of ADR 0011 landed as one flat commit: the internal row-source →
+spool-preparation chain for `db_loader='copy'`, plus the runner wiring
+that composes and hands off a `_ProjectedRowSource`. `db_loader='copy'`
+remains rejected at every public boundary; the new module and its
+composition are exercised only by helper-level tests. Phase 6 will lift
+the public rejection and integrate `copy_expert()`. Callers using the
+default `db_loader='insert'` observe no API or behavioral change.
+
+### Added
+- **`task_core/db_copy.py`** -- new level-2 module, the COPY-loader
+  spool-preparation subsystem. Public shape (still test-only):
+  `CopyLoadPolicy` (moved from `db_publish.py` so its home matches its
+  layer, re-exported), `SpoolFormatError`, `SPOOL_STAGES`,
+  `SPOOL_FILENAME_RE`, `compose_ownership_token`,
+  `compose_spool_filename`, `parse_spool_filename`, `write_spool_header`
+  / `read_spool_header`, `resolve_spool_directory`, `SpoolIdentity`,
+  `prepare_copy_source`, `cleanup_spool_paths`. Internal:
+  type-neutral binary spool grammar (write + read), streaming inference
+  accumulator (`_InferenceStreamState` in `db_values.py`), target-aware
+  COPY-text serializer with pass-2 declared-value validation shared with
+  the INSERT path, and success + failure-path cleanup. See ADR 0011
+  §Implementation sequence Phase 5.
+- **`_prepare_copy_source_for_pipeline`** in `task_core/export.py` --
+  runner-side composition of the row-source chain: reads
+  `adapter.to_row_source()`, resolves framework columns from
+  `spec.db_updated_at` via `_build_framework_columns`, builds a
+  `RowProjection` for `db_contract` + framework, wraps in
+  `_ProjectedRowSource`, and hands the iterator to
+  `prepare_copy_source()`. Runner branches into it via the Phase 4
+  planning skeleton. Publicly unreachable in 0.6.4 because
+  `db_loader='copy'` is still rejected; helper-level tests exercise the
+  full composition.
+- **`framework_columns` kwarg on `prepare_copy_source()`** -- pins
+  resolved framework-column types by name after inferred-mode
+  accumulation, mirroring the INSERT path's `_resolve_payload_schema`
+  bypass at `db_values.py:722-725`. Inference resolves the datetime
+  family to naive `sa.DateTime()`; without the bypass, an aware
+  `etl_updated_at` value would fail pass-2 validation against the
+  inferred naive column type. With it, declared-mode value validation
+  stays byte-identical between the two loaders.
+
+### Fixed
+- **`_validate_declared_value` at `db_values.py:706` now receives
+  `payload.table_name`, not the full `DbPayload`.** The 5.x refactor
+  that made `_validate_declared_value` stateless (so the same kernel
+  serves both the INSERT-path `_resolve_payload_schema` pass and the
+  COPY-path pass-2 in `db_copy.serialize_row_to_copytext`) updated
+  every internal `_declared_value_error` call but missed the top-level
+  call site. The regressed contextual error message interpolated the
+  whole payload repr instead of `'target'`, breaking the ADR-required
+  `'{table}': output row N column 'C'.*NUL character` contract that
+  `test_nul_character_in_declared_text_is_rejected_contextually`
+  asserts. Fixed and verified by revert-observe-restore.
+
+### Tests
+- **`Test8DbCopyBoundary`** in `tests/test_docs.py` -- the ADR §Tests
+  module-boundary tripwires for the new loader, mirroring
+  `Test7DbInsertBoundary`: no `DbPublisher` import, no transaction
+  primitives (`begin`, `commit`, `rollback`), no
+  `create_engine`/`URL`/`connect`. AST-scan rather than call-count
+  mocks. Verified by revert-observe-restore against an injected
+  `.begin()` call.
+- **`Test9DbValuesBoundary`** in `tests/test_docs.py` -- the ADR §Tests
+  boundary that the stateless kernel imports neither the publisher nor
+  either loader (`task_core.db_publish`, `task_core.db_insert`,
+  `task_core.db_copy`). Verified by revert-observe-restore against an
+  injected `from task_core.db_insert import ...`.
+- **`tests/test_db_copy.py`** -- direct helper coverage for the new
+  module: policy handling, directory resolution, filename grammar +
+  header, ownership-token digest, neutral spool round-trip,
+  target-aware COPY-text serializer (`NULL`, empty string, literal
+  `\\N`, tabs/newlines/carriage returns/backslashes, Unicode, Decimal
+  precision + scale, Boolean and integer boundaries, non-finite
+  floats, date + both timestamp timezone modes, binary, row-width
+  mismatch, unsupported non-scalar), streaming schema-state parity
+  with the INSERT-path `_infer_column_type` corpus, success + failure
+  cleanup paths, and the `prepare_copy_source()` orchestrator.
+- **`Test17eComposeCopySourceForPipeline`** in `tests/test_db_publish.py`
+  -- runner-side composition helper: patches `validate_db_loader` so
+  `db_loader='copy'` can construct a spec, then asserts
+  `_prepare_copy_source_for_pipeline` returns a copytext spool path
+  and the resolved column list matches declared/inferred expectations
+  including framework-column type pinning.
+- **`test_declared_output_schema_appends_framework_columns_in_order`**
+  in `tests/test_db_publish.py` extended to assert the framework
+  column's resolved SQLAlchemy type carries `timezone=True`, so the
+  INSERT and COPY paths resolve framework columns identically.
+
+### Changed
+- **Level diagram in `docs/architecture.md`** adds `db_copy.py` at
+  level 2 alongside `db_publish.py`, `source_state.py`,
+  `table_adapters.py`, and `export.py`. The lateral-dependencies note
+  records that `db_publish.py` re-exports `CopyLoadPolicy` from
+  `db_copy.py` and that `db_copy` does not import back. Enforced by
+  `Test5TheDocumentedLevelMapMatchesRealImports`.
+- **ADR 0011 §Verification status** notes that 0.6.4 shipped Phase 5
+  (both the internal chain and the runner wiring), with `db_loader='copy'`
+  still publicly rejected pending Phase 6.
+
+
 ## 0.6.3
 
 Correction patch for four gaps external review found against 0.6.2, and

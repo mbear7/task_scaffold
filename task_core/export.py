@@ -22,9 +22,27 @@ exception is db_contract, via the get_dynamic_db_contract hook below.
 """
 
 from datetime import datetime, timezone
+import os
 
 from task_core.types import OutputColumn, PipelineContractError, get_pipeline_spec
 from task_core.table_adapters import get_table_adapter
+
+
+def _build_framework_columns(spec):
+    """Framework-column tuple implied by ``spec`` -- currently just the
+    single ``db_updated_at`` column when enabled, empty otherwise.
+
+    Shared between the INSERT path (``apply_db_updated_at``) and the
+    COPY path (``_prepare_copy_source_for_pipeline``) so the two derive
+    the exact same tuple from the same spec. Duplicating the "read
+    ``spec.db_updated_at``, pick the name" rule was the drift class
+    CLAUDE.md names most often, so a single producer here is required
+    -- not merely nice.
+    """
+    if not spec.db_updated_at:
+        return ()
+    column_name = spec.db_updated_at if isinstance(spec.db_updated_at, str) else 'etl_updated_at'
+    return (OutputColumn(column_name, 'TIMESTAMPTZ', nullable=False),)
 
 
 def apply_db_updated_at(payload, spec, run_started_at=None):
@@ -34,15 +52,20 @@ def apply_db_updated_at(payload, spec, run_started_at=None):
     # plain lists and dicts regardless of which adapter produced them).
     # Never needed engine-specific knowledge in the first place -- it was
     # always operating on task_core's own generic payload shape.
-    if not spec.db_updated_at:
+    framework = _build_framework_columns(spec)
+    if not framework:
         return
+    # Only one framework column today; kept as a tuple so a future
+    # addition passes through _build_framework_columns without a new
+    # mechanism. Destructure here to keep the append/append/append
+    # sequence readable.
+    (framework_column,) = framework
+    column_name = framework_column.name
 
     # Added after db_contract is applied (to_db_payload already ran it),
     # since db_contract's cut(*source_cols) would otherwise silently drop
     # a column added upstream that it doesn't know about. This also keeps
     # Excel export (which uses tbl directly, before this point) unaffected.
-    column_name = spec.db_updated_at if isinstance(spec.db_updated_at, str) else 'etl_updated_at'
-
     if column_name in payload.columns:
         raise PipelineContractError(
             f'{spec.db_table!r}: db_updated_at column {column_name!r} already exists in the '
@@ -56,9 +79,7 @@ def apply_db_updated_at(payload, spec, run_started_at=None):
     for row in payload.rows:
         row[column_name] = run_started_at
 
-    payload.framework_columns = tuple(payload.framework_columns) + (
-        OutputColumn(column_name, 'TIMESTAMPTZ', nullable=False),
-    )
+    payload.framework_columns = tuple(payload.framework_columns) + (framework_column,)
 
 
 def _export_excel_with_spec(tbl, spec):
@@ -111,4 +132,125 @@ def _build_db_payload_with_spec(task_cls, tbl, spec, pg_schema, *, run_started_a
 def build_db_payload(task_cls, tbl, pg_schema, *, run_started_at=None):
     return _build_db_payload_with_spec(
         task_cls, tbl, get_pipeline_spec(task_cls), pg_schema, run_started_at=run_started_at,
+    )
+
+
+def _prepare_copy_source_for_pipeline(
+    task_cls, tbl, spec, pg_schema, *, task_name, run_started_at=None, policy=None,
+):
+    """Compose the Phase 5 COPY chain for one pipeline: adapter row-source
+    reshaped by db_contract + framework columns, spooled through
+    prepare_copy_source() into a target-aware COPY-text file.
+
+    Sits at level 2 alongside _build_db_payload_with_spec because both
+    turn (task_cls, out_tbl, spec, pg_schema) into a publish-ready
+    artefact; runner.py stays engine-neutral by delegating both.
+
+    ``db_loader='copy'`` remains publicly rejected by validate_db_loader
+    at both spec and payload boundaries in 0.6.4, so this helper has no
+    non-test caller yet. Phase 6 will lift that gate, add the real
+    copy_expert() transport, and integrate this composition into
+    publisher.publish(); the runner branch that calls this today is
+    scaffolding for that landing point.
+
+    Returns (copytext_path, resolved_columns). The caller owns the
+    spool from the moment this returns.
+    """
+    # Deferred imports keep export.py's module-level dependency surface
+    # minimal (db_copy is level 2 alongside export; the imports are
+    # acyclic but noisy at the top of the file) and mirror the
+    # dependency direction the tests enforce: nothing at level 2 pulls
+    # in db_copy unconditionally.
+    from task_core.db_publish import RowProjection, _ProjectedRowSource
+    from task_core.db_copy import (
+        CopyLoadPolicy, SpoolIdentity, prepare_copy_source,
+        resolve_spool_directory,
+    )
+    from task_core.db_values import ResolvedColumn, _resolve_declared_type
+
+    if not spec.db_table:
+        raise PipelineContractError(
+            '_prepare_copy_source_for_pipeline requires spec.db_table'
+        )
+
+    # Same rule as _build_db_payload_with_spec: get_dynamic_db_contract
+    # is captured against the pipeline's actual output while every other
+    # field comes from the pre-.run() spec. output_schema + dynamic
+    # contract is rejected upstream at validate_pipeline_class; a
+    # duplicate check here would fire on the same input and is left to
+    # that single owner.
+    dynamic_contract_fn = getattr(task_cls, 'get_dynamic_db_contract', None)
+    if callable(dynamic_contract_fn):
+        db_contract = dynamic_contract_fn(tbl)
+    else:
+        db_contract = spec.db_contract
+
+    if policy is None:
+        policy = CopyLoadPolicy()
+    if run_started_at is None:
+        run_started_at = datetime.now(timezone.utc)
+
+    adapter = get_table_adapter(spec.table_adapter)
+    source_columns, raw_source = adapter.to_row_source(tbl)
+
+    framework_columns = _build_framework_columns(spec)
+    projection = RowProjection.build(
+        source_columns,
+        db_contract=db_contract,
+        framework_columns=framework_columns,
+        run_started_at=run_started_at,
+    )
+    projected_source = _ProjectedRowSource(raw_source, projection)
+
+    # Framework columns as ResolvedColumn using the same OutputColumn
+    # -> concrete TypeEngine converter db_values uses on the INSERT
+    # path, so aware timestamps stay aware regardless of loader. Built
+    # unconditionally: declared mode folds them into declared_columns
+    # (below), inferred mode hands them to prepare_copy_source as the
+    # type-pin argument.
+    resolved_framework_columns = tuple(
+        ResolvedColumn(fw.name, _resolve_declared_type(fw.type), fw.nullable)
+        for fw in framework_columns
+    )
+
+    if spec.output_schema is not None:
+        # Declared mode: convert OutputColumn (which accepts a SA type
+        # instance, class or string alias) into ResolvedColumn
+        # (concrete TypeEngine) exactly the way db_values does on the
+        # INSERT path -- same converter, so declared-mode value
+        # validation stays byte-identical between the two loaders.
+        # Framework columns are appended in projection order.
+        declared_columns = tuple(
+            ResolvedColumn(c.name, _resolve_declared_type(c.type), c.nullable)
+            for c in spec.output_schema
+        ) + resolved_framework_columns
+    else:
+        # Inferred mode: prepare_copy_source runs its own accumulator
+        # on the neutral pass and returns the resolved types. Framework
+        # column types are pinned by the framework_columns kwarg below,
+        # not by declared_columns.
+        declared_columns = None
+
+    identity = SpoolIdentity(
+        task=task_name,
+        target_schema=pg_schema,
+        target_table=spec.db_table,
+        run_start_utc=run_started_at,
+        pid=os.getpid(),
+    )
+    directory = resolve_spool_directory(policy)
+
+    # prepare_copy_source iterates row_source with a plain `for`, so
+    # it needs an iterable; _ProjectedRowSource exposes iteration via
+    # its explicit iter_rows() method (DbRowSource protocol), not
+    # __iter__. Handing the generator over rather than the wrapper
+    # keeps prepare_copy_source unaware of the protocol.
+    return prepare_copy_source(
+        row_source=projected_source.iter_rows(),
+        columns=projection.output_columns,
+        declared_schema=declared_columns,
+        identity=identity,
+        directory=directory,
+        policy=policy,
+        framework_columns=resolved_framework_columns,
     )

@@ -392,6 +392,34 @@ class Test3TechnicalTimestampAndPayloadConstruction(unittest.TestCase):
             )
         self.assertEqual(called, [])
 
+    def test_dynamic_contract_is_rejected_with_copy_loader(self):
+        # ADR 0011 §Tests requires structural rejection of the
+        # (db_loader='copy', get_dynamic_db_contract) combination.
+        # PipelineSpec.__post_init__ still rejects db_loader='copy'
+        # publicly in 0.6.4, so this test patches validate_db_loader to
+        # allow the spec to construct -- the rejection under test lives
+        # at the pipeline-validation layer (runner.validate_pipeline_class),
+        # not at the loader-string boundary that Phase 6 will lift.
+        with mock.patch('task_core.types.validate_db_loader', lambda v, **kw: v):
+            class pipeline:
+                spec = tc.PipelineSpec(
+                    db_table='target',
+                    db_loader='copy',
+                )
+
+                @classmethod
+                def get_dynamic_db_contract(cls, tbl):
+                    return {'id': 'id'}
+
+                @classmethod
+                def run(cls, ctx):
+                    return None
+
+            with self.assertRaisesRegex(
+                tc.PipelineContractError, r"db_loader='copy'.*get_dynamic_db_contract",
+            ):
+                tc.validate_pipeline_class(pipeline)
+
 
 class _Transaction:
     def __init__(self, conn):

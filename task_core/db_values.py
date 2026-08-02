@@ -14,7 +14,7 @@ straight is the whole reason the split exists.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -452,26 +452,26 @@ def _is_aware_datetime(value):
     return value.tzinfo is not None and value.utcoffset() is not None
 
 
-def _declared_value_error(payload, column, row_number, detail):
+def _declared_value_error(table_name, column, row_number, detail):
     raise DbPublishError(
-        f'{payload.table_name!r}: output row {row_number} column {column.name!r} '
+        f'{table_name!r}: output row {row_number} column {column.name!r} '
         f'is incompatible with declared type {column.type}: {detail}'
     )
 
 
-def _validate_numeric_value(payload, column, row_number, value):
+def _validate_numeric_value(table_name, column, row_number, value):
     if type(value) is int:
         decimal_value = Decimal(value)
     elif isinstance(value, Decimal):
         decimal_value = value
     else:
         _declared_value_error(
-            payload, column, row_number,
+            table_name, column, row_number,
             'expected int or Decimal; float-to-NUMERIC conversion is not implicit',
         )
 
     if not decimal_value.is_finite():
-        _declared_value_error(payload, column, row_number, 'non-finite Decimal is not supported')
+        _declared_value_error(table_name, column, row_number, 'non-finite Decimal is not supported')
 
     precision = column.type.precision
     declared_scale = column.type.scale
@@ -496,7 +496,7 @@ def _validate_numeric_value(payload, column, row_number, value):
 
     if effective_scale is not None and fractional_digits > effective_scale:
         _declared_value_error(
-            payload, column, row_number,
+            table_name, column, row_number,
             f'value requires rounding to fit scale {effective_scale}',
         )
 
@@ -505,17 +505,24 @@ def _validate_numeric_value(payload, column, row_number, value):
         max_integer_digits = precision - scale
         if integer_digits > max_integer_digits:
             _declared_value_error(
-                payload, column, row_number,
+                table_name, column, row_number,
                 f'value exceeds NUMERIC({precision}, {scale}) integer-digit capacity',
             )
 
 
-def _validate_declared_value(payload, column, row_number, value):
+def _validate_declared_value(table_name, column, row_number, value):
+    """Enforce declared nullability and type rules for one value.
+
+    Takes `table_name` (not a full payload) so the same kernel serves both
+    the insert path's declared-schema pass in `_resolve_payload_schema` and
+    the COPY path's pass-2 validation in `db_copy.serialize_row_to_copytext`.
+    Keeping this stateless is the entire point of db_values.
+    """
     if value is None:
         if column.nullable:
             return
         raise DbPublishError(
-            f'{payload.table_name!r}: output row {row_number} contains NULL in '
+            f'{table_name!r}: output row {row_number} contains NULL in '
             f'non-nullable column {column.name!r}'
         )
 
@@ -523,12 +530,12 @@ def _validate_declared_value(payload, column, row_number, value):
 
     if family == 'bool':
         if type(value) is not bool:
-            _declared_value_error(payload, column, row_number, 'expected bool')
+            _declared_value_error(table_name, column, row_number, 'expected bool')
         return
 
     if family in {'smallint', 'integer', 'bigint'}:
         if type(value) is not int:
-            _declared_value_error(payload, column, row_number, 'expected int, not bool or another numeric family')
+            _declared_value_error(table_name, column, row_number, 'expected int, not bool or another numeric family')
         range_type = {
             'smallint': sa.SmallInteger,
             'integer': sa.Integer,
@@ -536,53 +543,53 @@ def _validate_declared_value(payload, column, row_number, value):
         }[family]
         lower, upper = _INTEGER_RANGES[range_type]
         if not lower <= value <= upper:
-            _declared_value_error(payload, column, row_number, f'value is outside {family} range')
+            _declared_value_error(table_name, column, row_number, f'value is outside {family} range')
         return
 
     if family == 'numeric':
-        _validate_numeric_value(payload, column, row_number, value)
+        _validate_numeric_value(table_name, column, row_number, value)
         return
 
     if family == 'float':
         if type(value) is not float:
-            _declared_value_error(payload, column, row_number, 'expected float')
+            _declared_value_error(table_name, column, row_number, 'expected float')
         return
 
     if family == 'text':
         if not isinstance(value, str):
-            _declared_value_error(payload, column, row_number, 'expected str')
+            _declared_value_error(table_name, column, row_number, 'expected str')
         if '\x00' in value:
             _declared_value_error(
-                payload, column, row_number,
+                table_name, column, row_number,
                 'NUL character is not supported in PostgreSQL text',
             )
         if column.type.length is not None and len(value) > column.type.length:
             _declared_value_error(
-                payload, column, row_number,
+                table_name, column, row_number,
                 f'text length exceeds VARCHAR({column.type.length})',
             )
         return
 
     if family == 'bytes':
         if not isinstance(value, (bytes, bytearray, memoryview)):
-            _declared_value_error(payload, column, row_number, 'expected bytes-like value')
+            _declared_value_error(table_name, column, row_number, 'expected bytes-like value')
         return
 
     if family == 'date':
         if type(value) is not date:
-            _declared_value_error(payload, column, row_number, 'expected date; datetime-to-DATE conversion is not implicit')
+            _declared_value_error(table_name, column, row_number, 'expected date; datetime-to-DATE conversion is not implicit')
         return
 
     if family == 'datetime':
         if not isinstance(value, datetime):
-            _declared_value_error(payload, column, row_number, 'expected datetime')
+            _declared_value_error(table_name, column, row_number, 'expected datetime')
         aware = _is_aware_datetime(value)
         wants_timezone = bool(column.type.timezone)
         if wants_timezone and not aware:
-            _declared_value_error(payload, column, row_number, 'timezone-aware datetime required')
+            _declared_value_error(table_name, column, row_number, 'timezone-aware datetime required')
         if not wants_timezone and aware:
             _declared_value_error(
-                payload, column, row_number,
+                table_name, column, row_number,
                 'timezone-aware datetime cannot be published to timestamp without time zone',
             )
         return
@@ -696,7 +703,7 @@ def _resolve_payload_schema(payload, *, sample_size):
             for column in resolved.columns:
                 normalized = _normalize_value(row[column.name])
                 row[column.name] = normalized
-                _validate_declared_value(payload, column, row_number, normalized)
+                _validate_declared_value(payload.table_name, column, row_number, normalized)
 
         payload.columns = expected_names
         return resolved
@@ -912,3 +919,62 @@ def _value_family(value):
             return 'bytes'
         case _:
             return 'text'
+
+
+class _InferenceStreamState:
+    """Per-column family accumulator for one-pass row-source inference.
+
+    The COPY path (ADR 0011 §Preparation flows) cannot rewind its input,
+    so the sample-then-verify shape _infer_column_type() uses for the
+    insert path is not available. This class replaces it with a single
+    pass that observes every row: for each column, it grows a family set
+    exactly the way _scan_families() does for the insert path, then
+    resolves via the shared _resolve_families() kernel at EOF.
+
+    Streaming = full-scan semantics: given the same normalized values in
+    the same order, .resolve()[i] returns a type equal to
+    _infer_column_type(rows_as_dicts, columns[i], sample_size=None) for
+    every column. The parity test in tests/test_db_publish.py enforces
+    this over the insert-path corpus.
+
+    Input contract: values must already be normalized to Python-native
+    types (via _normalize_value or an equivalent). Normalization is not
+    layered here so that the same normalized value can also be written
+    to the spool once, without a second pass -- see ADR 0011 §Local
+    spool design. Feeding raw source values (pd.NA, np.int64, ...)
+    would misclassify them the same way _scan_families() would if
+    from_petl/from_pandas skipped their normalization step.
+
+    Bounded memory: one set per column, each at most three entries
+    (the shared _resolve_families() cannot distinguish anything larger,
+    so growth stops once size crosses two). Independent of row count.
+    """
+
+    def __init__(self, column_count: int):
+        if column_count < 1:
+            raise DbPublishError(
+                'inference stream requires at least one column, '
+                f'got {column_count}'
+            )
+        self._column_count = column_count
+        self._family_sets: list[set[str]] = [set() for _ in range(column_count)]
+
+    def feed_row(self, row: Sequence[Any]) -> None:
+        if len(row) != self._column_count:
+            raise DbPublishError(
+                f'row width {len(row)} does not match expected column '
+                f'count {self._column_count}'
+            )
+        for index, value in enumerate(row):
+            families = self._family_sets[index]
+            # Same short-circuit _scan_families uses: three families
+            # can only ever resolve to Text, so any further value in
+            # this column changes nothing.
+            if len(families) > 2:
+                continue
+            if value is None:
+                continue
+            families.add(_value_family(value))
+
+    def resolve(self) -> tuple[sa.types.TypeEngine, ...]:
+        return tuple(_resolve_families(families) for families in self._family_sets)

@@ -46,6 +46,7 @@ from task_core.db_values import (
     _declared_int_parameter,
     _declared_type_family,
     _declared_value_error,
+    _InferenceStreamState,
     _infer_column_type,
     _infer_from_scan,
     _is_aware_datetime,
@@ -840,6 +841,12 @@ class PublicationLockPolicy:
         return statement_ms, lock_ms
 
 
+# CopyLoadPolicy moved to task_core.db_copy in 0.6.4 so its home matches
+# its layer (db_publish -> db_copy -> db_values). Re-exported here so
+# every existing importer keeps working; the class object is the same.
+from task_core.db_copy import CopyLoadPolicy
+
+
 @dataclass(frozen=True)
 class PublisherConfig:
     """Everything about how publication behaves, in one frozen object.
@@ -862,6 +869,11 @@ class PublisherConfig:
     publication_lock_policy: PublicationLockPolicy = field(
         default_factory=PublicationLockPolicy
     )
+    # Positional-stability rule (same one PublisherConfig's other fields
+    # already follow): appended after every prior field so an existing
+    # positional caller keeps its previous meaning. Has no observable
+    # effect until db_loader='copy' is publicly accepted in Phase 6.
+    copy_load_policy: CopyLoadPolicy = field(default_factory=CopyLoadPolicy)
 
     def __post_init__(self):
         # Enforced, not assumed. None on either policy restored exactly the
@@ -877,6 +889,11 @@ class PublisherConfig:
             raise DbPublishError(
                 f'publication_lock_policy must be a PublicationLockPolicy, '
                 f'got {self.publication_lock_policy!r}'
+            )
+        if not isinstance(self.copy_load_policy, CopyLoadPolicy):
+            raise DbPublishError(
+                f'copy_load_policy must be a CopyLoadPolicy, '
+                f'got {self.copy_load_policy!r}'
             )
         if self.publisher_factory is not None and not callable(self.publisher_factory):
             raise DbPublishError(

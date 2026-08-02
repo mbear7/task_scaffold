@@ -32,10 +32,12 @@ FakeDbPublisher couldn't.
 """
 
 import sys
+import tempfile
 import time
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timezone as tz
 from decimal import Decimal
+from pathlib import Path
 
 import pandas as pd
 import sqlalchemy as sa
@@ -58,6 +60,7 @@ from task_core.db_publish import (
     DbPayload,
     from_pandas,
     is_missing,
+    _InferenceStreamState,
     _infer_column_type,
     _normalize_value,
 )
@@ -745,6 +748,148 @@ class Test8SampledTypeInferenceIsVerifiedAgainstUnsampledRows(unittest.TestCase)
         rows = [{'v': i} for i in range(self.SAMPLE)] + [{'v': 3.5}]
         result = _infer_column_type(rows, 'v', sample_size=None)
         self.assertEqual(type(result).__name__, 'Numeric')
+
+
+
+class Test9StreamingInferenceMatchesFullScanInferPerColumn(unittest.TestCase):
+    """The COPY path cannot rewind its source, so the sample-then-verify
+    shape _infer_column_type() uses for the insert path is not
+    available. _InferenceStreamState replaces it with a single pass that
+    grows one family set per column and resolves at EOF via the same
+    _resolve_families() kernel.
+
+    Streaming = full-scan semantics of _infer_column_type. Feed the
+    same normalized values in the same order and every column must
+    resolve to a type equal to
+    _infer_column_type(rows_as_dicts, col, sample_size=None).
+
+    Corpus: the row shapes that already discriminate correct from
+    broken for _infer_column_type -- Test8's silent-widening cases and
+    Test12's leading-null cases -- reused here so any drift between the
+    two mechanisms surfaces on rows this project has already found
+    matter. Multi-column shapes are added on top because a single-column
+    corpus cannot catch a positional-to-column-index mistake, which is
+    the one new failure mode _InferenceStreamState brings over
+    _scan_families (which is called per column, not per row).
+
+    Values fed here are already normalized: _infer_column_type receives
+    payload.rows built by from_petl/from_pandas, which normalizes via
+    _normalize_value before the dict lands in the payload. The
+    accumulator matches that contract -- Phase 5.h will layer
+    normalization above it in the row-source wrapper so the spool sees
+    the same normalized values exactly once. Feeding raw pd.NA /
+    np.int64 here would misclassify them the same way _scan_families
+    would if from_petl skipped its normalization step.
+    """
+
+    def _parity_check(self, columns, rows):
+        rows_as_dicts = [dict(zip(columns, row)) for row in rows]
+        state = _InferenceStreamState(len(columns))
+        for row in rows:
+            state.feed_row(row)
+        streaming = state.resolve()
+        for index, col in enumerate(columns):
+            with self.subTest(column=col):
+                expected = _infer_column_type(
+                    rows_as_dicts, col, sample_size=None,
+                )
+                self.assertEqual(
+                    type(streaming[index]).__name__,
+                    type(expected).__name__,
+                )
+
+    def test_single_column_int(self):
+        self._parity_check(['v'], [(i,) for i in range(20)])
+
+    def test_single_column_int_then_float_widens_to_numeric(self):
+        # Test8's silent-widening shape.
+        rows = [(i,) for i in range(20)] + [(3.5,)]
+        self._parity_check(['v'], rows)
+
+    def test_single_column_int_then_decimal_widens_to_numeric(self):
+        rows = [(i,) for i in range(20)] + [(Decimal('2.5'),)]
+        self._parity_check(['v'], rows)
+
+    def test_single_column_date_then_datetime_widens_to_datetime(self):
+        rows = [(date(2024, 1, 1),) for _ in range(20)]
+        rows.append((datetime(2024, 1, 1, 13, 30),))
+        self._parity_check(['v'], rows)
+
+    def test_single_column_int_then_text_collapses_to_text(self):
+        rows = [(i,) for i in range(20)] + [('N/A',)]
+        self._parity_check(['v'], rows)
+
+    def test_single_column_int_then_bool_collapses_to_text(self):
+        # bool is a subclass of int, but _value_family lists bool first,
+        # so True and False are their own family. {int, bool} resolves
+        # to Text.
+        rows = [(i,) for i in range(20)] + [(True,)]
+        self._parity_check(['v'], rows)
+
+    def test_single_column_leading_nulls_do_not_force_text(self):
+        # Test12's shape: sparse column with a long null prefix. The
+        # accumulator skips None the same way _scan_families does, so
+        # a late non-null row still drives the resolved type.
+        for tail in (1, 1.5, date(2024, 1, 1), datetime(2024, 1, 1)):
+            with self.subTest(tail=tail):
+                rows = [(None,)] * 100 + [(tail,)]
+                self._parity_check(['v'], rows)
+
+    def test_single_column_all_nulls_resolves_to_text(self):
+        # An empty family set resolves to Text via _resolve_families({}) --
+        # the "saw nothing" branch. Whether that is the right business
+        # answer for an all-null column is a separate question the
+        # insert path handles the same way; parity holds either way.
+        self._parity_check(['v'], [(None,)] * 50)
+
+    def test_single_column_zero_rows_resolves_to_text(self):
+        # Streaming EOF with no rows fed: same as _infer_column_type on
+        # an empty list, which resolves to Text via the empty family
+        # set. ADR 0011 §Failure semantics puts the "empty pipeline is
+        # an error" contract in prepare_copy_source(), not the
+        # accumulator; here the accumulator is a pure kernel and only
+        # has to agree with _infer_column_type on the same input.
+        self._parity_check(['v'], [])
+
+    def test_multi_column_independent_types(self):
+        # Positional-to-column-index mapping: each column sees its own
+        # values, not another column's. A shape where every column
+        # resolves to a distinct type is exactly what catches an
+        # off-by-one in the enumerate() step.
+        columns = ['i', 'f', 't', 'd']
+        rows = [
+            (1, 1.5, 'a', date(2024, 1, 1)),
+            (2, 2.5, 'b', date(2024, 1, 2)),
+            (3, 3.5, 'c', date(2024, 1, 3)),
+        ]
+        self._parity_check(columns, rows)
+
+    def test_multi_column_mixed_widening(self):
+        # Same shape, mixed widenings per column. Confirms columns do
+        # not cross-contaminate: an int seen in column 0 must not make
+        # column 1's date-then-datetime widening go wrong.
+        columns = ['w1', 'w2', 'w3']
+        rows = [
+            (1, date(2024, 1, 1), 'a'),
+            (2, date(2024, 1, 2), 'b'),
+            (3.5, datetime(2024, 1, 3, 12, 0), 'c'),
+        ]
+        self._parity_check(columns, rows)
+
+    def test_row_width_mismatch_raises(self):
+        # A programmer error at the wrapping stage (Phase 5.h) must
+        # not silently misalign columns. _ProjectedRowSource will
+        # enforce width above this, but the accumulator's own contract
+        # is the last defensible boundary and must fail loudly.
+        state = _InferenceStreamState(3)
+        with self.assertRaises(tc.DbPublishError):
+            state.feed_row((1, 2))
+        with self.assertRaises(tc.DbPublishError):
+            state.feed_row((1, 2, 3, 4))
+
+    def test_zero_column_state_is_rejected(self):
+        with self.assertRaises(tc.DbPublishError):
+            _InferenceStreamState(0)
 
 
 
@@ -2431,6 +2576,188 @@ class Test17dRunnerCopyBranching(unittest.TestCase):
         self.assertEqual(result, (False, True))
 
 
+class Test17eComposeCopySourceForPipeline(unittest.TestCase):
+    """_prepare_copy_source_for_pipeline (task_core/export.py) is the
+    Phase 5.h composition helper: given a task class, its output table,
+    spec, target schema and task name, it wires
+    adapter.to_row_source() -> RowProjection.build() ->
+    _ProjectedRowSource -> prepare_copy_source() into a target-aware
+    COPY-text spool.
+
+    Lives in test_db_publish.py rather than a runner-specific file for
+    the same reason Test17dRunnerCopyBranching does: the composition
+    IS the row-source contract in motion, and the row-source contract
+    is what this file tests. db_loader='copy' remains publicly rejected
+    at every spec/payload boundary in 0.6.4, so the helper is
+    exercised by direct calls here.
+    """
+
+    def _make_spec(self, **overrides):
+        # The helper accepts any spec whose db_table is set; db_loader
+        # is enforced by the runner's caller (validate_pipeline_class
+        # +  validate_db_loader), never by the helper itself, so tests
+        # can leave db_loader='insert' and exercise the composition.
+        from task_core.types import PipelineSpec
+        defaults = {'db_table': 't'}
+        defaults.update(overrides)
+        return PipelineSpec(**defaults)
+
+    def _run_helper(self, task_cls, tbl, spec, **overrides):
+        from task_core.export import _prepare_copy_source_for_pipeline
+        from task_core.db_copy import CopyLoadPolicy
+        kwargs = dict(
+            task_name='t_task',
+            run_started_at=datetime(2026, 5, 6, tzinfo=tz.utc),
+        )
+        kwargs.update(overrides)
+        # Every test gets its own tempdir so failures don't leave
+        # spools behind for the next test to trip on.
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = CopyLoadPolicy(spool_directory=Path(tmp))
+            path, resolved = _prepare_copy_source_for_pipeline(
+                task_cls, tbl, spec, 'bsr',
+                policy=policy,
+                **kwargs,
+            )
+            # Return the resolved payload plus the file contents,
+            # because the file will be reaped when the tempdir goes
+            # away at the end of this with-block.
+            body = path.read_bytes() if path.exists() else b''
+            return path, tuple(resolved), body
+
+    def _pipeline_cls(self):
+        # Minimal shape validate_pipeline_class expects; only
+        # attributes the helper reads matter here (spec, and
+        # optionally get_dynamic_db_contract).
+        class pipeline:
+            pass
+        return pipeline
+
+    def _petl_table(self, header, *rows):
+        # petl in-memory tables are lists of tuples with the header
+        # first; matches what latest_xlsx() etc produce.
+        return [tuple(header), *(tuple(r) for r in rows)]
+
+    def test_inferred_mode_returns_copytext_path_and_resolved_columns(self):
+        spec = self._make_spec()
+        cls = self._pipeline_cls()
+        tbl = self._petl_table(('id', 'name'), (1, 'alice'), (2, 'bob'))
+        path, resolved, body = self._run_helper(cls, tbl, spec)
+        # Filename encodes the ownership token, so its presence proves
+        # SpoolIdentity was constructed with task_name+schema+table.
+        self.assertTrue(path.name.startswith('task_core-copy-'))
+        self.assertTrue(path.name.endswith('-copytext.spool'))
+        self.assertEqual([c.name for c in resolved], ['id', 'name'])
+        # Inference resolves id as bigint (all ints), name as text.
+        self.assertIn(b'alice', body)
+        self.assertIn(b'bob', body)
+
+    def test_db_contract_rename_projects_target_column_names(self):
+        # db_contract maps source names to target names; the projection
+        # must present the projected columns tuple in target-name form,
+        # and prepare_copy_source's declared_names comparison catches
+        # any drift there. Also verifies the projection actually
+        # reorders values, not just renames.
+        spec = self._make_spec(db_contract={'name': 'renamed_name', 'id': 'renamed_id'})
+        cls = self._pipeline_cls()
+        tbl = self._petl_table(('id', 'name'), (1, 'alice'))
+        path, resolved, body = self._run_helper(cls, tbl, spec)
+        self.assertEqual([c.name for c in resolved], ['renamed_name', 'renamed_id'])
+        # Source row is (1, 'alice'); after projection with the mapping
+        # above the target-order row must be ('alice', 1). If the
+        # projection silently returned identity ordering, the copytext
+        # would encode '1\talice' rather than 'alice\t1'.
+        self.assertIn(b'alice\t1', body)
+
+    def test_db_updated_at_framework_column_is_appended_and_constant(self):
+        # db_updated_at=True adds a single framework column named
+        # 'etl_updated_at' after every source column, valued
+        # run_started_at on every row.
+        spec = self._make_spec(db_updated_at=True)
+        cls = self._pipeline_cls()
+        tbl = self._petl_table(('id',), (1,), (2,))
+        fixed = datetime(2026, 5, 6, 12, 34, 56, tzinfo=tz.utc)
+        path, resolved, body = self._run_helper(cls, tbl, spec, run_started_at=fixed)
+        self.assertEqual([c.name for c in resolved], ['id', 'etl_updated_at'])
+        # etl_updated_at column is non-nullable per framework contract.
+        etl_column = [c for c in resolved if c.name == 'etl_updated_at'][0]
+        self.assertFalse(etl_column.nullable)
+        # Both rows must carry the exact same run_started_at value in
+        # the appended framework column position; a drift here would
+        # signal RowProjection.constants was not wired through.
+        self.assertEqual(body.count(b'2026-05-06 12:34:56+00'), 2)
+
+    def test_declared_output_schema_flows_through_as_resolved_columns(self):
+        spec = self._make_spec(output_schema=(
+            tc.OutputColumn('id', sa.BigInteger(), nullable=False),
+            tc.OutputColumn('name', sa.Text()),
+        ))
+        cls = self._pipeline_cls()
+        tbl = self._petl_table(('id', 'name'), (1, 'alice'))
+        path, resolved, body = self._run_helper(cls, tbl, spec)
+        # Declared schema replaces inference; the resolved columns
+        # come from output_schema, converted via _resolve_declared_type.
+        self.assertEqual([c.name for c in resolved], ['id', 'name'])
+        self.assertFalse(resolved[0].nullable)
+        self.assertTrue(resolved[1].nullable)
+
+    def test_declared_output_schema_appends_framework_columns_in_order(self):
+        # Declared mode plus db_updated_at: framework columns are
+        # appended after the declared schema, exactly as the INSERT
+        # path does via apply_db_updated_at. This is the parity that
+        # _build_framework_columns exists to preserve.
+        spec = self._make_spec(
+            output_schema=(tc.OutputColumn('id', sa.BigInteger(), nullable=False),),
+            db_updated_at=True,
+        )
+        cls = self._pipeline_cls()
+        tbl = self._petl_table(('id',), (1,))
+        path, resolved, body = self._run_helper(cls, tbl, spec)
+        self.assertEqual([c.name for c in resolved], ['id', 'etl_updated_at'])
+        self.assertFalse(resolved[-1].nullable)
+        # etl_updated_at must resolve to timezone-aware DateTime so a
+        # UTC-aware run_started_at value is not silently rejected at
+        # serialize time. The INSERT path guarantees this via the
+        # framework-column bypass in _resolve_payload_schema; the COPY
+        # path guarantees it here via _resolve_declared_type on the
+        # OutputColumn's 'TIMESTAMPTZ' type alias.
+        self.assertTrue(resolved[-1].type.timezone)
+
+    def test_dynamic_contract_fn_is_called_and_wins_over_spec(self):
+        # get_dynamic_db_contract at the class level takes precedence
+        # over spec.db_contract on the INSERT path (same rule); the
+        # COPY helper mirrors that. Also verifies the fn is called with
+        # the actual output table, not the class or the spec.
+        calls = []
+        spec = self._make_spec(db_contract={'id': 'wrong_from_spec'})
+
+        class pipeline:
+            @classmethod
+            def get_dynamic_db_contract(cls, tbl):
+                calls.append(tbl)
+                return {'id': 'right_from_fn'}
+
+        tbl = self._petl_table(('id',), (1,))
+        path, resolved, body = self._run_helper(pipeline, tbl, spec)
+        self.assertEqual([c.name for c in resolved], ['right_from_fn'])
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0], tbl)
+
+    def test_missing_db_table_raises_pipeline_contract_error(self):
+        # The helper is only meaningful when a table will be published;
+        # without spec.db_table there is no target for the spool. Same
+        # defensive guard as _build_db_payload_with_spec's own
+        # short-circuit, but this one raises rather than returning None
+        # because the runner never reaches this call site unless
+        # `spec.db_table` is truthy -- reaching it without one is a
+        # programming error, not a task-author mistake.
+        spec = self._make_spec(db_table=None)
+        cls = self._pipeline_cls()
+        tbl = self._petl_table(('id',), (1,))
+        with self.assertRaises(tc.PipelineContractError):
+            self._run_helper(cls, tbl, spec)
+
+
 class Test18ConnectionLossIsFatal(unittest.TestCase):
     """One of three interlocking rules that close the stale-publisher trap:
     a session-scoped advisory lock, cleanup performed under it, and a
@@ -4035,6 +4362,77 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
                 with self.subTest(field=field, value=value):
                     with self.assertRaises(DbPublishError):
                         PublicationLockPolicy(**{field: value})
+
+
+
+class Test29CopyLoadPolicyValidation(unittest.TestCase):
+    """CopyLoadPolicy is the public knob set for the COPY loader's
+    spool machinery. In 0.6.4 its defaults have no observable effect --
+    db_loader='copy' is still publicly rejected -- but the validation
+    still has to fire now, because a bad configuration must be visible
+    before any resource is built (same rule IdentifierPolicy and
+    PublicationLockPolicy already follow). ADR 0011 §Local spool design
+    covers the semantics; this file only covers the boundary.
+    """
+
+    def test_defaults(self):
+        from task_core.db_publish import CopyLoadPolicy
+        policy = CopyLoadPolicy()
+        self.assertIsNone(policy.spool_directory)
+        self.assertEqual(policy.buffer_bytes, 1_048_576)
+
+    def test_spool_directory_must_be_a_path_or_none(self):
+        # A string is easy to accidentally pass and would push the
+        # str-vs-Path decision downstream into the spool machinery.
+        # Reject it here so the type stays crisp at the boundary.
+        from task_core.db_publish import CopyLoadPolicy
+        for bad in ('/tmp/spool', 3, b'/tmp/spool', object()):
+            with self.subTest(value=bad):
+                with self.assertRaises(DbPublishError):
+                    CopyLoadPolicy(spool_directory=bad)
+
+    def test_spool_directory_accepts_a_path(self):
+        # No existence check -- construction stays pure. Directory
+        # creation with mode 0o700 belongs in the spool machinery
+        # (Phase 5.b), not here.
+        from pathlib import Path
+        from task_core.db_publish import CopyLoadPolicy
+        policy = CopyLoadPolicy(spool_directory=Path('/nonexistent/spool'))
+        self.assertEqual(policy.spool_directory, Path('/nonexistent/spool'))
+
+    def test_buffer_bytes_must_be_a_positive_int(self):
+        # bool subclasses int, so isinstance() would accept True and
+        # produce a one-byte buffer -- same trap IdentifierPolicy's own
+        # int field already documents.
+        from task_core.db_publish import CopyLoadPolicy
+        for bad in (True, False, 0, -1, 1.0, '1048576', None):
+            with self.subTest(value=bad):
+                with self.assertRaises(DbPublishError):
+                    CopyLoadPolicy(buffer_bytes=bad)
+
+    def test_publisher_config_rejects_a_non_policy_value(self):
+        # Same shape as test_the_config_rejects_a_missing_policy above
+        # for the other two policy fields: PublisherConfig substituting
+        # its own default when handed a bad value would silently diverge
+        # from what the caller thinks was validated.
+        from task_core.db_publish import PublisherConfig
+        for bad in (None, {}, 'default'):
+            with self.subTest(value=bad):
+                with self.assertRaises(DbPublishError):
+                    PublisherConfig(copy_load_policy=bad)
+
+    def test_publisher_config_default_is_a_default_policy(self):
+        from task_core.db_publish import CopyLoadPolicy, PublisherConfig
+        cfg = PublisherConfig()
+        self.assertIsInstance(cfg.copy_load_policy, CopyLoadPolicy)
+        self.assertIsNone(cfg.copy_load_policy.spool_directory)
+
+    def test_the_facade_reexports_copyloadpolicy(self):
+        # Every public config class is reachable from `task_core`
+        # directly, matching IdentifierPolicy / PublicationLockPolicy /
+        # PublisherConfig. Confirms the __init__.py wiring landed.
+        from task_core.db_publish import CopyLoadPolicy as _direct
+        self.assertIs(tc.CopyLoadPolicy, _direct)
 
 
 

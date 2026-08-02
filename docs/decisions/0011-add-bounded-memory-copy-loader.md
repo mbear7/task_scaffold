@@ -1529,13 +1529,17 @@ land in 0.6.2 was the actual producer-consumer wiring: no path in
 `runner.py` calls `to_row_source()`, constructs a `RowProjection`, or
 hands a `_ProjectedRowSource` to a COPY loader. `db_loader='copy'`
 remains rejected at every public boundary, and the helpers are dormant
-production code exercised only by direct unit tests. Phase 5 completes
-the internal producer-consumer wiring by connecting the runner to
-`db_copy.py`'s spool preparation, still test-only since `'copy'`
-remains publicly rejected. Phase 6 integrates `copy_expert()` against
-the publisher's DBAPI connection and activates `'copy'` publicly, at
-which point those helpers become reachable from a real pipeline run for
-the first time. 0.6.3 corrected the 0.6.2 language that described the
+production code exercised only by direct unit tests. 0.6.4 shipped
+Phase 5 as `task_core/db_copy.py` (policy, spool directory, filename
+grammar + header, type-neutral spool format, streaming inference-state
+accumulator, target-aware COPY-text serializer, all cleanup paths, and
+`prepare_copy_source()` orchestrator) and wired the runner into it via
+the new `_prepare_copy_source_for_pipeline` helper in `export.py`;
+`db_loader='copy'` remains rejected at every public boundary, so the
+composition is exercised only by helper-level tests. Phase 6 integrates
+`copy_expert()` against the publisher's DBAPI connection and activates
+`'copy'` publicly, at which point those helpers become reachable from a
+real pipeline run for the first time. 0.6.3 corrected the 0.6.2 language that described the
 runner as a "real consumer" of `DbRowSource` — it consumes the *string*
 `'copy'`, not a `DbRowSource` object — and tightened four correctness
 gaps found by external review: `_PetlRawRowSource` walking the

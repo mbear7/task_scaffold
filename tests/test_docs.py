@@ -534,5 +534,107 @@ class Test7DbInsertBoundary(unittest.TestCase):
         )
 
 
+class Test8DbCopyBoundary(unittest.TestCase):
+    """db_copy.py is the COPY-loader spool-preparation subsystem factored
+    out of db_publish.py alongside db_insert. ADR 0011 §Tests requires the
+    same three structural properties from *both* loader modules: no
+    DbPublisher import, no transactions, no engine or second connection.
+    This class is the db_copy sibling of Test7DbInsertBoundary; the
+    reasoning matches, so keep the two in lockstep -- when one grows a
+    tripwire the other should grow the corresponding one, or the ADR-required
+    parity between the loaders quietly stops holding.
+
+    Scope note carries over: architectural tripwires, not exhaustive
+    enforcement. A helper reached through a transitive import is not
+    caught by grep-of-Import; a `connect()` on an engine variable named
+    something exotic is not caught by grep-of-Attribute-name. The current
+    module is pure file/bytes/schema work and clean on both, so the
+    lightweight form is enough today.
+    """
+
+    _SOURCE = Path('task_core/db_copy.py').read_text(encoding='utf-8')
+    _TREE = ast.parse(_SOURCE)
+
+    def _all_attribute_and_name_calls(self):
+        for node in ast.walk(self._TREE):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Name):
+                yield func.id
+            elif isinstance(func, ast.Attribute):
+                yield func.attr
+
+    def test_db_copy_does_not_import_db_publisher(self):
+        for node in ast.walk(self._TREE):
+            if isinstance(node, ast.ImportFrom):
+                imported = [alias.name for alias in (node.names or [])]
+                with self.subTest(module=node.module, names=imported):
+                    self.assertNotIn('DbPublisher', imported)
+                    self.assertNotEqual(
+                        node.module, 'task_core.db_publish',
+                        f'db_copy imports from task_core.db_publish -- the '
+                        f'spool-preparation module must not know the publisher exists',
+                    )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertFalse(
+                        alias.name.endswith('db_publish'),
+                        f'db_copy imports {alias.name} -- the spool-preparation '
+                        f'module must not know the publisher exists',
+                    )
+
+    def test_db_copy_never_begins_commits_or_rolls_back_transactions(self):
+        forbidden = {'begin', 'commit', 'rollback',
+                     '_ensure_transaction', '_commit_transaction'}
+        calls = set(self._all_attribute_and_name_calls())
+        offenders = sorted(forbidden & calls)
+        self.assertEqual(
+            offenders, [],
+            f'db_copy calls {offenders}: the publisher owns the transaction, '
+            f'per ADR 0011 §Module-boundary tests',
+        )
+
+    def test_db_copy_never_creates_an_engine_or_second_connection(self):
+        forbidden = {'create_engine', 'connect', 'URL'}
+        # Narrower than db_insert's set: db_copy legitimately calls
+        # methods named 'create' on filesystem paths (e.g. Path().touch()
+        # analogues) and on internal dataclasses, and it holds no DBAPI
+        # objects at all. Restricting to the three names that mean 'open
+        # a database connection' keeps this a real tripwire rather than a
+        # noisy one.
+        calls = set(self._all_attribute_and_name_calls())
+        offenders = sorted(forbidden & calls)
+        self.assertEqual(
+            offenders, [],
+            f'db_copy calls {offenders}: spool preparation is pure '
+            f'file/bytes/schema work; no database connection is opened here',
+        )
+
+
+class Test9DbValuesBoundary(unittest.TestCase):
+    """db_values.py is the stateless kernel: value normalization, family
+    classification, declared-schema validation, streaming-state
+    accumulator. ADR 0011 §Module-boundary tests requires it import
+    neither the publisher nor either loader -- if it did, the "shared by
+    both transports, owned by neither" contract at ADR §Consequences
+    would silently regress into hidden coupling that only shows up when
+    someone tries extracting it a second time.
+    """
+
+    _TREE = ast.parse(Path('task_core/db_values.py').read_text(encoding='utf-8'))
+
+    def test_db_values_imports_neither_publisher_nor_loader_modules(self):
+        forbidden = {'task_core.db_publish', 'task_core.db_insert', 'task_core.db_copy'}
+        for node in ast.walk(self._TREE):
+            if isinstance(node, ast.ImportFrom):
+                with self.subTest(module=node.module):
+                    self.assertNotIn(node.module, forbidden)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    with self.subTest(name=alias.name):
+                        self.assertNotIn(alias.name, forbidden)
+
+
 if __name__ == '__main__':
     unittest.main()
