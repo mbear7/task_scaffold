@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.6.12. This describes the present system, not
+How `task_core` works as of 0.6.13. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -36,10 +36,12 @@ level 3   runner.py                   run_pipelines()
 ```
 
 Within level 2 there are lateral dependencies: `table_adapters.py` imports
-payload constructors from `db_publish.py`, `export.py` imports
-`get_table_adapter` from `table_adapters.py`, and `db_publish.py` re-exports
-`CopyLoadPolicy` from `db_copy.py` (the config's home matches its layer;
-`db_copy` does not import back from `db_publish`).
+payload constructors from `db_publish.py` and missing-value semantics directly
+from `db_values.py`; `export.py` imports `get_table_adapter` from
+`table_adapters.py`; and `db_publish.py` re-exports `CopyLoadPolicy` from
+`db_copy.py` (the config's home matches its layer; `db_copy` does not import
+back from `db_publish`). Private value/schema helpers stay in `db_values.py`
+rather than being proxied through `db_publish.py`.
 
 `runner.py` imports `context.py` and `source_tracking.py` under
 `TYPE_CHECKING` only — it duck-types the context and the source-change

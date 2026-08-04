@@ -706,11 +706,11 @@ class DocumentationTests(unittest.TestCase):
             text,
         )
 
-    def test_release_version_and_architecture_claim_are_0_6_12(self):
+    def test_release_version_and_architecture_claim_are_current(self):
         facade = Path('task_core/__init__.py').read_text(encoding='utf-8')
         architecture = Path('docs/architecture.md').read_text(encoding='utf-8')
-        self.assertIn("__version__ = '0.6.12'", facade)
-        self.assertIn('as of 0.6.12', architecture)
+        self.assertIn("__version__ = '0.6.13'", facade)
+        self.assertIn('as of 0.6.13', architecture)
 
 
 if __name__ == '__main__':

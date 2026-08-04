@@ -2559,16 +2559,15 @@ class Test20bPrepareCopySourceParityCorrections(unittest.TestCase):
 
 
 class Test21PrepareCopySourceReapsSpoolsOnEveryFailurePath(unittest.TestCase):
-    """The `finally`-like cleanup path is the invariant Phase 5.h leans
-    on: when unlink succeeds, prepare_copy_source() removes its current-run
+    """The `finally`-like cleanup path is a preparation invariant: when
+    unlink succeeds, prepare_copy_source() removes its current-run
     spools before propagating an error. Both the mid-pass-1 (source raises)
     and mid-pass-2 (validation raises) cases must satisfy it. Separate fault
     injection covers the residual-path behavior when unlink itself fails.
 
     Teeth for both: remove the cleanup, confirm files survive; restore.
-    Recorded here rather than left as an inline comment because the
-    revert-observe-restore ritual is what CLAUDE.md requires for every
-    invariant we depend on.
+    Recorded as executable regression coverage rather than left as an
+    inline claim.
     """
 
     def test_row_source_exception_reaps_neutral_spool(self):

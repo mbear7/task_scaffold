@@ -154,8 +154,7 @@ class _FakeResult:
 class FakeDbPublisher:
     # Records preflight rather than stubbing it: WHEN the runner invokes the
     # backend hook is an ordering property of the runner, which is this
-    # file's scope. A bare no-op would hide it the way discard_pending_read()
-    # was hidden.
+    # file's scope. A bare no-op would hide whether the runner invokes it.
     preflight_calls = []
 
     @classmethod
@@ -163,8 +162,8 @@ class FakeDbPublisher:
         cls.preflight_calls.append((sorted(specs), schema))
 
     """Same shape as db_publish.DbPublisher (ensure_connection/
-    discard_pending_read/publish/commit/rollback/close/committed/
-    committed_tables/written_tables/table_rows), plus call counters these
+    begin_run/publish/commit/rollback/close/committed/committed_tables/
+    written_tables/table_rows), plus call counters these
     tests need. ensure_connection() returns a real FakeSourceStateConn,
     not object() -- source-change tests need SourceStateStore's real code
     to actually run, not just avoid crashing on the connection handle.
@@ -213,20 +212,13 @@ class FakeDbPublisher:
         self.commit_calls = 0
         self.rollback_calls = 0
         self.close_calls = 0
-        self.discard_calls = 0
         self.fail_commit = fail_commit
 
     def ensure_connection(self):
         return self.conn
 
     def begin_run(self):
-
         return True
-        # Mirrors the real DbPublisher.discard_pending_read(): with no
-        # explicit transaction of its own, it rolls the connection back to
-        # clear whatever the source-state read autobegan.
-        self.discard_calls += 1
-        self.conn.rollback()
 
     def publish(self, payload):
         # The real DbPublisher.publish() calls _ensure_transaction() ->
@@ -234,14 +226,11 @@ class FakeDbPublisher:
         # transaction from the source-state read is still open. Modelled
         # here at exactly that granularity -- not by replicating
         # DbPublisher's internals, but so this file can see whether the
-        # RUNNER clears the pending read before publishing, which is an
-        # ordering question and therefore this file's own scope.
-        # Under the staged model a pending read is COMMITTED rather than
-        # rejected: the source-state read is its own bounded phase, and
-        # _ensure_transaction() closes it out before opening an explicit
-        # transaction. The earlier version of this fake raised here,
-        # modelling the contract discard_pending_read() used to enforce --
-        # a lifecycle state the architecture no longer has.
+        # RUNNER has completed the bounded source-state read phase before
+        # publishing, which is an ordering question and therefore this
+        # file's own scope. Under the staged model an implicit read
+        # transaction is committed before publication opens its explicit
+        # transaction.
         if self.conn.implicit_transaction_open:
             self.conn.commit()
         self._written_tables.append(payload)

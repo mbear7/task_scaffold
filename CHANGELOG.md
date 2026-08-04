@@ -9,6 +9,30 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+## 0.6.13
+
+Performs a safe internal dead-code and comment-hygiene pass without changing
+any public task_core surface. `RunResult` and its convenience properties remain
+unchanged. The preserved alternative implementations in `tasks/hr_task.py` are
+intentionally untouched.
+
+### Changed
+- Removed unused runtime imports and one unused COPY constant.
+- Stopped re-exporting private `db_values` implementation helpers from
+  `db_publish`; internal callers and tests now import the private kernel from its
+  owning module. Public exceptions, policies and publisher classes remain where
+  they were.
+- Removed the private `_build_copy_sql` helper from `db_copy.__all__` while
+  retaining the helper itself for internal use and direct tests.
+- Reworded implementation-phase and removed-file comments so they describe the
+  current architecture rather than completed ADR construction phases.
+- Removed unreachable statements and unused test-only counters/imports.
+
+### Tests
+- Added source-hygiene tripwires covering the private module boundary, public
+  export list, removed dead symbols and current comments.
+
+
 ## 0.6.12
 
 Adds a repository-local PostgreSQL schema generator for moving an existing
@@ -44,6 +68,12 @@ without hand-writing dozens or hundreds of `OutputColumn` entries.
   standalone help, notebook defaults, connection and file cleanup, exact
   SQLAlchemy/PostgreSQL type rendering, aggregate unsupported-column
   diagnostics, exclusions and AST-valid class indentation.
+
+### Documentation
+- Consolidated the obsolete standalone 0.5.1 and 0.5.2 migration notes into
+  the current authoring contract and this changelog. Removed the two files and
+  all stale links; separate migration guides are now reserved for exceptional
+  migrations that need more than concise current guidance and release history.
 
 ## 0.6.11
 
@@ -681,9 +711,10 @@ change; only callers that reach for the now-moved private symbols do.
   `DbPublishError` instead of leaking a lower-level driver `ValueError`.
 
 ### Migration
-- Review external scripts containing `output_schema=`. Valid declarations need
-  no change; see `docs/migrating-to-0.5.2.md` for the rejected ambiguous shapes.
-  The bundled HR and OPS tasks use inferred schemas and require no edits.
+- Review external scripts containing `output_schema=` against the declared-type
+  rules above and the current authoring guide. Valid declarations need no
+  change. The bundled HR and OPS tasks use inferred schemas and require no
+  edits.
 
 
 ## 0.5.1
@@ -738,7 +769,8 @@ change; only callers that reach for the now-moved private symbols do.
 - Review every running script containing `output_schema=`. Add
   `db_publication_strategy='refill'` only where the ordinary table object and
   attached views, grants, indexes, ownership, triggers or RLS must survive.
-  See `docs/migrating-to-0.5.1.md`.
+  The current checklist is in
+  [`docs/task-authoring.md`](docs/task-authoring.md#review-existing-declared-schema-scripts).
 
 ### Notes
 - `partition` is deliberately absent from the strategy vocabulary rather

@@ -7,7 +7,6 @@ task-agnostic.
 
 import json
 import logging
-import re
 
 import sqlalchemy as sa
 

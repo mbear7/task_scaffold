@@ -92,9 +92,7 @@ class FakePublisher:
         return object()
 
     def begin_run(self):
-
         return True
-        pass
 
     def publish(self, payload):
         pass

@@ -177,9 +177,11 @@ default. A declared pipeline may explicitly request stable refill with
 and its attached database objects is worth the extra write and longer lock.
 
 
-Existing 0.5.0 scripts using `output_schema` should read the concise
-[0.5.1 migration note](docs/migrating-to-0.5.1.md). Scripts using declared
-type parameters should also review the [0.5.2 migration note](docs/migrating-to-0.5.2.md).
+The current declared-schema and publication contracts are documented in
+[task-authoring.md](docs/task-authoring.md). Historical release-specific
+changes remain in [CHANGELOG.md](CHANGELOG.md); standalone migration guides
+are reserved for migrations that cannot be explained concisely in those two
+places.
 
 
 ## Limitations

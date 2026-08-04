@@ -40,8 +40,8 @@ def _build_framework_columns(spec):
     Shared between the INSERT path (``apply_db_updated_at``) and the
     COPY path (``_prepare_copy_source_for_pipeline``) so the two derive
     the exact same tuple from the same spec. Duplicating the "read
-    ``spec.db_updated_at``, pick the name" rule was the drift class
-    CLAUDE.md names most often, so a single producer here is required
+    ``spec.db_updated_at``, pick the name" rule is a documented
+    one-source-of-truth boundary, so a single producer here is required
     -- not merely nice.
     """
     if not spec.db_updated_at:
@@ -146,8 +146,8 @@ def build_db_payload(task_cls, tbl, pg_schema, *, run_started_at=None):
 
 
 def _compose_copy_row_source(task_cls, tbl, spec, *, run_started_at):
-    """Build the final logical one-shot row source shared by Phase 5 tests
-    and the real Phase 6 publisher path.
+    """Build the final logical one-shot row source used by COPY tests and
+    the publisher path.
 
     COPY deliberately supports only the static ``db_contract`` from the
     captured PipelineSpec. ``get_dynamic_db_contract()`` may execute
@@ -181,7 +181,7 @@ def _compose_copy_row_source(task_cls, tbl, spec, *, run_started_at):
 def _build_copy_payload_with_spec(
     task_cls, tbl, spec, pg_schema, *, run_started_at=None,
 ):
-    """Build the real Phase 6 COPY DbPayload without materializing rows.
+    """Build a COPY DbPayload without materializing rows.
 
     Spool preparation remains inside ``DbPublisher.publish()`` so the
     publisher owns the complete preparation lifecycle: schema resolution,
@@ -220,7 +220,8 @@ def _build_copy_payload_with_spec(
 def _prepare_copy_source_for_pipeline(
     task_cls, tbl, spec, pg_schema, *, task_name, run_started_at=None, policy=None,
 ):
-    """Compose the Phase 5 COPY chain for one pipeline: adapter row-source
+    """Compose the direct COPY preparation chain for one pipeline: adapter
+    row-source
     reshaped by db_contract + framework columns, spooled through
     prepare_copy_source() into a target-aware spool container whose plaintext
     body is PostgreSQL COPY text.
@@ -230,7 +231,7 @@ def _prepare_copy_source_for_pipeline(
     artefact; runner.py stays engine-neutral by delegating both.
 
     This remains a direct preparation helper for tests and diagnostics.
-    The real Phase 6 runner path builds a one-shot DbPayload and lets
+    The runner path builds a one-shot DbPayload and lets
     ``DbPublisher.publish()`` own spool preparation and database transport.
 
     Returns a PreparedCopySource. The caller owns its spool path from

@@ -539,15 +539,22 @@ Changing a declared schema is only possible under `replace`. Under
 `refill` the compatibility check refuses a target whose physical shape no
 longer matches, and asks you to migrate or recreate it explicitly.
 
-### Migrating existing 0.5.0 scripts
+### Review existing declared-schema scripts
 
-Search every running script for `output_schema=`. In 0.5.0 that implied stable
-refill; in 0.5.1 it defaults to replacement. Add
+Search older running scripts for `output_schema=`. The current contract treats
+schema source and publication strategy as separate choices: declared outputs
+use `replace` unless they explicitly request `refill`. Add
 `db_publication_strategy='refill'` only where the target must preserve its OID,
-views, grants, indexes, ownership, triggers or RLS. Otherwise no source change
-is required. Direct callers of `DbPayload`, `from_petl()` or `from_pandas()`
-must also use only `replace`, or `refill` together with `output_schema`. See
-[migrating-to-0.5.1.md](migrating-to-0.5.1.md).
+views, grants, indexes, ownership, triggers or RLS. Direct callers of
+`DbPayload`, `from_petl()` or `from_pandas()` must likewise use `replace`, or
+`refill` together with `output_schema`.
+
+Review existing declarations against the type-shape and value rules in
+[Inferred and declared database schemas](#inferred-and-declared-database-schemas).
+Valid declarations require no change. Under `refill`, the existing target must
+match the declaration exactly; task_core does not widen, cast or migrate it.
+Under `replace`, the declaration is authoritative because the live relation is
+replaced rather than updated in place.
 
 
 ## Performance and loader selection

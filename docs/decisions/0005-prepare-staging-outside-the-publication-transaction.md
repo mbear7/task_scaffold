@@ -107,8 +107,9 @@ database.
 ## The extension seam, and the plan for it
 
 `publisher_factory` now takes six parameters. The 0.3.0 break that added
-three was deliberate and handled — minor bump, changelog, migration note —
-but the seam is visibly under growth pressure, and `IdentifierPolicy` was
+three was deliberate and handled through a minor bump and release
+documentation, but the seam is visibly under growth pressure, and
+`IdentifierPolicy` was
 itself created to stop two independently-defaulted integers drifting
 apart.
 

@@ -8,15 +8,15 @@ Layering (ADR 0011 §Implementation sequence):
 `db_copy` is one level *below* `db_publish`. It knows nothing about live-table
 publication, advisory locks, transaction boundaries, or the `DbPublisher`
 class. It cannot import `db_publish`, begin/commit/roll back transactions, or
-create an engine or connection. Phase 6 adds one narrow database operation:
-it opens a cursor on the SQLAlchemy connection supplied by the publisher and
+create an engine or connection. Its only database operation opens a cursor
+on the SQLAlchemy connection supplied by the publisher and
 streams a prepared spool through psycopg2 `copy_expert()` into an already
 created staging table.
 
 The module is deliberately name-clean of the forbidden transaction and engine
 operations so the architecture tests can enforce that ownership boundary.
 
-Public shape as of 0.6.11:
+Selected module surface:
 
 - `CopyLoadPolicy`               - config dataclass, moved here from
                                     db_publish in 0.6.4 so its home
@@ -36,8 +36,9 @@ Public shape as of 0.6.11:
 
 ADR 0011 §Spool ownership and cleanup requires *both* an exact filename
 grammar and an internal header for positive ownership before predecessor
-cleanup deletes anything. This module provides both primitives; Phase 7
-wires them into ``DbPublisher.begin_run()`` under the task advisory lock.
+cleanup deletes anything. This module provides both primitives;
+``DbPublisher.begin_run()`` invokes predecessor cleanup under the task
+advisory lock.
 """
 
 from __future__ import annotations
@@ -178,7 +179,6 @@ SPOOL_PROTECTIONS = (PROTECTION_NONE, PROTECTION_AES256_GCM)
 
 _AES_KEY_BYTES = 32
 _GCM_NONCE_BYTES = 12
-_GCM_TAG_BYTES = 16
 _GCM_FOOTER_MAGIC = b'TCGM'
 _GCM_FOOTER = struct.Struct('>4s16s')
 
@@ -197,7 +197,7 @@ SPOOL_FILENAME_RE = re.compile(
 
 # What resolve_spool_directory falls back to when the policy leaves it
 # unset. Kept as a module constant so the tests can reference the same
-# name and the Phase 5.f cleanup pass can list the right directory.
+# name and predecessor cleanup can list the right directory.
 DEFAULT_SPOOL_SUBDIR = 'task_core-copy-spool'
 
 
@@ -538,7 +538,7 @@ def resolve_spool_directory(policy: CopyLoadPolicy | None) -> Path:
     # resolve(strict=False) folds any `..` components and yields an
     # absolute path without requiring the target to exist yet. Both the
     # policy-supplied and tempdir-derived branches go through this so
-    # comparisons downstream (containment checks in Phase 5.f) start
+    # downstream containment checks start
     # from the same normalized form.
     target = target.resolve(strict=False)
     target.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1662,7 +1662,7 @@ def serialize_row_to_copytext(
 
 @dataclass(frozen=True)
 class PreparedCopySource:
-    """Immutable Phase 5 preparation result.
+    """Immutable COPY preparation result.
 
     The exact row count is captured during the one permitted source
     traversal. ``spool_bytes`` is the final on-disk COPY-text spool size,
@@ -2288,7 +2288,7 @@ def load_copy_into_staging(conn, staging_table, prepared, _chunk_size=None) -> i
     The caller owns the SQLAlchemy transaction, staging DDL, verification,
     commit/rollback and spool cleanup. This function opens only a cursor on
     the existing DBAPI connection and returns the exact logical row count
-    captured during Phase 5 preparation.
+    captured during spool preparation.
     """
     if not isinstance(prepared, PreparedCopySource):
         raise DbPublishError(
@@ -2755,7 +2755,6 @@ __all__ = [
     'open_spool_for_read',
     'cleanup_spool_paths',
     'cleanup_predecessor_spools',
-    '_build_copy_sql',
     'load_copy_into_staging',
     'prepare_copy_source',
 ]

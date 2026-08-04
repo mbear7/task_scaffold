@@ -100,8 +100,8 @@ class SourceChangeCheckConfig:
 
 @dataclass(frozen=True)
 class TrackedResourceSource:
-    # Phase 1: one tracked source == one loader/resource, identified by its
-    # task_context loader key. resource_key doubles as the metadata table's
+    # One tracked resource source maps to one task_context loader key.
+    # resource_key doubles as the metadata table's
     # source_key. TrackedDbQuerySource (below) separates the two, for
     # sources fingerprinted via a DB query rather than a resource object.
     resource_key: str

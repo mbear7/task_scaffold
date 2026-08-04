@@ -60,10 +60,12 @@ from task_core.db_publish import (
     server_identifier_limit,
     DbPayload,
     from_pandas,
-    is_missing,
+)
+from task_core.db_values import (
     _InferenceStreamState,
     _infer_column_type,
     _normalize_value,
+    is_missing,
 )
 
 
@@ -137,11 +139,10 @@ class FakeSqlaConnection:
             # This fake previously just set the flag and returned, which made
             # it strictly MORE PERMISSIVE than the library it stands in for --
             # and that gap was load-bearing, not cosmetic: with it,
-            # run_pipelines()'s publisher.discard_pending_read() call could be
-            # deleted outright and all 217 tests still passed, while the real
-            # library raises on the first publish() of any source-check-enabled
-            # run that also has DB outputs. Confirmed directly both ways before
-            # changing this.
+            # the source-state read phase could be left open and all 217 tests
+            # still passed, while the real library raises on the first publish()
+            # of any source-check-enabled run that also has DB outputs. Confirmed
+            # directly both ways before changing this.
             raise sa_exc.InvalidRequestError(
                 'This connection has already initialized a SQLAlchemy '
                 'Transaction() object via begin() or autobegin; '

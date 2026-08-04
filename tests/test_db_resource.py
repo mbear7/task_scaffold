@@ -11,7 +11,6 @@ silently accepted.
 """
 
 import unittest
-import warnings
 
 import petl as etl
 

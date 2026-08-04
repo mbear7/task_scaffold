@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import unittest
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest import mock
 
@@ -9,10 +9,8 @@ import pandas as pd
 import sqlalchemy as sa
 
 import task_core as tc
-from task_core.db_publish import (
-    DbPayload,
-    DbPublishError,
-    DbPublisher,
+from task_core.db_publish import DbPayload, DbPublishError, DbPublisher
+from task_core.db_values import (
     ResolvedColumn,
     ResolvedSchema,
     _resolve_payload_schema,

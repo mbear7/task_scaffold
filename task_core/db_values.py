@@ -4,8 +4,8 @@
 Everything here is independent of the connection, transaction, and
 publication policy that live in db_publish.py -- exception classes,
 value normalization, declared/inferred schema resolution, and the
-family classification used by inference. db_publish.py re-exports the
-same names (public and private) so existing importers see no change.
+family classification used by inference. Public publication exceptions
+are imported by db_publish.py; private kernel helpers remain owned here.
 
 Import direction is one way: db_publish depends on db_values. Nothing
 here imports db_publish, db_insert or db_copy -- keeping that arrow

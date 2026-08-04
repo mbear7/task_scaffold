@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -39,40 +38,16 @@ from task_core.types import (
     find_duplicates, validate_db_loader, validate_payload_source_state,
     validate_publication_strategy,
 )
-# Re-export the stateless value/schema kernel from db_values so every
-# existing importer -- public API, and tests that reach for the
-# underscore-prefixed names -- keeps working with no source change. The
-# definitions live in db_values; the dependency direction is one way
-# (db_publish -> db_values), see docs/decisions/0011.
 from task_core.db_values import (
     DbPublishError,
     DbPublishInvariantError,
     ResolvedColumn,
     ResolvedSchema,
-    _TYPE_OVERRIDES,
-    _INTEGER_RANGES,
-    _SILENTLY_WIDENABLE,
     _apply_db_contract_columns,
-    _declared_int_parameter,
-    _declared_type_family,
-    _declared_value_error,
-    _InferenceStreamState,
-    _infer_column_type,
-    _infer_from_scan,
-    _is_aware_datetime,
-    _is_scalar_like,
     _normalize_value,
     _resolve_declared_type,
-    _resolve_families,
-    _resolve_override,
     _resolve_payload_schema,
-    _scan_families,
-    _silently_widenable_exact_type,
-    _validate_declared_value,
-    _validate_numeric_value,
     _validate_unique_columns,
-    _value_family,
-    is_missing,
 )
 
 
@@ -890,8 +865,8 @@ class PublisherConfig:
     )
     # Positional-stability rule (same one PublisherConfig's other fields
     # already follow): appended after every prior field so an existing
-    # positional caller keeps its previous meaning. Has no observable
-    # effect until db_loader='copy' is publicly accepted in Phase 6.
+    # positional caller keeps its previous meaning. COPY-enabled tasks
+    # inherit this policy unless they override the per-task encryption flag.
     copy_load_policy: CopyLoadPolicy = field(default_factory=CopyLoadPolicy)
 
     def __post_init__(self):

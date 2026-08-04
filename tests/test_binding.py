@@ -520,7 +520,6 @@ class Test10DynamicDbContractOnBoundPipeline(unittest.TestCase):
                 return object()
             def begin_run(self):
                 return True
-                pass
             def publish(self, payload):
                 self.published.append(payload)
             def commit(self):
@@ -786,10 +785,8 @@ class Test12RunnerInvokesBackendPreflightBeforeBuildingResources(unittest.TestCa
     This exists because testing the hook in isolation proves nothing about
     the runner. Confirmed directly: with Test11 in
     tests/test_db_publish.py exercising DbPublisher.preflight() directly,
-    deleting the call from runner.py left all 264 tests passing. That is
-    the third time in this project the same mistake has been made -- see
-    the README on stabilize() and on discard_pending_read() -- so it is
-    recorded here rather than quietly corrected.
+    deleting the call from runner.py left all 264 tests passing. The
+    ordering regression is recorded here rather than quietly corrected.
 
     The ordering, not merely the call, is the property: preflight exists to
     fail before any resource is constructed, any remote file is opened, or
@@ -875,8 +872,8 @@ class Test12RunnerInvokesBackendPreflightBeforeBuildingResources(unittest.TestCa
     def test_a_factory_without_its_own_hook_still_gets_validated(self):
         # publisher_factory is duck-typed and is legitimately a plain
         # callable in places. Resolution falls back to the REAL backend
-        # policy, never to a no-op -- skipping on absence is how
-        # discard_pending_read() ended up with no coverage at all.
+        # policy, never to a no-op -- skipping validation on an absent hook
+        # would leave the runner path untested.
         with self.assertRaises(DbPublishError):
             tc.run_pipelines(
                 task_name='t',

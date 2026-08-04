@@ -415,6 +415,36 @@ class Test4DocumentationFilesExistWhereLinkedFrom(unittest.TestCase):
             with self.subTest(source='README.md', target=target):
                 self.assertTrue(os.path.exists(os.path.normpath(target)))
 
+    def test_obsolete_migration_note_series_is_consolidated(self):
+        obsolete = (
+            'docs/migrating-to-0.5.1.md',
+            'docs/migrating-to-0.5.2.md',
+        )
+        for path in obsolete:
+            with self.subTest(path=path):
+                self.assertFalse(Path(path).exists())
+
+        documents = (
+            'README.md',
+            'CHANGELOG.md',
+            'docs/task-authoring.md',
+            'docs/architecture.md',
+            *tuple(str(path) for path in Path('docs/decisions').glob('*.md')),
+        )
+        for path in documents:
+            text = Path(path).read_text(encoding='utf-8')
+            for obsolete_path in obsolete:
+                with self.subTest(document=path, obsolete=obsolete_path):
+                    self.assertNotIn(obsolete_path, text)
+
+        readme = re.sub(
+            r'\s+', ' ', Path('README.md').read_text(encoding='utf-8')
+        )
+        authoring = Path('docs/task-authoring.md').read_text(encoding='utf-8')
+        self.assertIn('Historical release-specific changes remain in', readme)
+        self.assertIn('### Review existing declared-schema scripts', authoring)
+        self.assertIn('task_core does not widen, cast or migrate it', authoring)
+
 
 class Test5TheDocumentedLevelMapMatchesRealImports(unittest.TestCase):
     """The layering diagram in docs/architecture.md is parsed out of the
@@ -774,6 +804,81 @@ class Test10OutputSchemaGeneratorBoundary(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, authoring)
         self.assertIn('generate-a-declaration-from-an-existing-table', readme)
+
+
+class Test11SafeSourceHygiene(unittest.TestCase):
+    """Low-risk cleanup stays low-risk and does not grow a new public API."""
+
+    def test_db_publish_does_not_reexport_unused_private_value_kernel_names(self):
+        module = importlib.import_module('task_core.db_publish')
+        private_leaks = (
+            '_TYPE_OVERRIDES',
+            '_INTEGER_RANGES',
+            '_SILENTLY_WIDENABLE',
+            '_InferenceStreamState',
+            '_infer_column_type',
+            '_infer_from_scan',
+            '_resolve_families',
+            '_scan_families',
+            '_value_family',
+            'is_missing',
+        )
+        for name in private_leaks:
+            with self.subTest(name=name):
+                self.assertFalse(
+                    hasattr(module, name),
+                    f'db_publish leaks {name} from the private db_values kernel',
+                )
+
+    def test_db_copy_all_contains_only_public_names(self):
+        module = importlib.import_module('task_core.db_copy')
+        self.assertEqual(
+            [name for name in module.__all__ if name.startswith('_')],
+            [],
+        )
+        self.assertTrue(hasattr(module, '_build_copy_sql'))
+
+    def test_confirmed_dead_symbols_and_stale_runtime_comments_are_absent(self):
+        sources = {
+            path: Path(path).read_text(encoding='utf-8')
+            for path in (
+                'task_core/db_copy.py',
+                'task_core/db_publish.py',
+                'task_core/db_values.py',
+                'task_core/export.py',
+                'task_core/source_state.py',
+                'tests/test_source_change_runner.py',
+            )
+        }
+        forbidden = {
+            'task_core/db_copy.py': (
+                '_GCM_TAG_BYTES',
+                'Public shape as of 0.6.11',
+            ),
+            'task_core/db_publish.py': (
+                'from datetime import date, datetime, timezone',
+                'from decimal import Decimal',
+                "no observable effect until db_loader='copy'",
+            ),
+            'task_core/db_values.py': (
+                're-exports the\nsame names (public and private)',
+            ),
+            'task_core/export.py': (
+                'CLAUDE.md',
+                'real Phase 6',
+                'Phase 5 COPY chain',
+            ),
+            'task_core/source_state.py': ('import re',),
+            'tests/test_source_change_runner.py': (
+                'discard_calls',
+                'discard_pending_read/publish',
+            ),
+        }
+        for path, phrases in forbidden.items():
+            for phrase in phrases:
+                with self.subTest(path=path, phrase=phrase):
+                    self.assertNotIn(phrase, sources[path])
+
 
 
 if __name__ == '__main__':
