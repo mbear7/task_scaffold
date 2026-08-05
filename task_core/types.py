@@ -244,7 +244,7 @@ class OutputColumn:
 
     name: str
     type: Any
-    nullable: bool = True
+    nullable: bool = field(default=True, kw_only=True)
 
     def __post_init__(self):
         if not isinstance(self.name, str) or not self.name:
@@ -255,7 +255,7 @@ class OutputColumn:
             raise TypeError('OutputColumn.nullable must be bool')
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class PipelineSpec:
     excel_name: str | None = None
     db_table: str | None = None
@@ -267,23 +267,17 @@ class PipelineSpec:
     publish_result: bool = False
     debug_display: bool = False
     table_adapter: str | None = None
-    # Added after every 0.4.1 field so existing positional construction keeps
-    # its meaning. New code should still use keyword arguments.
     db_not_null_columns: list[str] | tuple[str, ...] | None = None
     output_schema: list[OutputColumn] | tuple[OutputColumn, ...] | None = None
-    # None resolves to 'replace' for BOTH schema modes. Kept after every
-    # 0.5.0 field as API hygiene: adding an optional field must not silently
-    # reinterpret existing positional construction.
+    # None resolves to 'replace' for BOTH schema modes.
     #
     # 'refill' requires output_schema: it needs the target's physical schema
     # to remain stable across runs, and only a declaration can promise that.
     db_publication_strategy: str | None = None
-    # Implemented values are 'insert' and 'copy'. Appended after every
-    # 0.5.1 field for the same API-hygiene reason.
+    # Implemented values are 'insert' and 'copy'.
     db_loader: str = 'insert'
     # Secure default is inherited from PublisherConfig.copy_load_policy.
     # A task may explicitly opt out for controlled, non-sensitive workloads.
-    # Appended after db_loader to preserve every older positional meaning.
     db_copy_spool_encryption: bool | None = None
 
     def __post_init__(self):

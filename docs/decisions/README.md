@@ -25,3 +25,4 @@ them is usually still relevant to whatever replaced them.
 | [0010](0010-require-portable-database-identifiers.md) | Require portable database identifiers |
 | [0011](0011-add-bounded-memory-copy-loader.md) | Add a bounded-memory `COPY FROM STDIN` loader |
 | [0012](0012-separate-publication-strategy-from-schema-source.md) | Separate publication strategy from schema source |
+| [0013](0013-name-configuration-choices.md) | Name configuration choices |

@@ -146,38 +146,32 @@ class Test3bCopySpoolEncryptionOverride(unittest.TestCase):
                     tc.PipelineSpec(db_copy_spool_encryption=value)
 
 
-class Test4OldPositionalPipelineSpecConstructionKeepsItsMeaning(unittest.TestCase):
-    """PipelineSpec has grown fields across 0.4, 0.5 and 0.6. Every one was
-    added at the end deliberately, so the same positional call written in
-    0.4.1 still means what it meant in 0.4.1 -- the source comments at
-    types.py:208, :213 and :221 spell out that this is the API-hygiene
-    rule the additions must not break. CHANGELOG's promise for 0.6.0
-    that 'keyword construction of PipelineSpec(...) needs no source
-    change' is only half the story: the other half is that positional
-    construction also survives. This test pins both halves so a future
-    field insertion in the middle of the sequence fails here rather than
-    silently reinterpreting every task file that used positional args.
+class Test4PipelineSpecConstructorSemantics(unittest.TestCase):
+    """PipelineSpec is task-authored configuration, so choices are named.
+
+    Keyword-only construction removes field-order coupling: future fields may
+    be placed beside related settings instead of being appended forever to
+    preserve positional meaning.
     """
 
-    def test_the_0_5_2_positional_sequence_still_binds_field_for_field(self):
-        # Constructed as the 0.5.2 caller would have -- 13 positional
-        # arguments, no db_loader. The 14th field (db_loader) must default
-        # to 'insert'; every one of the 13 named values must land on the
-        # field name the 0.5.2 caller intended.
+    def test_positional_construction_is_rejected(self):
+        with self.assertRaises(TypeError):
+            tc.PipelineSpec('sheet.xlsx', 'my_table')
+
+    def test_keyword_construction_binds_the_complete_contract(self):
         spec = tc.PipelineSpec(
-            'sheet.xlsx',                 # excel_name
-            'my_table',                   # db_table
-            ('a', 'b'),                   # db_output
-            {'src': 'tgt'},               # db_contract
-            {'a': 'INT'},                 # db_type_overrides
-            'idpix',                      # db_table_id_pix
-            'updated',                    # db_updated_at (str truthy)
-            True,                         # publish_result
-            True,                         # debug_display
-            'petl',                       # table_adapter
-            ('a', 'b'),                   # db_not_null_columns
-            None,                         # output_schema (None keeps db_type_overrides valid)
-            'replace',                    # db_publication_strategy
+            excel_name='sheet.xlsx',
+            db_table='my_table',
+            db_output=('a', 'b'),
+            db_contract={'src': 'tgt'},
+            db_type_overrides={'a': 'INT'},
+            db_table_id_pix='idpix',
+            db_updated_at='updated',
+            publish_result=True,
+            debug_display=True,
+            table_adapter='petl',
+            db_not_null_columns=('a', 'b'),
+            db_publication_strategy='replace',
         )
 
         self.assertEqual(spec.excel_name, 'sheet.xlsx')
@@ -191,10 +185,7 @@ class Test4OldPositionalPipelineSpecConstructionKeepsItsMeaning(unittest.TestCas
         self.assertTrue(spec.debug_display)
         self.assertEqual(spec.table_adapter, 'petl')
         self.assertEqual(spec.db_not_null_columns, ('a', 'b'))
-        self.assertIsNone(spec.output_schema)
         self.assertEqual(spec.db_publication_strategy, 'replace')
-        # db_loader is the 0.6.0 addition; positional callers from 0.5.2
-        # did not pass it, so it must default to 'insert'.
         self.assertEqual(spec.db_loader, 'insert')
 
 

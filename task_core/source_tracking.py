@@ -63,7 +63,7 @@ def make_source_signature(payload):
     return hashlib.md5(normalized.encode('utf-8')).hexdigest()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class SourceChangeCheckConfig:
     enabled: bool = False
     schema: str = 'bsr'

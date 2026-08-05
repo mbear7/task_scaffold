@@ -135,6 +135,33 @@ class derived:
 
 ## PipelineSpec
 
+`PipelineSpec` is keyword-only. Configuration choices must be named:
+
+```python
+spec = PipelineSpec(
+    db_table='customer_summary',
+    db_loader='copy',
+    db_publication_strategy='replace',
+)
+```
+
+Positional construction is rejected. The same rule applies to the other
+public configuration dataclasses: `PublisherConfig`, `PublicationLockPolicy`,
+`CopyLoadPolicy`, `SourceChangeCheckConfig`, `ResourceEnvironment` and
+`IdentifierPolicy`.
+
+Natural value identity remains concise. `OutputColumn` keeps `name` and `type`
+positional, but `nullable` is a named policy choice:
+
+```python
+OutputColumn('customer_id', sa.BigInteger(), nullable=False)
+```
+
+`ResourceSpec` follows the same mixed rule: `loader` may be positional, while
+`tracker` must be named. `RunResult` and `DbRunResult` retain their existing
+constructor and field contracts. See
+[ADR 0013](decisions/0013-name-configuration-choices.md).
+
 | field | default | meaning |
 | --- | --- | --- |
 | `excel_name` | `None` | Workbook filename to write. Omit for no Excel output. |

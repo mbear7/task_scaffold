@@ -212,9 +212,10 @@ separate replayability contract rather than an undocumented convention.
 
 ## Public configuration
 
-`db_loader` is appended after every field that exists in `PipelineSpec` 0.5.2
-so existing positional construction retains its meaning. New code should
-continue to use keyword arguments.
+In the 0.6 implementation, `db_loader` was appended after every field that
+existed in `PipelineSpec` 0.5.2 so positional construction retained its
+meaning. ADR 0013 supersedes that constructor-compatibility rule in 0.7.0:
+`PipelineSpec` is now keyword-only.
 
 ```python
 @dataclass(frozen=True)
@@ -1262,7 +1263,7 @@ Required coverage:
 
 - omitted `db_loader` resolves to insert;
 - invalid values fail during structural validation;
-- old positional `PipelineSpec` construction retains 0.5.2 meanings;
+- keyword-only `PipelineSpec` construction is enforced by ADR 0013;
 - direct payload callers cannot bypass loader validation;
 - COPY plus `get_dynamic_db_contract()` fails during structural validation;
 - static `db_contract` remains supported in both schema modes;

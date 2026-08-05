@@ -10,6 +10,35 @@ chronologically rather than by release.
 
 
 
+## 0.7.0
+
+Adopts role-based constructor semantics for dataclasses. Author-facing
+configuration choices are keyword-only; natural values remain concise;
+result contracts remain unchanged.
+
+### Changed
+- `PipelineSpec`, `PublisherConfig`, `PublicationLockPolicy`,
+  `CopyLoadPolicy`, `SourceChangeCheckConfig`, `ResourceEnvironment` and
+  `IdentifierPolicy` now require keyword arguments.
+- `OutputColumn.name` and `OutputColumn.type` remain positional, while
+  `nullable` is keyword-only.
+- `ResourceSpec.loader` remains positional, while `tracker` is keyword-only.
+- Removed positional-append compatibility comments from configuration classes;
+  fields may now be grouped logically without positional-order coupling.
+- Added ADR 0013 to define the classification rule for future dataclasses.
+
+### Breaking
+- Positional calls to the converted configuration classes now raise
+  `TypeError`. Rewrite them with named arguments. No compatibility shim is
+  provided.
+- `RunResult`, `DbRunResult` and their public fields remain unchanged.
+
+### Tests
+- Replaced historical positional-compatibility tests with constructor-shape
+  tests covering every keyword-only configuration class, mixed value objects,
+  stable result contracts and a representative positional natural record.
+
+
 ## 0.6.14
 
 Refines the standalone PostgreSQL schema generator without changing task_core

@@ -175,6 +175,36 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
             with self.subTest(expected_result=expected_result):
                 self.assertIn(expected_result, normalized)
 
+    def test_constructor_semantics_are_documented_and_decided(self):
+        authoring = Path('docs/task-authoring.md').read_text(encoding='utf-8')
+        adr = Path(
+            'docs/decisions/0013-name-configuration-choices.md'
+        ).read_text(encoding='utf-8')
+        index = Path('docs/decisions/README.md').read_text(encoding='utf-8')
+
+        for name in (
+            'PipelineSpec',
+            'PublisherConfig',
+            'PublicationLockPolicy',
+            'CopyLoadPolicy',
+            'SourceChangeCheckConfig',
+            'ResourceEnvironment',
+            'IdentifierPolicy',
+        ):
+            with self.subTest(configuration=name):
+                self.assertIn(f'`{name}`', authoring)
+                self.assertIn(f'`{name}`', adr)
+
+        self.assertIn('`PipelineSpec` is keyword-only.', authoring)
+        self.assertIn('Configuration choices are named.', adr)
+        self.assertIn('RunResult', adr)
+        self.assertIn('DbRunResult', adr)
+        self.assertIn('does not mandate slots', adr)
+        self.assertIn(
+            '[0013](0013-name-configuration-choices.md)',
+            index,
+        )
+
     def test_result_shapes_are_as_documented(self):
         self.assertEqual(
             {f.name for f in dataclasses.fields(tc.RunResult)},

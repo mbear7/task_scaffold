@@ -85,7 +85,7 @@ log = logging.getLogger(__name__)
 
 # --- Config ------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class CopyLoadPolicy:
     """Where and how the COPY loader spools rows before database transport.
 

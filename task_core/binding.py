@@ -66,7 +66,7 @@ from task_core.types import PipelineContractError, find_duplicates
 
 # === Resource environment ===
 
-@dataclass
+@dataclass(kw_only=True)
 class ResourceEnvironment:
     base_path: str | None = None
     file_access: object | None = None
@@ -117,7 +117,7 @@ class ResourceEnvironment:
 @dataclass(frozen=True)
 class ResourceSpec:
     loader: Callable[[ResourceEnvironment], object]
-    tracker: bool = False
+    tracker: bool = field(default=False, kw_only=True)
 
 
 # === Pipeline-resource binding ===

@@ -101,10 +101,9 @@ not inherited.
   coupled was only the *selection*: a set populated from
   `resolved_schema.source == 'declared'`, now populated from
   `payload.publication_strategy == 'refill'`.
-- `db_publication_strategy` is appended after all fields present in 0.5.0.
-  This is API hygiene rather than a legacy programme: adding an optional field
-  must not silently reinterpret an existing positional call. New code should
-  still use keyword arguments.
+- In the 0.5 implementation, `db_publication_strategy` was appended after all
+  existing fields to preserve positional construction. ADR 0013 supersedes
+  that constructor-compatibility rule in 0.7.0: `PipelineSpec` is keyword-only.
 - Direct `DbPayload`, `from_petl()` and `from_pandas()` callers receive the
   same closed-vocabulary and inferred/refill validation as `PipelineSpec`; the
   mutable payload is checked again at `publish()` as defense in depth.

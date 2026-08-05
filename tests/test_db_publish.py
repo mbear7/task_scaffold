@@ -4042,9 +4042,18 @@ class Test24InvariantsEnforcedRatherThanAssumed(unittest.TestCase):
         for bad in (True, False, 1.0, '63', None, 0, -1):
             with self.subTest(value=bad):
                 with self.assertRaises(DbPublishError):
-                    IdentifierPolicy(bad)
+                    IdentifierPolicy(max_identifier_bytes=bad)
 
-        self.assertEqual(IdentifierPolicy(63).max_identifier_bytes, 63)
+        self.assertEqual(
+            IdentifierPolicy(max_identifier_bytes=63).max_identifier_bytes,
+            63,
+        )
+
+    def test_identifier_policy_rejects_positional_configuration(self):
+        from task_core.db_publish import IdentifierPolicy
+
+        with self.assertRaises(TypeError):
+            IdentifierPolicy(63)
 
 
 

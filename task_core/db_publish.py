@@ -660,7 +660,7 @@ class PublicationPlan:
         return len(self._steps)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class IdentifierPolicy:
     """The single source of truth for identifier rules, shared by
     class-level preflight and the publisher that will do the work.
@@ -683,8 +683,8 @@ class IdentifierPolicy:
 
     def __post_init__(self):
         # `type(...) is int`, not isinstance: bool subclasses int, so
-        # IdentifierPolicy(True) was accepted and produced an effective
-        # one-byte limit rather than rejecting the configuration.
+        # IdentifierPolicy(max_identifier_bytes=True) would otherwise
+        # produce an effective one-byte limit rather than reject the config.
         if type(self.max_identifier_bytes) is not int or self.max_identifier_bytes < 1:
             raise DbPublishError(
                 f'max_identifier_bytes must be a positive integer, '
@@ -694,7 +694,7 @@ class IdentifierPolicy:
 
 DEFAULT_IDENTIFIER_POLICY = IdentifierPolicy()
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class PublicationLockPolicy:
     """How long publication may wait for ACCESS EXCLUSIVE on its targets.
 
@@ -841,7 +841,7 @@ class PublicationLockPolicy:
 from task_core.db_copy import CopyLoadPolicy
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class PublisherConfig:
     """Everything about how publication behaves, in one frozen object.
 
@@ -863,10 +863,8 @@ class PublisherConfig:
     publication_lock_policy: PublicationLockPolicy = field(
         default_factory=PublicationLockPolicy
     )
-    # Positional-stability rule (same one PublisherConfig's other fields
-    # already follow): appended after every prior field so an existing
-    # positional caller keeps its previous meaning. COPY-enabled tasks
-    # inherit this policy unless they override the per-task encryption flag.
+    # COPY-enabled tasks inherit this policy unless they override the
+    # per-task encryption flag.
     copy_load_policy: CopyLoadPolicy = field(default_factory=CopyLoadPolicy)
 
     def __post_init__(self):

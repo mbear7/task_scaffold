@@ -6,6 +6,7 @@ import argparse
 import ast
 import contextlib
 import io
+import re
 import subprocess
 import sys
 import tempfile
@@ -776,8 +777,9 @@ class DocumentationTests(unittest.TestCase):
     def test_release_version_and_architecture_claim_are_current(self):
         facade = Path('task_core/__init__.py').read_text(encoding='utf-8')
         architecture = Path('docs/architecture.md').read_text(encoding='utf-8')
-        self.assertIn("__version__ = '0.6.14'", facade)
-        self.assertIn('as of 0.6.14', architecture)
+        match = re.search(r"^__version__ = '([^']+)'$", facade, re.M)
+        self.assertIsNotNone(match)
+        self.assertIn(f'as of {match.group(1)}', architecture)
 
 
 if __name__ == '__main__':

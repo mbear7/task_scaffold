@@ -26,25 +26,17 @@ class Test1OutputSchemaConfiguration(unittest.TestCase):
         column = tc.OutputColumn('value', sa.Text())
         self.assertTrue(column.nullable)
 
-    def test_existing_positional_pipeline_spec_fields_keep_their_041_meaning(self):
-        marker = object()
-        spec = tc.PipelineSpec(
-            'x.xlsx', 'target', ('id',), {'id': 'id'}, {'id': 'BIGINT'},
-            marker, True, True, True, 'pandas',
-        )
-        self.assertIs(spec.db_table_id_pix, marker)
-        self.assertTrue(spec.db_updated_at)
-        self.assertTrue(spec.publish_result)
-        self.assertTrue(spec.debug_display)
-        self.assertEqual(spec.table_adapter, 'pandas')
-        self.assertIsNone(spec.db_not_null_columns)
-        self.assertIsNone(spec.output_schema)
+    def test_pipeline_spec_rejects_positional_configuration(self):
+        with self.assertRaises(TypeError):
+            tc.PipelineSpec('x.xlsx', 'target')
 
-    def test_existing_positional_pipeline_spec_fields_keep_their_050_meaning(self):
+    def test_pipeline_spec_keyword_construction_keeps_the_declared_contract(self):
         schema = (tc.OutputColumn('id', sa.BigInteger(), nullable=False),)
         spec = tc.PipelineSpec(
-            'x.xlsx', 'target', None, None, None, None, False, False, False,
-            'petl', None, schema,
+            excel_name='x.xlsx',
+            db_table='target',
+            table_adapter='petl',
+            output_schema=schema,
         )
         self.assertIs(spec.output_schema, schema)
         self.assertIsNone(spec.db_not_null_columns)
