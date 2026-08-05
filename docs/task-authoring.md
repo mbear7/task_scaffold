@@ -254,7 +254,7 @@ When a table already exists, especially after an earlier inferred-schema run,
 do not hand-write a 100-column declaration. Use the repository tool:
 
 ```bash
-python tools/generate_output_schema.py --schema bsr --table customer_summary
+python tools/generate_output_schema.py --table customer_summary
 ```
 
 The default output is indented for direct paste inside a task class's
@@ -267,7 +267,7 @@ class customer_summary:
         # Generated from bsr.customer_summary.
         output_schema=(
             OutputColumn('customer_id', sa.BigInteger(), nullable=False),
-            OutputColumn('revenue', sa.Numeric(18, 2), nullable=True),
+            OutputColumn('revenue', sa.Numeric(18, 2)),
         ),
     )
 ```
@@ -276,10 +276,17 @@ Use `--style class-constant` to emit a four-space `OUTPUT_SCHEMA = (...)`
 class attribute instead. Use `--output schema_snippet.py` to write UTF-8 code
 to a file. Run `python tools/generate_output_schema.py --help` for all options.
 
+When `--schema` is omitted, the tool resolves the unqualified table through
+the active PostgreSQL `search_path`. This includes connection options supplied
+by `pgcreds`, for example `options='-c search_path=bsr,public'`. Pass
+`--schema bsr` to bypass `search_path` and inspect one explicit schema. The
+comment in generated code records the schema PostgreSQL actually resolved.
+
 For notebook or editor execution without command-line arguments, open
-`tools/generate_output_schema.py`, edit `TABLE_NAME` and `SCHEMA_NAME` in the
-configuration block near the top, then run the file. The script prints the
-generated code.
+`tools/generate_output_schema.py`, edit `TABLE_NAME`, and leave
+`SCHEMA_NAME = None` to use the active PostgreSQL `search_path`. Set
+`SCHEMA_NAME` to a schema string only when explicit resolution is required,
+then run the file. The script prints the generated code.
 
 Connection settings are resolved in this order:
 
@@ -290,6 +297,10 @@ Connection settings are resolved in this order:
 Command-line values override only the supplied keys, so other pgcreds options
 such as `sslmode` remain active. The catalog connection is read-only and the
 tool never changes the table.
+
+Generated nullable columns omit `nullable=True` because that is the
+`OutputColumn` default. Only PostgreSQL `NOT NULL` columns emit
+`nullable=False`.
 
 The generated declaration contains user-owned columns only. Exclude a
 framework-owned timestamp column explicitly:

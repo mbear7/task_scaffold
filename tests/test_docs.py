@@ -768,12 +768,12 @@ class Test10OutputSchemaGeneratorBoundary(unittest.TestCase):
         source = Path('tools/generate_output_schema.py').read_text(encoding='utf-8')
         required = (
             "TABLE_NAME = ''",
-            "SCHEMA_NAME = 'public'",
+            'SCHEMA_NAME: str | None = None',
             'from pgcreds import pgcreds',
             "'--table'",
             "'--schema'",
             'readonly=True',
-            'SELECT c.relkind',
+            'pg_catalog.to_regclass',
             'pg_catalog.format_type',
         )
         for phrase in required:
@@ -798,7 +798,7 @@ class Test10OutputSchemaGeneratorBoundary(unittest.TestCase):
         for phrase in (
             'tools/generate_output_schema.py',
             '--style class-constant',
-            'edit `TABLE_NAME` and `SCHEMA_NAME`',
+            '`SCHEMA_NAME = None` to use the active PostgreSQL `search_path`',
             'no partial code is emitted',
         ):
             with self.subTest(phrase=phrase):

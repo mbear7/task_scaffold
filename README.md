@@ -153,13 +153,17 @@ When the destination table already exists, generate the declaration instead
 of typing it manually:
 
 ```bash
-python tools/generate_output_schema.py --schema bsr --table customer_summary
+python tools/generate_output_schema.py --table customer_summary
 ```
 
-The tool uses `pgcreds.py` when available, accepts command-line connection
-overrides, and also supports no-argument notebook/editor execution through the
-`TABLE_NAME` and `SCHEMA_NAME` constants at the top of the script. It performs
-read-only introspection and emits paste-ready class indentation. See
+When `--schema` is omitted, PostgreSQL resolves the table through the active
+`search_path`, including a value supplied by `pgcreds` such as
+`options='-c search_path=bsr,public'`. Pass `--schema bsr` to force one explicit
+schema. The tool accepts command-line connection overrides and also supports
+no-argument notebook/editor execution through `TABLE_NAME` and optional
+`SCHEMA_NAME` constants at the top of the script. Leave `SCHEMA_NAME = None`
+to use `search_path`. It performs read-only introspection and emits paste-ready
+class indentation. See
 [task-authoring.md](docs/task-authoring.md#generate-a-declaration-from-an-existing-table).
 
 Supplying `output_schema` disables inference. The declaration defines the

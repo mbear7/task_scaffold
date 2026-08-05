@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """Generate task_core ``output_schema`` code from an existing PostgreSQL table.
 
-Standalone command-line use::
+Standalone command-line use through the active PostgreSQL ``search_path``::
+
+    python tools/generate_output_schema.py --table customer_summary
+
+Pass ``--schema`` to bypass ``search_path`` and inspect one explicit schema::
 
     python tools/generate_output_schema.py --schema bsr --table customer_summary
 
@@ -16,9 +20,11 @@ or ``.pgpass`` when possible.
 
 Notebook / editor use without command-line arguments:
 
-1. Edit ``TABLE_NAME`` and ``SCHEMA_NAME`` in the configuration block below.
-2. Ensure ``pgcreds.py`` is importable.
-3. Run this file. The generated Python code is printed to stdout.
+1. Edit ``TABLE_NAME`` in the configuration block below.
+2. Leave ``SCHEMA_NAME`` as ``None`` to use the connection's active
+   ``search_path``, or set it to one explicit schema.
+3. Ensure ``pgcreds.py`` is importable.
+4. Run this file. The generated Python code is printed to stdout.
 
 Credential precedence is command line, inline ``DB_*`` values, then the
 ``pgcreds`` mapping when it is importable. The script performs read-only
@@ -43,11 +49,12 @@ if str(_REPOSITORY_ROOT) not in sys.path:
 
 # ---------------------------------------------------------------------------
 # Notebook / no-command-line configuration.
-# Edit TABLE_NAME and SCHEMA_NAME, then run this file.
+# Edit TABLE_NAME, and optionally SCHEMA_NAME, then run this file.
+# Leave SCHEMA_NAME as None to resolve the table through PostgreSQL search_path.
 # ---------------------------------------------------------------------------
 
 TABLE_NAME = ''
-SCHEMA_NAME = 'public'
+SCHEMA_NAME: str | None = None
 OUTPUT_STYLE = 'pipeline-argument'
 OUTPUT_NAME = 'OUTPUT_SCHEMA'
 EXCLUDE_COLUMNS: tuple[str, ...] = ()
@@ -77,13 +84,21 @@ _RELATION_KINDS = {
     'f': 'foreign table',
 }
 
-_RELATION_QUERY = '''
-SELECT c.relkind
+_RELATION_QUERY_BY_SCHEMA = '''
+SELECT c.oid, n.nspname, c.relname, c.relkind
 FROM pg_catalog.pg_class AS c
 JOIN pg_catalog.pg_namespace AS n
   ON n.oid = c.relnamespace
 WHERE n.nspname = %s
   AND c.relname = %s
+'''
+
+_RELATION_QUERY_BY_SEARCH_PATH = '''
+SELECT c.oid, n.nspname, c.relname, c.relkind
+FROM pg_catalog.pg_class AS c
+JOIN pg_catalog.pg_namespace AS n
+  ON n.oid = c.relnamespace
+WHERE c.oid = pg_catalog.to_regclass(%s)
 '''
 
 _COLUMN_QUERY = '''
@@ -103,10 +118,6 @@ SELECT
         ELSE pg_catalog.pg_get_expr(ad.adbin, ad.adrelid)
     END AS default_expression
 FROM pg_catalog.pg_attribute AS a
-JOIN pg_catalog.pg_class AS c
-  ON c.oid = a.attrelid
-JOIN pg_catalog.pg_namespace AS n
-  ON n.oid = c.relnamespace
 JOIN pg_catalog.pg_type AS t
   ON t.oid = a.atttypid
 JOIN pg_catalog.pg_namespace AS tn
@@ -114,8 +125,7 @@ JOIN pg_catalog.pg_namespace AS tn
 LEFT JOIN pg_catalog.pg_attrdef AS ad
   ON ad.adrelid = a.attrelid
  AND ad.adnum = a.attnum
-WHERE n.nspname = %s
-  AND c.relname = %s
+WHERE a.attrelid = %s
   AND a.attnum > 0
   AND NOT a.attisdropped
 ORDER BY a.attnum
@@ -170,12 +180,19 @@ def build_parser() -> argparse.ArgumentParser:
   python tools/generate_output_schema.py --schema bsr --table customer_summary \\
       --exclude-column etl_updated_at --style class-constant
 
-Without command-line arguments, edit TABLE_NAME and SCHEMA_NAME at the top of
-this file and run it from a notebook or editor. Command-line connection values
-override inline DB_* values and pgcreds.py.''',
+Without command-line arguments, edit TABLE_NAME at the top of this file.
+Leave SCHEMA_NAME as None to use the active PostgreSQL search_path, or set it
+to one explicit schema. Command-line connection values override inline DB_*
+values and pgcreds.py.''',
     )
     parser.add_argument('--table', help='existing PostgreSQL table name')
-    parser.add_argument('--schema', help='existing PostgreSQL schema name')
+    parser.add_argument(
+        '--schema',
+        help=(
+            'existing PostgreSQL schema name; omit to resolve the table '
+            'through the active search_path'
+        ),
+    )
     parser.add_argument('--host', help='PostgreSQL host; overrides pgcreds')
     parser.add_argument('--port', type=int, help='PostgreSQL port; overrides pgcreds')
     parser.add_argument(
@@ -283,33 +300,43 @@ def _connect(creds: Mapping[str, Any]):
 def inspect_table(
     connection,
     *,
-    schema: str,
+    schema: str | None,
     table: str,
 ) -> TableInspection:
     with connection.cursor() as cursor:
-        cursor.execute(_RELATION_QUERY, (schema, table))
+        if schema is None:
+            cursor.execute(_RELATION_QUERY_BY_SEARCH_PATH, (table,))
+        else:
+            cursor.execute(_RELATION_QUERY_BY_SCHEMA, (schema, table))
+
         relation_row = cursor.fetchone()
         if relation_row is None:
+            if schema is None:
+                raise SchemaGenerationError(
+                    f'PostgreSQL relation {table!r} does not exist or is not '
+                    'visible through the active search_path'
+                )
             raise SchemaGenerationError(
                 f'PostgreSQL relation {schema}.{table} does not exist'
             )
 
-        relation_kind = relation_row[0]
+        relation_oid, resolved_schema, resolved_table, relation_kind = relation_row
+        qualified_name = f'{resolved_schema}.{resolved_table}'
         if relation_kind not in ('r', 'p'):
             description = _RELATION_KINDS.get(
                 relation_kind,
                 f'unsupported relation kind {relation_kind!r}',
             )
             raise SchemaGenerationError(
-                f'{schema}.{table} is a {description}, not a publishable table'
+                f'{qualified_name} is a {description}, not a publishable table'
             )
 
-        cursor.execute(_COLUMN_QUERY, (schema, table))
+        cursor.execute(_COLUMN_QUERY, (relation_oid,))
         rows = cursor.fetchall()
 
     if not rows:
         raise SchemaGenerationError(
-            f'PostgreSQL table {schema}.{table} has no user columns'
+            f'PostgreSQL table {qualified_name} has no user columns'
         )
 
     columns = tuple(
@@ -329,8 +356,8 @@ def inspect_table(
         for row in rows
     )
     return TableInspection(
-        schema=schema,
-        table=table,
+        schema=resolved_schema,
+        table=resolved_table,
         relation_kind=relation_kind,
         columns=columns,
     )
@@ -508,20 +535,23 @@ def convert_columns(
 
 def _render_column_line(column: GeneratedColumn, *, indent: int) -> list[str]:
     prefix = ' ' * indent
-    nullable = 'True' if column.nullable else 'False'
+    nullable_argument = '' if column.nullable else ', nullable=False'
     one_line = (
         f'{prefix}OutputColumn({column.name!r}, '
-        f'{column.sqlalchemy_expression}, nullable={nullable}),'
+        f'{column.sqlalchemy_expression}{nullable_argument}),'
     )
     if len(one_line) <= 88:
         return [one_line]
-    return [
+
+    lines = [
         f'{prefix}OutputColumn(',
         f'{prefix}    {column.name!r},',
         f'{prefix}    {column.sqlalchemy_expression},',
-        f'{prefix}    nullable={nullable},',
-        f'{prefix}),',
     ]
+    if not column.nullable:
+        lines.append(f'{prefix}    nullable=False,')
+    lines.append(f'{prefix}),')
+    return lines
 
 
 def render_output_schema(
@@ -582,11 +612,6 @@ def _validate_request(args: argparse.Namespace):
             'table name is required; pass --table or edit TABLE_NAME at the '
             'top of this file'
         )
-    if not args.schema:
-        raise SchemaGenerationError(
-            'schema name is required; pass --schema or edit SCHEMA_NAME at '
-            'the top of this file'
-        )
     if args.style not in ('pipeline-argument', 'class-constant'):
         raise SchemaGenerationError(
             f'OUTPUT_STYLE must be pipeline-argument or class-constant, '
@@ -600,13 +625,16 @@ def _validate_request(args: argparse.Namespace):
             f'output name {args.name!r} is not a valid Python identifier'
         )
 
-    problems = [
-        problem
-        for problem in (
+    identifier_checks = [
+        _identifier_problem(args.table, label=f'table {args.table!r}'),
+    ]
+    if args.schema is not None:
+        identifier_checks.insert(
+            0,
             _identifier_problem(args.schema, label=f'schema {args.schema!r}'),
-            _identifier_problem(args.table, label=f'table {args.table!r}'),
         )
-        if problem is not None
+    problems = [
+        problem for problem in identifier_checks if problem is not None
     ]
     if problems:
         raise SchemaGenerationError('; '.join(problems))

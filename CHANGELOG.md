@@ -9,6 +9,30 @@ single entry from the previous README, which recorded changes
 chronologically rather than by release.
 
 
+
+## 0.6.14
+
+Refines the standalone PostgreSQL schema generator without changing task_core
+runtime behavior or public API.
+
+### Changed
+- When `--schema` is omitted, `tools/generate_output_schema.py` now resolves the
+  unqualified table through PostgreSQL's active `search_path` instead of
+  forcing `public`. An explicit `--schema` or edited `SCHEMA_NAME` still takes
+  precedence, and generated code records the schema actually resolved.
+- `SCHEMA_NAME` now defaults to `None`, so notebook/editor execution follows
+  connection options such as `options='-c search_path=bsr,public'` from
+  `pgcreds` unless the user explicitly selects a schema.
+- Generated declarations omit redundant `nullable=True`; only `NOT NULL`
+  columns emit `nullable=False`.
+
+### Tests
+- Added search-path resolution, explicit-schema precedence, resolved-schema
+  output, missing-relation diagnostics, nullable-default rendering and
+  standalone `pgcreds` `options` coverage. The tool suite now contains 39
+  deterministic tests and runs normally and under `python -O`.
+
+
 ## 0.6.13
 
 Performs a safe internal dead-code and comment-hygiene pass without changing

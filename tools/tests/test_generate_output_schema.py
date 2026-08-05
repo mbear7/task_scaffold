@@ -158,7 +158,7 @@ class CatalogInspectionTests(unittest.TestCase):
             (1, 'id', 'bigint', 'int8', 'b', 'pg_catalog', True, '', '', False, None),
             (2, 'name', 'text', 'text', 'b', 'pg_catalog', False, '', '', False, None),
         ]
-        connection = _FakeConnection([[('r',)], rows])
+        connection = _FakeConnection([[(91, 'bsr', 'customer_summary', 'r')], rows])
 
         result = tool.inspect_table(
             connection,
@@ -171,14 +171,45 @@ class CatalogInspectionTests(unittest.TestCase):
             connection.cursor_instance.executions[0][1],
             ('bsr', 'customer_summary'),
         )
-        self.assertEqual(
-            connection.cursor_instance.executions[1][1],
-            ('bsr', 'customer_summary'),
+        self.assertEqual(connection.cursor_instance.executions[1][1], (91,))
+        self.assertNotIn(
+            'to_regclass',
+            connection.cursor_instance.executions[0][0],
         )
+
+    def test_omitted_schema_resolves_through_active_search_path(self):
+        rows = [
+            (1, 'id', 'bigint', 'int8', 'b', 'pg_catalog', True, '', '', False, None),
+        ]
+        connection = _FakeConnection([
+            [(101, 'bsr', 'customer_summary', 'r')],
+            rows,
+        ])
+
+        result = tool.inspect_table(
+            connection,
+            schema=None,
+            table='customer_summary',
+        )
+
+        self.assertEqual(result.schema, 'bsr')
+        self.assertEqual(result.table, 'customer_summary')
+        query, params = connection.cursor_instance.executions[0]
+        self.assertIn('to_regclass', query)
+        self.assertEqual(params, ('customer_summary',))
+        self.assertEqual(connection.cursor_instance.executions[1][1], (101,))
+
+    def test_missing_relation_reports_search_path_resolution(self):
+        connection = _FakeConnection([[]])
+        with self.assertRaisesRegex(
+            tool.SchemaGenerationError,
+            'not visible through the active search_path',
+        ):
+            tool.inspect_table(connection, schema=None, table='missing')
 
     def test_partitioned_table_is_supported(self):
         row = (1, 'id', 'bigint', 'int8', 'b', 'pg_catalog', True, '', '', False, None)
-        connection = _FakeConnection([[('p',)], [row]])
+        connection = _FakeConnection([[(92, 'bsr', 'p', 'p')], [row]])
         result = tool.inspect_table(connection, schema='bsr', table='p')
         self.assertEqual(result.relation_kind, 'p')
 
@@ -188,12 +219,12 @@ class CatalogInspectionTests(unittest.TestCase):
             tool.inspect_table(connection, schema='bsr', table='missing')
 
     def test_view_is_rejected(self):
-        connection = _FakeConnection([[('v',)]])
+        connection = _FakeConnection([[(93, 'bsr', 'v', 'v')]])
         with self.assertRaisesRegex(tool.SchemaGenerationError, 'is a view'):
             tool.inspect_table(connection, schema='bsr', table='v')
 
     def test_zero_column_table_is_rejected(self):
-        connection = _FakeConnection([[('r',)], []])
+        connection = _FakeConnection([[(94, 'bsr', 'empty', 'r')], []])
         with self.assertRaisesRegex(tool.SchemaGenerationError, 'no user columns'):
             tool.inspect_table(connection, schema='bsr', table='empty')
 
@@ -374,6 +405,20 @@ class SelectionAndRenderingTests(unittest.TestCase):
         wrapped = 'class Example:\n    spec = PipelineSpec(\n' + code + '    )\n'
         ast.parse(wrapped)
 
+    def test_nullable_true_uses_outputcolumn_default(self):
+        inspection = _inspection(_column('name', 'text'))
+        columns, _ = tool.convert_columns(inspection)
+
+        code = tool.render_output_schema(
+            inspection,
+            columns,
+            style='pipeline-argument',
+            output_name='OUTPUT_SCHEMA',
+        )
+
+        self.assertIn("OutputColumn('name', sa.Text()),", code)
+        self.assertNotIn('nullable=True', code)
+
     def test_class_constant_is_paste_ready_inside_task_class(self):
         inspection = _inspection(_column('id', 'bigint', not_null=True))
         columns, _ = tool.convert_columns(inspection)
@@ -404,6 +449,7 @@ class SelectionAndRenderingTests(unittest.TestCase):
         )
 
         self.assertEqual(code.count('OutputColumn('), 150)
+        self.assertNotIn('nullable=True', code)
         self.assertEqual(warnings, ())
         ast.parse('class Example:\n    spec = PipelineSpec(\n' + code + '    )\n')
 
@@ -487,6 +533,7 @@ pgcreds = {
     'dbname': 'analytics',
     'user': 'reporter',
     'sslmode': 'require',
+    'options': '-c search_path=bsr,public',
 }
 """
         fake_psycopg2 = """
@@ -504,8 +551,11 @@ class Cursor:
     def execute(self, query, params):
         self.step += 1
         if self.step == 1:
-            self.current = [('r',)]
+            assert 'to_regclass' in query
+            assert params == ('customer_summary',)
+            self.current = [(123, 'bsr', 'customer_summary', 'r')]
         else:
+            assert params == (123,)
             self.current = [
                 (1, 'id', 'bigint', 'int8', 'b', 'pg_catalog', True, '', '', False, None),
                 (2, 'name', 'text', 'text', 'b', 'pg_catalog', False, '', '', False, None),
@@ -538,6 +588,7 @@ def connect(**kwargs):
     assert kwargs['dbname'] == 'analytics'
     assert kwargs['user'] == 'reporter'
     assert kwargs['sslmode'] == 'require'
+    assert kwargs['options'] == '-c search_path=bsr,public'
     return Connection()
 """
 
@@ -556,7 +607,6 @@ def connect(**kwargs):
                 [
                     sys.executable,
                     str(script_path),
-                    '--schema', 'bsr',
                     '--table', 'customer_summary',
                     '--host', 'cli-host',
                 ],
@@ -567,11 +617,14 @@ def connect(**kwargs):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('        # Generated from bsr.customer_summary.', result.stdout)
         self.assertIn('        output_schema=(', result.stdout)
         self.assertIn(
             "OutputColumn('id', sa.BigInteger(), nullable=False)",
             result.stdout,
         )
+        self.assertIn("OutputColumn('name', sa.Text())", result.stdout)
+        self.assertNotIn('nullable=True', result.stdout)
         self.assertEqual(result.stderr, '')
 
     def test_help_is_available_from_standalone_script(self):
@@ -584,7 +637,8 @@ def connect(**kwargs):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('--table', result.stdout)
         self.assertIn('--exclude-column', result.stdout)
-        self.assertIn('notebook or editor', result.stdout)
+        self.assertIn('active search_path', result.stdout)
+        self.assertIn('Without command-line arguments', result.stdout)
 
     def test_main_writes_utf8_output_file_and_warning(self):
         parser = tool.build_parser()
@@ -656,6 +710,18 @@ def connect(**kwargs):
         self.assertEqual(args.table, 'inline_table')
         self.assertEqual(args.schema, 'inline_schema')
 
+    def test_no_argument_mode_uses_search_path_when_schema_is_none(self):
+        parser = tool.build_parser()
+        args = parser.parse_args([])
+        with (
+            mock.patch.object(tool, 'TABLE_NAME', 'inline_table'),
+            mock.patch.object(tool, 'SCHEMA_NAME', None),
+        ):
+            args = tool._effective_args(args)
+            tool._validate_request(args)
+        self.assertEqual(args.table, 'inline_table')
+        self.assertIsNone(args.schema)
+
     def test_missing_table_explains_both_entry_modes(self):
         parser = tool.build_parser()
         args = parser.parse_args([])
@@ -689,7 +755,8 @@ class DocumentationTests(unittest.TestCase):
         required = (
             'tools/generate_output_schema.py',
             '--style class-constant',
-            'edit `TABLE_NAME` and `SCHEMA_NAME`',
+            '`SCHEMA_NAME = None` to use the active PostgreSQL `search_path`',
+            'active PostgreSQL `search_path`',
             'pgcreds.pgcreds',
             'no partial code is emitted',
             '--exclude-column etl_updated_at',
@@ -709,8 +776,8 @@ class DocumentationTests(unittest.TestCase):
     def test_release_version_and_architecture_claim_are_current(self):
         facade = Path('task_core/__init__.py').read_text(encoding='utf-8')
         architecture = Path('docs/architecture.md').read_text(encoding='utf-8')
-        self.assertIn("__version__ = '0.6.13'", facade)
-        self.assertIn('as of 0.6.13', architecture)
+        self.assertIn("__version__ = '0.6.14'", facade)
+        self.assertIn('as of 0.6.14', architecture)
 
 
 if __name__ == '__main__':
