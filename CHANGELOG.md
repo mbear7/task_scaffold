@@ -10,6 +10,29 @@ chronologically rather than by release.
 
 
 
+## 0.7.1
+
+Cleans up SQLite resources owned by database-publication test fixtures.
+Production runtime behavior and public API are unchanged.
+
+### Fixed
+- PostgreSQL-dialect test doubles backed by real SQLite connections now close
+  their checked-out connection and dispose their owned SQLAlchemy engine.
+- Tests that attach those SQLite-backed connections to a `DbPublisher` now
+  register publisher cleanup instead of leaving the connection to garbage
+  collection.
+- The source-state transaction test now disposes its local SQLite engine after
+  closing the connection.
+- Session-loss tests close the original SQLAlchemy connection before replacing
+  it with an invalidated connection stand-in.
+
+### Tests
+- Added direct regression coverage proving that SQLite-backed test doubles
+  dispose their owned engines.
+- The acceptance suite is expected to complete without
+  `ResourceWarning: unclosed database` diagnostics.
+
+
 ## 0.7.0
 
 Adopts role-based constructor semantics for dataclasses. Author-facing

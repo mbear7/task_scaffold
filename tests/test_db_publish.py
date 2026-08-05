@@ -1875,7 +1875,10 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
                 return None
             if lowered.startswith('set local'):
                 return None
-            if 'pg_try_advisory_lock' in lowered:
+            if (
+                'pg_try_advisory_lock' in lowered
+                or 'pg_advisory_unlock' in lowered
+            ):
                 return _Scalar(True)
             if 'pg_class' in lowered and 'relname like' in lowered:
                 return _Rows([])            # predecessor scan: nothing left behind
@@ -1928,12 +1931,16 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
             self._real.rollback()
 
         def close(self):
-            self._real.close()
+            try:
+                self._real.close()
+            finally:
+                self._engine.dispose()
 
     def _publisher(self, conn):
         publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
         publisher._conn = conn
-        publisher._engine = object()
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        self.addCleanup(publisher.close)
         # publish() now enforces the unconditional-lock contract itself
         # rather than trusting the caller, so the fixture must claim the
         # task the way a real run does.
@@ -2107,7 +2114,8 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         conn = Test17PreparationValidationAndOwnership._Conn(columns=['a'])
         publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
         publisher._conn = conn
-        publisher._engine = object()
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        self.addCleanup(publisher.close)
         publisher.begin_run()
 
         before_publish = len(conn.statements)
@@ -2156,7 +2164,8 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         conn = Test17PreparationValidationAndOwnership._Conn(columns=['a'])
         publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
         publisher._conn = conn
-        publisher._engine = object()
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        self.addCleanup(publisher.close)
         publisher.begin_run()
 
         calls = []
@@ -3001,7 +3010,8 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
             ),
         )
         publisher._conn = conn
-        publisher._engine = object()
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        self.addCleanup(publisher.close)
         publisher.begin_run()
         return publisher
 
@@ -3069,7 +3079,8 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
                     ),
                 )
                 publisher._conn = conn
-                publisher._engine = object()
+                publisher._engine = type('E', (), {'dispose': lambda self: None})()
+                self.addCleanup(publisher.close)
                 self.assertTrue(publisher.begin_run())
                 self.assertFalse(root.exists())
 
@@ -3115,7 +3126,8 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
                     ),
                 )
                 publisher._conn = conn
-                publisher._engine = object()
+                publisher._engine = type('E', (), {'dispose': lambda self: None})()
+                self.addCleanup(publisher.close)
                 self.assertTrue(publisher.begin_run())
 
                 module.LOADERS['copy'] = failing_loader
@@ -3624,12 +3636,16 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
             self._real.rollback()
 
         def close(self):
-            self._real.close()
+            try:
+                self._real.close()
+            finally:
+                self._engine.dispose()
 
     def _publisher(self, conn, *, claim=True):
         publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
         publisher._conn = conn
         publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        self.addCleanup(publisher.close)
         if claim:
             publisher.begin_run()
         return publisher
@@ -3653,6 +3669,7 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
         from task_core.source_state import SourceStateStore
 
         engine = sa.create_engine('sqlite://')
+        self.addCleanup(engine.dispose)
         conn = engine.connect()
         self.addCleanup(conn.close)
         conn.execute(sa.text(
@@ -3850,10 +3867,17 @@ class Test21CleanupNeverReconnectsAfterSessionLoss(unittest.TestCase):
         publisher.publish(from_petl(etl.wrap([['v'], [1]]), table_name='t', schema=None))
         return publisher
 
+    def _replace_with_invalidated(self, publisher):
+        original = publisher._conn
+        lost = self._Invalidated()
+        original.close()
+        publisher._conn = lost
+        return lost, original
+
     def test_rollback_runs_no_sql_on_an_invalidated_connection(self):
         publisher = self._prepared_publisher()
-        lost = self._Invalidated()
-        publisher._conn = lost
+        lost, original = self._replace_with_invalidated(publisher)
+        self.assertTrue(original.closed, 'the replaced SQLAlchemy connection was orphaned')
 
         publisher.rollback()
 
@@ -3865,8 +3889,8 @@ class Test21CleanupNeverReconnectsAfterSessionLoss(unittest.TestCase):
         # PostgreSQL releases a session-scoped lock when the session dies;
         # attempting an explicit unlock would only force a reconnect.
         publisher = self._prepared_publisher()
-        lost = self._Invalidated()
-        publisher._conn = lost
+        lost, original = self._replace_with_invalidated(publisher)
+        self.assertTrue(original.closed, 'the replaced SQLAlchemy connection was orphaned')
 
         publisher.release_task_lock()
 
@@ -3875,8 +3899,8 @@ class Test21CleanupNeverReconnectsAfterSessionLoss(unittest.TestCase):
 
     def test_close_does_not_reconnect_to_unlock(self):
         publisher = self._prepared_publisher()
-        lost = self._Invalidated()
-        publisher._conn = lost
+        lost, original = self._replace_with_invalidated(publisher)
+        self.assertTrue(original.closed, 'the replaced SQLAlchemy connection was orphaned')
 
         publisher.close()
 
@@ -3951,6 +3975,7 @@ class Test23ProtocolAndTransactionRefinements(unittest.TestCase):
                                 publication_plan=plan)
         publisher._conn = Test20GapsFoundReviewingTheStagedModel._Conn()
         publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        self.addCleanup(publisher.close)
 
         with self.assertRaises(DbPublishError) as caught:
             publisher.commit()
@@ -4923,6 +4948,39 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
         from task_core.db_publish import CopyLoadPolicy as _direct
         self.assertIs(tc.CopyLoadPolicy, _direct)
 
+
+
+class Test25SqliteFixtureOwnership(unittest.TestCase):
+    """Real SQLite engines owned by PostgreSQL test doubles are disposed.
+
+    These tests are intentionally about the fixture boundary. Closing only
+    the checked-out SQLAlchemy connection leaves the in-memory engine pool
+    holding a DBAPI connection until garbage collection, which surfaces as
+    ResourceWarning noise and can hide genuine lifecycle regressions.
+    """
+
+    def _assert_owned_engine_is_disposed(self, conn):
+        from unittest import mock
+
+        with mock.patch.object(
+            conn._engine,
+            'dispose',
+            wraps=conn._engine.dispose,
+        ) as dispose:
+            conn.close()
+
+        self.assertTrue(conn._real.closed)
+        dispose.assert_called_once_with()
+
+    def test_preparation_fixture_disposes_its_owned_engine(self):
+        self._assert_owned_engine_is_disposed(
+            Test17PreparationValidationAndOwnership._Conn()
+        )
+
+    def test_staged_model_fixture_disposes_its_owned_engine(self):
+        self._assert_owned_engine_is_disposed(
+            Test20GapsFoundReviewingTheStagedModel._Conn()
+        )
 
 
 if __name__ == '__main__':
