@@ -150,6 +150,26 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
         )
         self.assertIn('Status: accepted — complete.', text)
         self.assertNotIn('Formal closure remains pending', text)
+
+        # §Verification status accumulated by prepending each new release
+        # above the older text, so it climbed to closure and then fell back
+        # to 0.6.3/0.5.2/0.5.1 and ended on two gates written as though the
+        # ADR were still open. A closed ADR must not read as pending.
+        for reopening in (
+            'ADR 0011 is complete as a decision only when',
+            'Before 0.5.2 becomes the accepted INSERT reference baseline',
+        ):
+            with self.subTest(reopening=reopening):
+                self.assertNotIn(reopening, normalized)
+
+        # The releases that section skipped: 0.6.8 is where the first live
+        # Phase 8 run failed and forced the TIMESTAMPTZ correction, and
+        # 0.6.9/0.6.10 restructured the declared path before closure.
+        verification = text.split('## Verification status', 1)[1]
+        for release in ('0.6.8', '0.6.9'):
+            with self.subTest(release=release):
+                self.assertIn(release, verification)
+
         self.assertIn('### Formal closure result', text)
         self.assertIn('| 10m | `replace` | 337.39 s | 106.12 s |', text)
         self.assertIn('| 10m | `refill` | 542.37 s | 315.44 s |', text)
@@ -174,6 +194,51 @@ class Test1DocumentedApiMatchesTheCode(unittest.TestCase):
         ):
             with self.subTest(expected_result=expected_result):
                 self.assertIn(expected_result, normalized)
+
+    def test_adr_0011_verification_status_reads_in_release_order(self):
+        """The section must not walk backwards through releases.
+
+        It had grown by prepending each new release above the older text, so
+        it climbed to closure and then fell back through 0.6.3, 0.5.2 and
+        0.5.1. A first pass at fixing that left one jump behind -- a summary
+        paragraph running to 0.6.5 sat immediately above the detailed 0.6.3
+        paragraph -- because nothing asserted the ordering the cleanup
+        claimed.
+
+        Keyed on releases that *begin a sentence*, which is how this section
+        narrates one ("0.6.4 shipped ...") as opposed to merely referring to
+        one ("... because 0.5.2 does not change strategy selection"). Keying
+        on the first release per paragraph was tried first and proved too
+        weak: merging 0.6.4/0.6.5 back into the paragraph that opens on 0.6.0
+        leaves that paragraph's first release unchanged, so the regression
+        passed. Sentence-initial keying catches both that and whole-paragraph
+        reordering, since a paragraph's opening release is sentence-initial
+        too.
+        """
+        text = Path(
+            'docs/decisions/0011-add-bounded-memory-copy-loader.md'
+        ).read_text(encoding='utf-8')
+        verification = text.split('## Verification status', 1)[1]
+
+        sequence = []
+        for paragraph in verification.split('\n\n'):
+            flat = ' '.join(paragraph.split())
+            for found in re.finditer(
+                r'(?:^|(?<=\. ))(\d+)\.(\d+)\.(\d+)\b', flat
+            ):
+                sequence.append((
+                    tuple(int(part) for part in found.groups()),
+                    flat[max(0, found.start()):found.start() + 60],
+                ))
+
+        self.assertGreater(len(sequence), 5, 'no releases parsed')
+        for (earlier, first), (later, second) in zip(sequence, sequence[1:]):
+            with self.subTest(earlier=earlier, later=later):
+                self.assertLessEqual(
+                    earlier, later,
+                    f'§Verification status goes backwards: '
+                    f'"{first}..." is followed by "{second}..."'
+                )
 
     def test_constructor_semantics_are_documented_and_decided(self):
         authoring = Path('docs/task-authoring.md').read_text(encoding='utf-8')
@@ -876,6 +941,7 @@ class Test11SafeSourceHygiene(unittest.TestCase):
                 'task_core/db_publish.py',
                 'task_core/db_values.py',
                 'task_core/export.py',
+                'task_core/db_insert.py',
                 'task_core/source_state.py',
                 'tests/test_source_change_runner.py',
             )
@@ -897,6 +963,12 @@ class Test11SafeSourceHygiene(unittest.TestCase):
                 'CLAUDE.md',
                 'real Phase 6',
                 'Phase 5 COPY chain',
+            ),
+            # db_insert stopped being the only loader in 0.6.6, but its
+            # module docstring still said so through 0.7.1 -- including
+            # across the 0.6.13 comment-hygiene pass.
+            'task_core/db_insert.py': (
+                'and today, only -- loader',
             ),
             'task_core/source_state.py': ('import re',),
             'tests/test_source_change_runner.py': (

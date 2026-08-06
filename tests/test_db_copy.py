@@ -2796,10 +2796,6 @@ class Test24CloseAndWriteFailureSemantics(unittest.TestCase):
             db_copy_module._write_all(ZeroWriter(), b'x')
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class Test19DbapiCopyTransport(unittest.TestCase):
     class _Cursor:
         def __init__(self, owner, *, error=None, close_error=None):
@@ -2963,3 +2959,101 @@ class Test19DbapiCopyTransport(unittest.TestCase):
                     load_copy_into_staging(conn, self._table(), prepared)
             finally:
                 cleanup_spool_paths([prepared.path])
+
+
+class Test25DeclaredFastPathMatchesTheGenericSerializerByte(unittest.TestCase):
+    """The compiled declared writers must agree with the generic chain.
+
+    0.6.10 gave declared COPY one compiled writer per column, fusing missing
+    handling, validation and encoding. That path bypasses `_normalize_value()`,
+    the generic declared validator and `serialize_row_to_copytext()`. Nothing
+    pinned the two together: Test19c asserts the fast path's bytes against a
+    hardcoded literal whose only text value is `'x\\ty'`, so tab was covered
+    incidentally and nothing else was.
+
+    Two independent breaks were injected to size the gap, and the full suite
+    reported OK under both:
+
+    - escaping tab/newline/CR but not backslash -- a user's literal `\\N` goes
+      onto the wire as `\\N`, which PostgreSQL COPY reads as SQL NULL. Correct
+      row count, no diagnostic, wrong data in the live table;
+    - escaping backslash/tab but not newline/CR -- a record splits early.
+
+    This asserts equality between the two paths rather than against a literal,
+    so it cannot go stale as the corpus grows, and it fails if a future
+    optimization inlines escaping instead of delegating to the one escaper
+    ADR 0011 requires (`Escaping exists once in db_copy.py`).
+
+    The corpus is the list ADR 0011 §Final serialization says the serializer
+    must handle at minimum.
+    """
+
+    CASES = (
+        ('bool true', sa.Boolean(), False, True),
+        ('bool false', sa.Boolean(), False, False),
+        ('smallint', sa.SmallInteger(), False, -7),
+        ('integer', sa.Integer(), False, 42),
+        ('bigint', sa.BigInteger(), False, 2 ** 40),
+        ('numeric exact', sa.Numeric(10, 2), False, Decimal('12.30')),
+        ('numeric negative', sa.Numeric(10, 2), False, Decimal('-0.01')),
+        ('float finite', sa.Float(), False, 3.5),
+        ('float inf', sa.Float(), False, float('inf')),
+        ('float -inf', sa.Float(), False, float('-inf')),
+        ('text plain', sa.String(50), False, 'hello'),
+        # NULL versus empty string is a distinction COPY text must keep.
+        ('text empty', sa.Text(), False, ''),
+        # The silent-corruption case: literal backslash-N must not become NULL.
+        ('text literal backslash-N', sa.Text(), False, '\\N'),
+        ('text backslash-n', sa.Text(), False, '\\n'),
+        ('text double backslash', sa.Text(), False, '\\\\'),
+        ('text tab', sa.Text(), False, 'a\tb'),
+        ('text newline', sa.Text(), False, 'a\nb'),
+        ('text carriage return', sa.Text(), False, 'a\r\nb'),
+        ('text unicode', sa.Text(), False, 'привет \U0001F600 mixed'),
+        ('bytes', sa.LargeBinary(), False, b'\x00\xff'),
+        ('date', sa.Date(), False, date(2026, 8, 2)),
+        (
+            'datetime naive', sa.DateTime(), False,
+            datetime(2026, 8, 2, 10, 11, 12),
+        ),
+        (
+            'datetime aware', sa.DateTime(timezone=True), False,
+            datetime(2026, 8, 2, 10, 11, 12, tzinfo=timezone.utc),
+        ),
+        ('null text', sa.Text(), True, None),
+        ('null integer', sa.Integer(), True, None),
+        ('null bool', sa.Boolean(), True, None),
+        ('null datetime', sa.DateTime(), True, None),
+    )
+
+    def _compiled_bytes(self, column, value, directory):
+        prepared = prepare_copy_source(
+            row_source=[(value,)],
+            columns=[column.name],
+            declared_schema=(column,),
+            identity=_make_identity(),
+            directory=directory,
+        )
+        try:
+            return _read_copytext_body(prepared)
+        finally:
+            cleanup_spool_paths([prepared.path])
+
+    def test_every_declared_family_serializes_identically_on_both_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, sa_type, nullable, value in self.CASES:
+                with self.subTest(case=label):
+                    column = ResolvedColumn('c', sa_type, nullable)
+                    generic = serialize_row_to_copytext(
+                        {column.name: value}, [column], 'tbl', 1,
+                    )
+                    compiled = self._compiled_bytes(column, value, Path(tmp))
+                    self.assertEqual(
+                        compiled, generic,
+                        f'{label}: compiled declared writer disagrees with '
+                        f'the generic serializer'
+                    )
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -165,7 +165,13 @@ class TestShippedFilesDoNotNameExternalModules(unittest.TestCase):
         if not names:
             self.skipTest('no externally supplied modules declared in .gitignore')
 
-        roots = ['task_core', 'docs', 'examples', 'tests', 'README.md', 'CHANGELOG.md']
+        # `tools/` postdates this test and shipped ~1500 lines outside its
+        # scope. Confirmed by injecting a forbidden name there and watching
+        # the tripwire pass.
+        roots = [
+            'task_core', 'docs', 'examples', 'tests', 'tools',
+            'README.md', 'CHANGELOG.md',
+        ]
         offenders = {}
 
         for root in roots:
@@ -196,6 +202,127 @@ class TestShippedFilesDoNotNameExternalModules(unittest.TestCase):
         self.assertEqual(
             offenders, {},
             f'shipped files name externally supplied module(s): {offenders}'
+        )
+
+
+class TestNoTestModuleHidesCasesBehindItsMainBlock(unittest.TestCase):
+    """`unittest.main()` must be the last statement in a test module.
+
+    A test class defined *after* `if __name__ == '__main__': unittest.main()`
+    is invisible when the file is run directly: at the moment main() executes,
+    that class does not exist yet. Discovery still finds it, because discovery
+    imports the module under its real name and never runs the block -- so the
+    two invocations disagree and the direct run still prints `OK`.
+
+    This happened in two files at once. `tests/test_db_copy.py` ran 206 of 211
+    cases and `tests/test_types.py` ran 10 of 32, both reporting success. The
+    documented commands all use discovery, which is why it survived: nothing
+    that anyone was told to run could observe it.
+    """
+
+    def _module_paths(self):
+        # Both suites, not just this directory. `tools/tests/` is exactly the
+        # kind of latecomer that drifted outside the external-module tripwire
+        # above; a new tripwire should not repeat that.
+        for directory in (
+            _THIS_DIR,
+            os.path.join(_PROJECT_ROOT, 'tools', 'tests'),
+        ):
+            if not os.path.isdir(directory):
+                continue
+            for name in sorted(os.listdir(directory)):
+                if name.startswith('test_') and name.endswith('.py'):
+                    yield os.path.join(directory, name)
+
+    @staticmethod
+    def _is_main_guard(node):
+        if not isinstance(node, ast.If):
+            return False
+        test = node.test
+        return (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == '__name__'
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == '__main__'
+        )
+
+    @classmethod
+    def _statements_after_main_guard(cls, source):
+        """Names (or node types) of every top-level statement after the guard.
+
+        Every statement, not just ClassDef/FunctionDef. A test case built by
+        assignment -- `T = type('T', (unittest.TestCase,), {...})` -- is a
+        plain Assign node, and the first version of this scanner ignored it:
+        discovery saw 33 cases, a direct run saw 32, and the tripwire stayed
+        green. Comments and blank lines leave no AST node, so this cleanly
+        means "the guard is the last statement".
+        """
+        body = ast.parse(source).body
+        guard = next(
+            (i for i, node in enumerate(body) if cls._is_main_guard(node)),
+            None,
+        )
+        if guard is None:
+            return []
+        return [
+            getattr(node, 'name', type(node).__name__)
+            for node in body[guard + 1:]
+        ]
+
+    def test_assignment_after_main_guard_is_detected(self):
+        """Protects the scanner itself, against synthetic source.
+
+        The repository scan below cannot protect it: every real guard is
+        already last, so reverting the scanner to its ClassDef/FunctionDef
+        filter leaves the whole suite green. Only synthetic source that
+        actually contains the defect can fail when the fix is reverted.
+        """
+        source = (
+            "import unittest\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    unittest.main()\n"
+            "\n"
+            "TestGenerated = type(\n"
+            "    'TestGenerated',\n"
+            "    (unittest.TestCase,),\n"
+            "    {'test_generated': lambda self: None},\n"
+            ")\n"
+        )
+        self.assertEqual(
+            self._statements_after_main_guard(source), ['Assign'],
+            'a TestCase built by assignment after the main guard went '
+            'unnoticed; discovery would run it and a direct run would not'
+        )
+
+    def test_a_clean_module_reports_nothing_after_the_guard(self):
+        source = (
+            "import unittest\n"
+            "\n"
+            "class TestOne(unittest.TestCase):\n"
+            "    def test_x(self):\n"
+            "        pass\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    unittest.main()\n"
+        )
+        self.assertEqual(self._statements_after_main_guard(source), [])
+
+    def test_nothing_at_all_follows_the_main_guard(self):
+        offenders = {}
+        for path in self._module_paths():
+            hidden = self._statements_after_main_guard(
+                Path(path).read_text(encoding='utf-8')
+            )
+            if hidden:
+                offenders[os.path.relpath(path, _PROJECT_ROOT)] = hidden
+
+        self.assertEqual(
+            offenders, {},
+            'these statements follow `if __name__ == "__main__"` and are '
+            f'silently skipped when the file is run directly: {offenders}'
         )
 
 

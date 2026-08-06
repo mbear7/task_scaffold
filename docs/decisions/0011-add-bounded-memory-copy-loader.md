@@ -1607,7 +1607,9 @@ for small outputs.
 ## Consequences
 
 - Loader selection remains an explicit part of task design and independent of schema source and publication strategy.
-- `PipelineSpec` gains one backward-compatible field.
+- `PipelineSpec` gained one field, appended so positional construction kept
+  its meaning at the time. ADR 0013 superseded that rule in 0.7.0 and
+  `PipelineSpec` is now keyword-only.
 - Database-only lazy PETL COPY can avoid both the current cache and the
   whole-table list of dictionaries.
 - Multiple-consumer PETL pipelines may still materialize because those
@@ -1630,39 +1632,33 @@ for small outputs.
 
 ## Verification status
 
+The accepted 0.5.1 PostgreSQL evidence remains applicable to publication
+mechanics because 0.5.2 does not change strategy selection, locking, refill,
+rollback or cleanup:
+
+- the PostgreSQL 16.11 live-server publication-strategy campaign passed 9/9;
+- the PostgreSQL 16.11 VPS concurrency and recovery campaign passed 10/10;
+- both campaigns completed with no owned staging artifacts left behind.
+
+The local `task_core` 0.5.2 candidate passes 470 automated tests. It tightens
+the INSERT-path declared type contract so SQLAlchemy type parameters cannot be
+silently erased during PostgreSQL rendering, and normalizes PostgreSQL-invalid
+NUL text into contextual framework rejection.
+
+That baseline was gated on the external 0.5.2 VPS declared-types campaign
+passing its full round-trip, replacement, refill, catalog and rejection
+matrix, with ambiguous type shapes and NUL text required to fail as
+`DbPublishError` before any live target is created or changed. No evidence
+from that campaign survives, and none is reconstructible. Rather than treat
+a five-release-old gate as outstanding forever, the equivalent matrix was
+rerun against the current implementation; see the 0.7.2 entry below. The
+accepted live evidence carried forward is therefore the 0.5.1 campaigns
+above, the 0.6.10 closure campaign below, and that rerun.
+
 Phases 1 and 2 shipped in 0.6.0 (commit `1c55a42`), together with
 Phase 3a. 0.6.2 shipped the Phase 3b row-source/projection helpers and the
 Phase 4 traversal-planning skeleton; 0.6.3 corrected overstatements about
-that skeleton and tightened one-shot and projection invariants. 0.6.4 shipped
-the internal Phase 5 spool-preparation chain. 0.6.5 restored full INSERT/COPY
-preparation parity, added encrypted spool bodies by default with explicit
-per-task opt-out, and hardened current-run and positive-ownership cleanup
-primitives.
-
-0.6.6 ships Phase 6: `db_loader='copy'` is public, `run_pipelines()` builds the
-one-shot payload, `DbPublisher` prepares the spool before its staging
-transaction, and `db_copy.load_copy_into_staging()` streams the authenticated
-COPY-text body through psycopg2 `copy_expert()` on the existing connection.
-The publisher removes the final spool before successful preparation commit and
-retains ownership of verification, comments, rollback and publication.
-Unit tests prove exact SQL construction, bounded authenticated reader use,
-connection-loss invalidation, current-run cleanup and no runner pre-count.
-Live PostgreSQL acceptance is still Phase 8 evidence, not claimed by 0.6.6.
-
-0.6.7 ships Phase 7: `begin_run()` performs positive, task-scoped predecessor
-spool cleanup only after acquiring the advisory lock. This removes residue left
-when a process crash prevented current-run cleanup; it does not recover task
-data or resume work. Unknown, malformed and foreign files remain untouched,
-and known-owned residue that cannot be deleted is fatal. COPY SQL also declares
-`ENCODING 'UTF8'`, matching the serializer's unconditional UTF-8 bytes. Live
-PostgreSQL acceptance remains Phase 8 evidence and is not claimed by 0.6.7.
-
-0.6.10 completed Phase 8 on the target localhost PostgreSQL 18.4 instance.
-The complete repository, adversarial concurrency/failure, lazy-source memory
-and randomized 1m/10m release campaigns all passed. ADR 0011 is therefore
-closed. Version 0.6.11 is a post-closure cleanup hardening change: after owned
-spool files are removed, task_core best-effort removes its empty implicit
-default spool root with `rmdir()`. Configured directories are never removed.
+that skeleton and tightened one-shot and projection invariants.
 
 0.6.3 corrected the 0.6.2 language that described the
 runner as a "real consumer" of `DbRowSource` — it consumes the *string*
@@ -1684,26 +1680,58 @@ asserts `_ProjectedRowSource` produces byte-identical output to the current
 INSERT path (which stays untouched), so the two cannot silently drift;
 verified by revert-observe-restore.
 
-The local `task_core` 0.5.2 candidate passes 470 automated tests. It tightens
-the INSERT-path declared type contract so SQLAlchemy type parameters cannot be
-silently erased during PostgreSQL rendering, and normalizes PostgreSQL-invalid
-NUL text into contextual framework rejection.
+0.6.4 shipped the internal Phase 5 spool-preparation chain. 0.6.5 restored
+full INSERT/COPY preparation parity, added encrypted spool bodies by default
+with explicit per-task opt-out, and hardened current-run and
+positive-ownership cleanup primitives.
 
-The accepted 0.5.1 PostgreSQL evidence remains applicable to publication
-mechanics because 0.5.2 does not change strategy selection, locking, refill,
-rollback or cleanup:
+0.6.6 ships Phase 6: `db_loader='copy'` is public, `run_pipelines()` builds the
+one-shot payload, `DbPublisher` prepares the spool before its staging
+transaction, and `db_copy.load_copy_into_staging()` streams the authenticated
+COPY-text body through psycopg2 `copy_expert()` on the existing connection.
+The publisher removes the final spool before successful preparation commit and
+retains ownership of verification, comments, rollback and publication.
+Unit tests prove exact SQL construction, bounded authenticated reader use,
+connection-loss invalidation, current-run cleanup and no runner pre-count.
+Live PostgreSQL acceptance is still Phase 8 evidence, not claimed by 0.6.6.
 
-- the PostgreSQL 16.11 live-server publication-strategy campaign passed 9/9;
-- the PostgreSQL 16.11 VPS concurrency and recovery campaign passed 10/10;
-- both campaigns completed with no owned staging artifacts left behind.
+0.6.7 ships Phase 7: `begin_run()` performs positive, task-scoped predecessor
+spool cleanup only after acquiring the advisory lock. This removes residue left
+when a process crash prevented current-run cleanup; it does not recover task
+data or resume work. Unknown, malformed and foreign files remain untouched,
+and known-owned residue that cannot be deleted is fatal. COPY SQL also declares
+`ENCODING 'UTF8'`, matching the serializer's unconditional UTF-8 bytes. Live
+PostgreSQL acceptance remains Phase 8 evidence and is not claimed by 0.6.7.
 
-Before 0.5.2 becomes the accepted INSERT reference baseline for COPY, the
-external 0.5.2 VPS declared-types campaign must pass its full round-trip,
-replacement, refill, catalog and rejection matrix. The campaign specifically
-requires ambiguous type shapes and NUL text to fail as `DbPublishError` before
-any live target is created or changed.
+0.6.8 corrected the first live Phase 8 findings on PostgreSQL 18.4. The
+first live acceptance run failed: inferred timezone-aware and naive
+datetimes were classified as one family and both resolved to `timestamp
+without time zone`, so INSERT applied session-timezone semantics while COPY
+discarded the offset for the same target type. 0.6.8 resolves aware-only
+columns to `TIMESTAMPTZ`, rejects columns mixing aware datetimes with naive
+datetimes or bare dates before any database work, and extends sample
+verification to datetime awareness so a post-sample mismatch triggers
+re-inference rather than a silent naive timestamp. The failed first run is
+preserved as evidence rather than discarded.
 
-ADR 0011 is complete as a decision only when the implementation demonstrates:
+0.6.9 and 0.6.10 optimized COPY preparation before closure. Declared mode
+stopped creating the neutral predecessor spool and writes the final
+COPY-text spool in one pass; both modes compile the row serializer once per
+payload; and 0.6.10 added one compiled direct field writer per declared
+column, so ordinary native Python values no longer traverse the generic
+normalization, validation and serialization chain. Non-native scalar
+wrappers still fall back to the shared kernel. Publication, spool
+protection and bounded-memory behavior are unchanged, and Phase 8 was rerun
+against the optimized implementation.
+
+0.6.10 completed Phase 8 on the target localhost PostgreSQL 18.4 instance.
+The complete repository, adversarial concurrency/failure, lazy-source memory
+and randomized 1m/10m release campaigns all passed. ADR 0011 is therefore
+closed. Version 0.6.11 is a post-closure cleanup hardening change: after owned
+spool files are removed, task_core best-effort removes its empty implicit
+default spool root with `rmdir()`. Configured directories are never removed.
+
+ADR 0011 required the implementation to demonstrate:
 
 - behavior-preserving extraction of `db_values.py` and `db_insert.py`;
 - no circular or upward dependencies;
@@ -1715,6 +1743,33 @@ ADR 0011 is complete as a decision only when the implementation demonstrates:
 - fatal connection-loss behavior;
 - mixed-loader atomic publication;
 - real memory and throughput results.
+
+The 0.6.10 closure campaign demonstrated all ten; §Formal closure result
+carries the measurements.
+
+0.7.2 reran live acceptance on the same target localhost PostgreSQL 18.4
+instance, covering the two things closure did not. First, the §Final
+serialization corpus now round-trips through a real COPY rather than only
+through a byte-comparison between two code paths: 23 columns across two rows,
+zero failures, including a literal `\N` stored as text rather than SQL NULL,
+tabs, newlines, carriage returns, empty string, Unicode, non-finite floats,
+bytes and both naive and aware datetimes. Second, the declared-types matrix
+that the lost 0.5.2 campaign was meant to cover passed 9/9 for both loaders:
+declared round-trip, exact catalog types, stable refill preserving the target
+OID and its attached indexes, NUL text rejected as `DbPublishError` with the
+live target neither created nor changed, and no staging residue.
+
+0.7.2 also exercised the post-closure spool-root cleanup, which shipped after
+the 13-case concurrency campaign and had been covered only by unit tests. Eight
+processes sharing the framework-owned default root completed 240 concurrent
+COPY cycles with no failures, no residue and the empty root removed. A separate
+deterministic probe established the shape of the documented recreate-and-retry:
+it is single-shot. One removal between directory resolution and the exclusive
+open is survived; a second, landing between the recreate and the retried open,
+escapes as `FileNotFoundError`. That matches what the code comment claims
+("Recreate the directory once"), fails loudly before any database work, and
+cannot corrupt or partially publish data. Whether to make the retry bounded
+rather than single-shot is open.
 
 The feature is not complete when COPY merely loads a table. It is complete when
 it loads large data materially faster without introducing a new way to publish

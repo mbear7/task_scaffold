@@ -9,9 +9,11 @@ __pycache__/
 # not source. Loosen this if a fixture .xlsx is ever intentionally added.
 *.xlsx
 
-# Local-only environment workarounds, never part of the real project --
-# see the note in README.md if these exist in your working copy.
+# Local-only environment workarounds, never part of the real project.
+# If these exist in your working copy they are offline stand-ins for the
+# real packages in requirements.txt, not source.
 /sqlalchemy/
 /petl/
+/psycopg2/
 /petl_util.py
 /.claude/

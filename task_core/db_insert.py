@@ -2,10 +2,12 @@
 
 """Staging-table INSERT loader for db publication.
 
-This is the current -- and today, only -- loader that fills a staging
-table during publish(). The path was factored out of db_publish.py so
-the loader has a name and a single call site, without pulling any of
-the publisher's lifecycle (transactions, locks, comments) with it.
+The default loader that fills a staging table during publish(), and the
+compatibility baseline against which COPY is measured. Since 0.6.6 the
+COPY loader in db_copy.py is the other member of DB_LOADERS. The path was
+factored out of db_publish.py so the loader has a name and a single call
+site, without pulling any of the publisher's lifecycle (transactions,
+locks, comments) with it.
 
 The transaction is owned by the publisher: this function neither opens
 nor commits one, and neither creates nor drops the staging table.

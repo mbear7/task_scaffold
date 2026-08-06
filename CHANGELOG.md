@@ -10,6 +10,96 @@ chronologically rather than by release.
 
 
 
+## 0.7.2
+
+Closes a COPY test-coverage gap proven to let *injected* silent
+data-corruption defects pass the whole suite, restores 27 tests that were
+invisible to direct invocation, and reorders the ADR 0011 verification record.
+No such defect was present in any release: the gap is in the coverage, not the
+implementation. Runtime behavior and public API are unchanged.
+
+### Fixed
+- **The compiled declared COPY writers are now pinned to the generic
+  serializer.** 0.6.10 gave declared COPY one compiled writer per column,
+  bypassing `_normalize_value()`, the generic declared validator and
+  `serialize_row_to_copytext()`. Nothing tied the two paths together: the
+  adversarial escaping corpus exercises only the generic serializer, and the
+  fast-path test pinned bytes against a literal whose sole text value contained
+  a tab. Two escaping breaks were injected to size the gap and the full suite
+  reported `OK` under both — including one where a user's literal `\N` reaches
+  the wire unescaped as `\N`, the sequence COPY text format documents as the
+  NULL marker. The byte divergence is measured; that PostgreSQL would then
+  store NULL follows from the documented format and was not executed against a
+  live server. The implementation was already correct; only the coverage was
+  missing.
+- **`unittest.main()` no longer hides test cases.** `tests/test_db_copy.py` and
+  `tests/test_types.py` placed the main guard above later test classes, so
+  direct invocation ran 206 of 211 and 10 of 32 cases respectively, printing
+  `OK` both times. Discovery — which every documented command uses — was
+  unaffected, which is why it survived.
+- **`db_insert.py` no longer claims to be the only staging loader.** It has
+  shared `DB_LOADERS` with the COPY loader since 0.6.6, across the 0.6.13
+  comment-hygiene pass.
+- **The external-module tripwire now scans `tools/`.** That directory postdates
+  the test and shipped roughly 1500 lines outside its scope; confirmed by
+  injecting a forbidden name there and watching the tripwire pass.
+- `.gitignore` covers `/psycopg2/` alongside the other offline stand-ins, and no
+  longer points at a README note that does not exist.
+
+### Documentation
+- **ADR 0011 §Verification status is chronological.** The section had grown by
+  prepending each release above the older text, so it climbed to closure and
+  then fell back to 0.6.3, 0.5.2 and 0.5.1, ending on two gates written as
+  though the ADR were still open. Wording is preserved; only the two gates were
+  rewritten in past tense.
+- **0.6.8 and 0.6.9 are now recorded there.** 0.6.8 is where the first live
+  Phase 8 run failed and forced the `TIMESTAMPTZ` correction — the section
+  previously read as though Phase 8 passed first time. 0.6.9/0.6.10 restructured
+  the declared path before closure.
+- The 0.5.2 declared-types gate is marked as not recorded in this repository
+  rather than left in the future tense.
+- The `PipelineSpec` consequence notes ADR 0013's 0.7.0 supersession.
+
+### Tests
+- Added a byte-equality test across the ADR 0011 §Final serialization corpus
+  between the compiled declared writers and the generic serializer. It asserts
+  equality between the two paths rather than against a literal, so it cannot go
+  stale as the corpus grows. Proven against both injected breaks separately.
+- Added a static tripwire rejecting **any** top-level statement that follows a
+  test module's main guard, across both `tests/` and `tools/tests/`. An earlier
+  version checked only `ClassDef`/`FunctionDef` and so ignored a `TestCase`
+  built by assignment — `T = type('T', (unittest.TestCase,), {...})` — which
+  external review demonstrated still produced 33 discovered cases against 32 on
+  a direct run while the tripwire stayed green.
+- Extended the stale-comment tripwire to `db_insert.py`, and the ADR 0011 doc
+  test to reject the two reopening phrases and require 0.6.8/0.6.9.
+- Added an ADR 0011 ordering test keyed on sentence-initial releases. Keying on
+  the first release per paragraph was tried first and could not see a summary
+  paragraph over-running the detail below it.
+- The main-guard scanner is factored into a helper and covered by synthetic
+  source, because the repository scan cannot protect it: every real guard is
+  already last, so reverting the scanner left the whole suite green. Reverting
+  it now fails the synthetic case alone, which is the point.
+
+### Verification
+- Live acceptance against the target localhost PostgreSQL 18.4 instance:
+  the ADR 0011 §Final serialization corpus round-trips through a real COPY
+  unchanged (23 columns x 2 rows, 0 failures), including a literal `\N`
+  stored as text rather than NULL — the one claim this release would
+  otherwise have carried as documented rather than measured.
+- The post-closure spool-root cleanup ran 240 concurrent COPY cycles across
+  eight processes sharing the default root with zero failures and no residue.
+  A deterministic probe additionally established that the documented
+  recreate-and-retry is single-shot: one removal between resolve and the
+  exclusive open is survived, a second escapes as `FileNotFoundError`. That
+  is a loud preparation failure, not data loss, and matches what the code
+  comment claims.
+- The declared-types matrix passed 9/9 for both loaders: round-trip, exact
+  catalog types, refill preserving table OID and attached indexes, NUL text
+  rejected as `DbPublishError` with the live target unchanged, and no staging
+  residue.
+
+
 ## 0.7.1
 
 Cleans up SQLite resources owned by database-publication test fixtures.

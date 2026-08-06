@@ -96,10 +96,6 @@ class Test2DbContractAndTypeOverridesGenuinelyImmutable(unittest.TestCase):
         self.assertEqual(payload.columns, ['target_col'])
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class Test3DbLoaderVocabulary(unittest.TestCase):
     """PipelineSpec exposes exactly the two implemented staging loaders."""
 
@@ -299,3 +295,7 @@ class TestFindDuplicates(unittest.TestCase):
 
     def test_works_on_any_iterable_of_hashables(self):
         self.assertEqual(find_duplicates(iter((1, 2, 1))), [1])
+
+
+if __name__ == '__main__':
+    unittest.main()
