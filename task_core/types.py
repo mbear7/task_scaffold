@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Level 0: shared vocabulary for the rest of the package. Zero imports from
-anywhere else in task_core, or from db_publish.py -- not even under
+anywhere else in task_core, or from db/publish.py -- not even under
 TYPE_CHECKING. RunResult.source_fingerprints and
 DbRunResult.committed_tables/published_tables are typed list[Any] rather
 than list[SourceFingerprint]/list[DbTableResult] specifically to keep
@@ -37,7 +37,7 @@ if sys.version_info < (3, 11):
 def find_duplicates(items):
     """Values appearing more than once in items, in first-occurrence order,
     each listed once. The one shared implementation of an idiom previously
-    hand-rolled in runner.py, binding.py, and db_publish.py -- order matters
+    hand-rolled in runner.py, binding.py, and db/publish.py -- order matters
     (error messages should report duplicates in the order the caller's data
     presents them), which is why this isn't a set operation."""
     seen = set()
@@ -64,7 +64,7 @@ VALID_TABLE_ADAPTERS = frozenset({None, 'petl', 'pandas'})
 # The scaffold's portable identifier convention. Deliberately NOT a
 # PostgreSQL rule -- this module is level 0 and engine-neutral, and every
 # PostgreSQL-specific fact (the 63-byte limit, staging-name generation,
-# normalization and collision rules) lives in db_publish.py instead.
+# normalization and collision rules) lives in db/publish.py instead.
 #
 # Lower case only, not [A-Za-z_]. Uppercase is exactly what makes an
 # identifier case-fragile: SQLAlchemy quotes a mixed-case name to preserve
@@ -86,7 +86,7 @@ PORTABLE_IDENTIFIER_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
 
 # How new data replaces old in a published table. Engine-neutral
 # vocabulary, like PORTABLE_IDENTIFIER_RE above; the mechanics live in
-# db_publish.py.
+# db/publish.py.
 #
 #   replace   drop the live table, rename staging into its place. One
 #             database write, catalog-time lock. The target is a new
@@ -430,8 +430,8 @@ class DbRunResult:
     had_outputs: bool
     committed: bool
     # Typed list[Any], not list[DbTableResult]: DbTableResult is defined in
-    # db_publish.py. Even though db_publish.py now lives inside task_core
-    # (task_core/db_publish.py), it's still an implementation module one
+    # db/publish.py. Even though db/publish.py now lives inside task_core
+    # (task_core/db/publish.py), it's still an implementation module one
     # level up from types.py -- the same reasoning as
     # RunResult.source_fingerprints below applies: types.py stays
     # stdlib-only, full stop, not "stdlib-only except peer modules that

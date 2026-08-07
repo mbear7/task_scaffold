@@ -5,328 +5,68 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-import hashlib
-import json
 import logging
-import math
 import os
-import re
 import random
 import time
-from types import MappingProxyType
-from uuid import uuid4
 from typing import Any
 
-import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
-from task_core.db_insert import load_rows_into_staging
-from task_core.db_copy import (
+from task_core.db.insert import load_rows_into_staging
+from task_core.db.copy import (
     SpoolIdentity,
-    cleanup_predecessor_spools,
     cleanup_spool_paths,
     load_copy_into_staging,
     prepare_copy_source,
-    resolve_spool_directory,
 )
+from task_core.db.spool_format import resolve_spool_directory
+from task_core.db.spool_io import cleanup_predecessor_spools
 from task_core.types import (
-    DB_LOADERS, DbRowSource, OutputColumn, PORTABLE_IDENTIFIER_RE,
-    find_duplicates, validate_db_loader, validate_payload_source_state,
+    DB_LOADERS, validate_db_loader, validate_payload_source_state,
     validate_publication_strategy,
 )
-from task_core.db_values import (
+from task_core.db.payload import (
+    DbPayload,
+    DbTableResult,
+)
+from task_core.db.identifiers import (
+    MAX_IDENTIFIER_BYTES,
+    _RUN_TOKEN_HEX,
+    STAGING_NAME_KIND,
+    _quote_identifier,
+    _quoted_name,
+    advisory_lock_key,
+    build_published_comment,
+    build_staging_comment,
+    new_run_token,
+    owned_staging_tokens,
+    parse_staging_comment,
+    server_identifier_limit,
+    staging_table_name,
+    staging_target_token,
+    validate_identifier,
+    validate_portable_identifier,
+)
+from task_core.db.policies import (
+    DEFAULT_IDENTIFIER_POLICY,
+    IdentifierPolicy,
+    PublicationLockPolicy,
+    PublicationPlan,
+)
+from task_core.db.values import (
     DbPublishError,
     DbPublishInvariantError,
     ResolvedColumn,
     ResolvedSchema,
-    _apply_db_contract_columns,
-    _normalize_value,
     _resolve_declared_type,
     _resolve_payload_schema,
-    _validate_unique_columns,
 )
 
 
-@dataclass(frozen=True)
-class DbTableResult:
-    schema: str
-    table_name: str
-    full_name: str
-    rows: int
-    db_table_id_pix: Any | None = None
-
-
-@dataclass
-class DbPayload:
-    table_name: str
-    schema: str
-    columns: list[str]
-    # None means "this payload's rows are carried by row_source, not
-    # materialized". Public COPY payloads use this state; INSERT payloads keep
-    # the materialized mapping list. See ADR 0011 §Row-source contract.
-    rows: list[dict[str, Any]] | None
-    type_overrides: dict[str, Any] | None = None
-    db_table_id_pix: Any | None = None
-    not_null_columns: tuple[str, ...] = ()
-    output_schema: tuple[OutputColumn, ...] | None = None
-    framework_columns: tuple[OutputColumn, ...] = ()
-    # 'replace' or 'refill'. Carried from PipelineSpec so publication can
-    # select the mechanism without re-deriving it from the schema source.
-    publication_strategy: str = 'replace'
-    # 'insert' or 'copy'. Repeated on the payload so direct construction
-    # cannot bypass loader/source-state validation. See ADR 0011.
-    db_loader: str = 'insert'
-    # Positional-stability rule (same one that added db_publication_strategy
-    # after every 0.5.0 field): appended AFTER every 0.6.0 field so any
-    # caller constructing DbPayload positionally keeps its previous
-    # meaning. Only meaningful when db_loader='copy'; None on the insert
-    # path. See ADR 0011 §Row-source contract for the state matrix.
-    row_source: DbRowSource | None = None
-    # Per-task override for CopyLoadPolicy.encrypt_spools. Appended after
-    # every existing payload field so older positional construction keeps
-    # its meaning. None inherits the publisher policy.
-    copy_spool_encryption: bool | None = None
-
-    def __post_init__(self):
-        validate_publication_strategy(
-            self.publication_strategy,
-            output_schema=self.output_schema,
-            field_name='publication_strategy',
-            error_type=DbPublishError,
-        )
-        validate_db_loader(
-            self.db_loader,
-            field_name='db_loader',
-            error_type=DbPublishError,
-        )
-        if self.copy_spool_encryption is not None and type(
-            self.copy_spool_encryption
-        ) is not bool:
-            raise DbPublishError('copy_spool_encryption must be bool or None')
-        # Enforced here, not only per-field, because the invariant is on
-        # the pair (loader, rows/row_source) and no single field carries
-        # enough context to check it alone. Runs after validate_db_loader
-        # so an unknown loader is reported with its specific message
-        # rather than the generic state-matrix one.
-        validate_payload_source_state(
-            self.db_loader, self.rows, self.row_source,
-            error_type=DbPublishError,
-        )
-
-
-@dataclass(frozen=True)
-class RowProjection:
-    """A plan for turning positional rows from a DbRowSource into the
-    final logical rows of a DbPayload -- db_contract renaming/projection
-    plus framework columns (currently just the run-started-at timestamp),
-    composed in one place.
-
-    Immutable by construction: source_columns/output_columns are tuples,
-    source_indices is a tuple, constants is a MappingProxyType. Built via
-    ``RowProjection.build``; the constructor is intentionally low-level
-    so tests can assemble one directly.
-
-    Composition order matches the current INSERT path exactly (from_petl
-    / from_pandas apply the contract inline, then export.apply_db_updated_at
-    appends framework columns after) so an INSERT/COPY parity test can
-    hold both to the same expected output.
-    """
-
-    source_columns: tuple[str, ...]
-    output_columns: tuple[str, ...]
-    # Per output column: index into the source row, or -1 for a column
-    # whose value comes from ``constants`` instead. Stored as a plain
-    # tuple of ints -- looked up once per row per column in the hot
-    # iteration path, so cheap.
-    source_indices: tuple[int, ...]
-    # Output-column-index -> constant value. Used for framework columns
-    # (the timestamp is computed once per payload/run and injected at
-    # the right position). MappingProxyType so an accidental mutation
-    # after construction raises rather than silently drifting.
-    constants: Mapping[int, Any]
-
-    def __post_init__(self):
-        if len(self.output_columns) != len(self.source_indices):
-            raise DbPublishInvariantError(
-                f'RowProjection: output_columns has {len(self.output_columns)} '
-                f'entries but source_indices has {len(self.source_indices)}'
-            )
-        source_width = len(self.source_columns)
-        for out_idx, src_idx in enumerate(self.source_indices):
-            if src_idx == -1:
-                if out_idx not in self.constants:
-                    raise DbPublishInvariantError(
-                        f'RowProjection: output column {self.output_columns[out_idx]!r} '
-                        f'at position {out_idx} has source_index=-1 but no constant'
-                    )
-            elif not (0 <= src_idx < source_width):
-                raise DbPublishInvariantError(
-                    f'RowProjection: output column {self.output_columns[out_idx]!r} '
-                    f'at position {out_idx} points at source index {src_idx}, '
-                    f'outside [0, {source_width})'
-                )
-        for const_idx in self.constants:
-            if not (0 <= const_idx < len(self.output_columns)):
-                raise DbPublishInvariantError(
-                    f'RowProjection: constant at position {const_idx} is '
-                    f'outside output range [0, {len(self.output_columns)})'
-                )
-            if self.source_indices[const_idx] != -1:
-                # A constant sitting at a source-backed position would
-                # be silently ignored by iter_rows() (the ternary picks
-                # row[src_idx], never touching constants[out_idx]) --
-                # exactly the class of silent projection drift these
-                # checks exist to prevent.
-                raise DbPublishInvariantError(
-                    f'RowProjection: constant at position {const_idx} '
-                    f'coincides with a source-backed position '
-                    f'(source_indices[{const_idx}]='
-                    f'{self.source_indices[const_idx]}); constants may '
-                    f'only appear at positions where source_indices == -1'
-                )
-
-    @classmethod
-    def build(cls, source_columns, *, db_contract, framework_columns, run_started_at):
-        """Compose a projection from the same inputs the INSERT path uses.
-
-        ``db_contract`` -- mapping source column names to output column
-        names, or None/empty for identity. Applied first: the projected
-        column list is either ``list(db_contract.values())`` in mapping
-        order or ``list(source_columns)``.
-
-        ``framework_columns`` -- tuple of ``OutputColumn`` for framework
-        columns to append AFTER the contract projection, in order. The
-        only framework column today is db_updated_at, so this is a
-        one-element tuple in practice; kept general so a future framework
-        column does not need a new mechanism. Each framework column
-        currently receives the same ``run_started_at`` value (a single
-        datetime), matching what apply_db_updated_at writes on the
-        INSERT path.
-
-        Framework column position is derived as
-        ``len(contract_projected_columns)``, not hardcoded to "last" --
-        it resolves to last today, but that fact is encoded rather than
-        assumed, so a future non-terminal framework column would just
-        pass a different position.
-        """
-        src_cols = tuple(str(c) for c in source_columns)
-
-        # Collision validation mirrors the checks the INSERT path
-        # already performs at db_values._stringify_and_reject_duplicate_columns
-        # (source-name duplicates) and _apply_db_contract_columns
-        # (target-name duplicates), plus PipelineSpec.__post_init__'s
-        # rejection of framework-name collisions with the declared
-        # schema. Without this, RowProjection.build would silently
-        # accept configurations INSERT rejects, which is exactly the
-        # semantic-drift class the parity test exists to catch.
-        src_dupes = find_duplicates(src_cols)
-        if src_dupes:
-            raise DbPublishError(
-                f'RowProjection.build: duplicate source column names: '
-                f'{src_dupes!r}'
-            )
-
-        src_index = {name: i for i, name in enumerate(src_cols)}
-
-        if db_contract:
-            contract_pairs = list(db_contract.items())
-            projected_cols = [target for _src, target in contract_pairs]
-            projected_indices = []
-            for src_name, _target in contract_pairs:
-                if src_name not in src_index:
-                    raise DbPublishError(
-                        f'RowProjection.build: db_contract references source '
-                        f'column {src_name!r} not in source_columns'
-                    )
-                projected_indices.append(src_index[src_name])
-
-            target_dupes = find_duplicates(projected_cols)
-            if target_dupes:
-                raise DbPublishError(
-                    f'RowProjection.build: db_contract maps multiple source '
-                    f'columns to the same target name: {target_dupes!r}'
-                )
-        else:
-            projected_cols = list(src_cols)
-            projected_indices = list(range(len(src_cols)))
-
-        fw_names = [fw.name for fw in framework_columns]
-        fw_dupes = find_duplicates(fw_names)
-        if fw_dupes:
-            raise DbPublishError(
-                f'RowProjection.build: duplicate framework column names: '
-                f'{fw_dupes!r}'
-            )
-
-        projected_set = set(projected_cols)
-        colliding = [name for name in fw_names if name in projected_set]
-        if colliding:
-            raise DbPublishError(
-                f'RowProjection.build: framework column(s) collide with '
-                f'projected column(s): {colliding!r}'
-            )
-
-        output_cols = list(projected_cols)
-        source_indices = list(projected_indices)
-        constants = {}
-        for fw in framework_columns:
-            # Position derived, not hardcoded -- see docstring.
-            fw_position = len(output_cols)
-            output_cols.append(fw.name)
-            source_indices.append(-1)
-            constants[fw_position] = run_started_at
-
-        return cls(
-            source_columns=src_cols,
-            output_columns=tuple(output_cols),
-            source_indices=tuple(source_indices),
-            constants=MappingProxyType(dict(constants)),
-        )
-
-
-class _ProjectedRowSource:
-    """DbRowSource decorator: wraps another DbRowSource and yields rows
-    reshaped by a RowProjection (renamed, projected, framework-augmented).
-
-    One-shot at its own layer, not merely by delegation. Delegating to
-    the wrapped source's own one-shot guard would give a correct answer
-    only if that guard existed and fired -- a hand-rolled DbRowSource
-    that re-iterates would otherwise be silently accepted here.
-    Row width from the underlying source is checked exactly against the
-    projection's declared ``source_columns`` width -- an under- or
-    over-wide row is a broken source, and the ADR's row-source contract
-    requires exact width.
-    """
-
-    def __init__(self, source, projection):
-        self._source = source
-        self._projection = projection
-        self._claimed = False
-
-    def iter_rows(self):
-        if self._claimed:
-            raise DbPublishError(
-                'projected row source already consumed -- one-shot per ADR 0011'
-            )
-        self._claimed = True
-        projection = self._projection
-        expected_width = len(projection.source_columns)
-        source_indices = projection.source_indices
-        constants = projection.constants
-        for row_number, row in enumerate(self._source.iter_rows(), start=1):
-            row = tuple(row)  # defensive: some sources yield generators/iterators
-            if len(row) != expected_width:
-                raise DbPublishError(
-                    f'row {row_number} has width {len(row)}, expected '
-                    f'{expected_width} to match declared source_columns'
-                )
-            yield tuple(
-                constants[out_idx] if src_idx == -1 else row[src_idx]
-                for out_idx, src_idx in enumerate(source_indices)
-            )
 
 
 _REQUIRED_CRED_KEYS = ('user', 'host', 'dbname')
@@ -367,87 +107,6 @@ def make_engine(creds):
     return sa.create_engine(url, poolclass=NullPool)
 
 
-def from_petl(
-    tbl, *, table_name, schema, type_overrides=None, db_contract=None,
-    not_null_columns=(), output_schema=None, db_table_id_pix=None,
-    publication_strategy='replace', db_loader='insert',
-):
-    if isinstance(tbl, pd.DataFrame):
-        raise DbPublishError(
-            f'{table_name!r}: from_petl() received a pandas DataFrame, '
-            'not a petl table -- use from_pandas() instead'
-        )
-
-    iterator = iter(tbl)
-
-    try:
-        header = next(iterator)
-    except StopIteration:
-        raise DbPublishError(f'PETL table for {table_name!r} is empty and has no header row')
-
-    columns = [str(col) for col in header]
-    if not columns:
-        raise DbPublishError(f'{table_name!r}: no columns to publish -- the source table has no header')
-    _validate_unique_columns(columns, table_name=table_name)
-
-    rows = [
-        {col: _normalize_value(value) for col, value in zip(columns, row, strict=True)}
-        for row in iterator
-    ]
-    columns, rows = _apply_db_contract_columns(columns, rows, db_contract, table_name=table_name)
-
-    return DbPayload(
-        table_name=table_name,
-        schema=schema,
-        columns=columns,
-        rows=rows,
-        type_overrides=type_overrides,
-        not_null_columns=tuple(not_null_columns or ()),
-        output_schema=tuple(output_schema) if output_schema is not None else None,
-        publication_strategy=publication_strategy,
-        db_loader=db_loader,
-        db_table_id_pix=db_table_id_pix,
-    )
-
-
-
-def from_pandas(
-    df: pd.DataFrame, *, table_name, schema, type_overrides=None, db_contract=None,
-    not_null_columns=(), output_schema=None, db_table_id_pix=None,
-    publication_strategy='replace', db_loader='insert',
-):
-    if not isinstance(df, pd.DataFrame):
-        raise DbPublishError(
-            f'{table_name!r}: from_pandas() received a {type(df).__name__!r}, '
-            'not a pandas DataFrame -- use from_petl() instead'
-        )
-
-    columns = [str(col) for col in df.columns]
-    if not columns:
-        raise DbPublishError(f'{table_name!r}: no columns to publish -- the source DataFrame has no columns')
-    _validate_unique_columns(columns, table_name=table_name)
-
-    prepared = df.copy()
-    prepared = prepared.astype(object).where(pd.notna(prepared), None)
-
-    rows = [
-        {col: _normalize_value(value) for col, value in zip(columns, row, strict=True)}
-        for row in prepared.itertuples(index=False, name=None)
-    ]
-    columns, rows = _apply_db_contract_columns(columns, rows, db_contract, table_name=table_name)
-
-    return DbPayload(
-        table_name=table_name,
-        schema=schema,
-        columns=columns,
-        rows=rows,
-        type_overrides=type_overrides,
-        not_null_columns=tuple(not_null_columns or ()),
-        output_schema=tuple(output_schema) if output_schema is not None else None,
-        publication_strategy=publication_strategy,
-        db_loader=db_loader,
-        db_table_id_pix=db_table_id_pix,
-    )
 
 
 # Dispatch table for the staging loader. One entry per implemented value
@@ -469,104 +128,6 @@ if set(LOADERS) != set(DB_LOADERS):
     )
 
 
-# PostgreSQL truncates any identifier past NAMEDATALEN-1 = 63 BYTES, and
-# announces it with a NOTICE rather than an error -- and psycopg2 exposes
-# notices on the connection, where nothing in this project reads them. So an
-# over-long identifier does not fail; it quietly becomes a different name
-# than the one this code believes it created.
-#
-# Canonical default only. NAMEDATALEN is compile-time configurable, so this
-# is an assumption about a stock build, not a fact about the server in
-# front of us. Three levels, in increasing authority: this constant, a
-# constructor-injected override for tests and nonstandard builds, and the
-# server's own max_identifier_length read before the first DDL. The
-# configured value can only ever LOWER the effective limit, never raise it
-# past what the server will actually accept.
-MAX_IDENTIFIER_BYTES = 63
-
-# Staging is a named internal namespace constant, not a live parameter.
-# Passing a 'purpose' argument would advertise supported variation that
-# does not exist -- there is exactly one kind of generated table today.
-# Generalize when a second use case actually arrives, not before.
-STAGING_NAME_KIND = 'stg'
-
-_STAGING_TOKEN_HEX = 8
-_RUN_TOKEN_HEX = 8
-
-
-def validate_identifier(name, max_bytes, *, kind, context='', invariant=False):
-    """Every generated or declared identifier passes through here before it
-    reaches SQL. `invariant=True` marks a name this module constructed
-    itself, where a failure means this module is broken rather than the
-    task being wrong -- see DbPublishInvariantError.
-    """
-    if not isinstance(name, str) or not name:
-        raise DbPublishError(f'{context}empty or non-string {kind}: {name!r}')
-
-    if '\x00' in name:
-        raise DbPublishError(f'{context}{kind} contains a NUL byte: {name!r}')
-
-    actual = len(name.encode('utf-8'))
-    if actual > max_bytes:
-        error = DbPublishInvariantError if invariant else DbPublishError
-        prefix = 'internal invariant violated -- ' if invariant else ''
-        raise error(
-            f'{prefix}{context}PostgreSQL {kind} exceeds limit: '
-            f'{actual} bytes, maximum {max_bytes}: {name!r}'
-        )
-    return name
-
-
-def validate_portable_identifier(name, *, kind, context=''):
-    # fullmatch(), not match(). Python's `$` also matches immediately
-    # before a trailing newline, so match() accepted 'foo\n' as portable --
-    # confirmed directly. That name is interpolated unquoted into
-    # source-state SQL (where the newline is just whitespace) and quoted
-    # for output tables (where it becomes part of the identifier). Neither
-    # is what this convention promises.
-    if not PORTABLE_IDENTIFIER_RE.fullmatch(name):
-        raise DbPublishError(
-            f'{context}{kind} is not a portable identifier '
-            f'({PORTABLE_IDENTIFIER_RE.pattern}): {name!r}. Rename it.'
-        )
-    return name
-
-
-def server_identifier_limit(conn, configured):
-    """The identifier byte limit actually in force: the lower of what the
-    caller configured and what the server reports.
-
-    Configuration can only ever TIGHTEN. A configured value larger than the
-    server's would produce names the server silently truncates, which is
-    the failure this whole mechanism exists to prevent.
-
-    Branches on the dialect rather than catching every exception. A
-    catch-all exists to accommodate backends with no such setting, but it
-    also swallows real PostgreSQL failures -- which makes the authoritative
-    runtime check not authoritative, since any error silently restores the
-    assumed value. Worse, the statement may run inside an open transaction,
-    and a failed statement leaves a PostgreSQL transaction aborted, so the
-    next DDL fails with a secondary transaction-aborted error obscuring the
-    real cause.
-
-    Module-level rather than a DbPublisher method so source_state.py can
-    use it for the technical table without the publisher protocol growing
-    another member -- that protocol is an advertised extension seam and has
-    already been expanded once by accident.
-    """
-    if conn.dialect.name != 'postgresql':
-        return configured
-
-    try:
-        value = conn.execute(sa.text('show max_identifier_length')).scalar()
-    except Exception as exc:
-        raise DbPublishError(
-            'could not read max_identifier_length from PostgreSQL; refusing to '
-            'assume a limit that generated identifiers would then be silently '
-            'truncated against'
-        ) from exc
-
-    return min(configured, int(value))
 
 
 _FIND_RELATION_SQL = sa.text(
@@ -631,213 +192,12 @@ def _external_incoming_foreign_keys(conn, oid):
     )
 
 
-class PublicationPlan:
-    """Work the runner needs performed inside the publication transaction.
-
-    Source-state writing belongs to the runner and source_state.py, but it
-    must land in the same transaction as the table swaps or a failed run
-    could still advance the stored fingerprints. Queuing it here keeps
-    commit()'s signature and the publisher protocol unchanged -- both of
-    which were expanded by accident once already.
-    """
-
-    def __init__(self):
-        self._steps = []
-
-    def add(self, description, action):
-        self._steps.append((description, action))
-
-    def run(self, log):
-        for description, action in self._steps:
-            log.info('publication step: %s', description)
-            action()
-
-    def clear(self):
-        self._steps = []
-
-    def __len__(self):
-        return len(self._steps)
 
 
-@dataclass(frozen=True, kw_only=True)
-class IdentifierPolicy:
-    """The single source of truth for identifier rules, shared by
-    class-level preflight and the publisher that will do the work.
-
-    Previously the limit reached preflight through run_pipelines() and the
-    publisher through its own constructor default, so
-    db_max_identifier_bytes=40 validated declared names against 40 and
-    everything discovered at runtime against 63. Two independently
-    configured integers for one rule.
-
-    Frozen, and deliberately does NOT hold the server-verified limit: that
-    is resolved per connection and can only tighten this value. The policy
-    is authoritative for static validation; the effective limit at DDL time
-    is min(policy, server) and the publisher owns that derivation. Two
-    policy objects in flight would be worse than one policy plus a
-    documented derivation.
-    """
-
-    max_identifier_bytes: int = MAX_IDENTIFIER_BYTES
-
-    def __post_init__(self):
-        # `type(...) is int`, not isinstance: bool subclasses int, so
-        # IdentifierPolicy(max_identifier_bytes=True) would otherwise
-        # produce an effective one-byte limit rather than reject the config.
-        if type(self.max_identifier_bytes) is not int or self.max_identifier_bytes < 1:
-            raise DbPublishError(
-                f'max_identifier_bytes must be a positive integer, '
-                f'got {self.max_identifier_bytes!r}'
-            )
-
-
-DEFAULT_IDENTIFIER_POLICY = IdentifierPolicy()
-
-@dataclass(frozen=True, kw_only=True)
-class PublicationLockPolicy:
-    """How long publication may wait for ACCESS EXCLUSIVE on its targets.
-
-    PostgreSQL queues new ACCESS SHARE requests behind a waiting ACCESS
-    EXCLUSIVE, so a publisher waiting on one long reader blocks every
-    subsequent reader too. Bounding the wait is what stops one slow query
-    turning a publication into a read outage.
-
-    `retry_horizon_seconds` is the primary bound and gates COMPLETION of
-    the lock phase, not merely permission to start another attempt --
-    otherwise an attempt begun just inside the horizon could run well past
-    it and the horizon would be a hint rather than a limit. The per-attempt
-    timeouts are therefore ceilings: each attempt gets
-    min(configured, time remaining), so a final attempt may run with far
-    less than the configured budget.
-
-    `max_attempts` is a defensive ceiling only, not the policy. Under these
-    defaults it is unreachable -- a 1s minimum delay inside a 60s horizon
-    admits far fewer -- and it exists to stop a runaway if someone
-    configures a sub-second delay.
-    """
-
-    # Two different things, deliberately:
-    #
-    #   lock_timeout_ms       the PER-CONFLICT limit -- how long to wait
-    #                         for any one target
-    #   acquisition_timeout_ms the AGGREGATE multi-target budget: how long
-    #                         the statement may spend waiting for the
-    #                         complete lock set, and therefore how long an
-    #                         already-acquired target blocks its own
-    #                         readers while the statement waits for the
-    #                         next one
-    #
-    # acquisition_timeout_ms is NOT the total reader-impact ceiling.
-    # Acquired locks are held through the swap and commit that follow, and
-    # both timeouts are reset once the set is complete, so the earliest
-    # acquired target is blocked for acquisition + publication. The
-    # aggregate bounds the WAITING half only; the critical section is
-    # unbounded by this policy.
-    #
-    # Sizing, with:
-    #
-    #   L = per-conflict lock timeout
-    #   A = complete lock-acquisition timeout
-    #   M = execution and timeout-ordering margin
-    #   n = actual existing targets in the LOCK TABLE statement
-    #   P = post-acquisition publication duration
-    #   B = accepted total reader-blocking budget
-    #
-    # Retry classification requires the hard runtime invariant:
-    #
-    #     n * L + M <= A
-    #
-    # Total reader blocking must separately satisfy:
-    #
-    #     A + P <= B
-    #
-    # A bounds acquisition waiting only. Locks already acquired remain held
-    # through replacement or refill and commit. Replacement P is normally
-    # catalog-time; explicit refill P is row- and index-dependent.
-    #
-    # The defaults support at most (5000 - 50) // 500 = 9 existing targets
-    # in one publication. _lock_publication_targets() rejects a larger actual
-    # lock set before requesting any live-target lock.
-    lock_timeout_ms: int = 500
-    acquisition_timeout_ms: int = 5_000
-    retry_horizon_seconds: float = 60.0
-    retry_delay_min_seconds: float = 1.0
-    retry_delay_max_seconds: float = 5.0
-    max_attempts: int = 100
-
-    # Engineering margin reserved after the sum of all possible sequential
-    # per-target waits. A single-wait ordering check alone is insufficient for
-    # one LOCK TABLE statement containing multiple relations.
-    TIMEOUT_MARGIN_MS = 50
-
-    def __post_init__(self):
-        for name in ('lock_timeout_ms', 'acquisition_timeout_ms', 'max_attempts'):
-            value = getattr(self, name)
-            # type(...) is int, not isinstance: bool subclasses int.
-            if type(value) is not int or value < 1:
-                raise DbPublishError(f'{name} must be a positive integer, got {value!r}')
-        for name in ('retry_horizon_seconds', 'retry_delay_min_seconds',
-                     'retry_delay_max_seconds'):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise DbPublishError(f'{name} must be a number, got {value!r}')
-            # isfinite: NaN and inf passed a type-and-sign check and then
-            # failed later inside int(), random.uniform() or sleep(), far
-            # from the configuration that caused them.
-            if not math.isfinite(value) or value < 0:
-                raise DbPublishError(f'{name} must be a finite non-negative number, got {value!r}')
-        if self.retry_delay_min_seconds > self.retry_delay_max_seconds:
-            raise DbPublishError(
-                f'retry_delay_min_seconds ({self.retry_delay_min_seconds}) exceeds '
-                f'retry_delay_max_seconds ({self.retry_delay_max_seconds})'
-            )
-        # PostgreSQL documents that a nonzero lock_timeout is pointless
-        # once it reaches statement_timeout, because the statement timeout
-        # fires first. Here that is not merely pointless but harmful: it
-        # converts retryable 55P03 lock_not_available into terminal 57014
-        # query_canceled, so ordinary contention would end the run instead
-        # of being retried.
-        if self.acquisition_timeout_ms < self.lock_timeout_ms + self.TIMEOUT_MARGIN_MS:
-            raise DbPublishError(
-                f'acquisition_timeout_ms ({self.acquisition_timeout_ms}) must exceed '
-                f'lock_timeout_ms ({self.lock_timeout_ms}) by at least '
-                f'{self.TIMEOUT_MARGIN_MS}ms. Otherwise statement_timeout fires first '
-                f'and retryable lock contention (55P03) arrives as terminal '
-                f'cancellation (57014).'
-            )
-
-    def attempt_budgets_ms(self, remaining_seconds, *, target_count=1):
-        """Return ``(statement_timeout_ms, lock_timeout_ms)`` for one attempt.
-
-        ``statement_timeout`` covers the complete multi-target statement while
-        ``lock_timeout`` applies to each sequential acquisition. On a shortened
-        final attempt the effective per-target timeout is reduced so the actual
-        budgets still satisfy ``A >= n * L + M``.
-        """
-        if type(target_count) is not int or target_count < 1:
-            raise DbPublishError(
-                f'target_count must be a positive integer, got {target_count!r}'
-            )
-
-        remaining_ms = int(remaining_seconds * 1000)
-        if remaining_ms <= 0:
-            return None
-
-        statement_ms = min(self.acquisition_timeout_ms, remaining_ms)
-        available_for_waits = statement_ms - self.TIMEOUT_MARGIN_MS
-        if available_for_waits < target_count:
-            return None
-
-        lock_ms = min(self.lock_timeout_ms, available_for_waits // target_count)
-        if lock_ms < 1:
-            return None
-        return statement_ms, lock_ms
-
-
-# CopyLoadPolicy moved to task_core.db_copy in 0.6.4 so its home matches
-# its layer (db_publish -> db_copy -> db_values). Re-exported here so
+# CopyLoadPolicy moved out of this module in 0.6.4 so its home matches
+# its layer (publish -> copy -> values). Re-exported here so
 # every existing importer keeps working; the class object is the same.
-from task_core.db_copy import CopyLoadPolicy
+from task_core.db.copy import CopyLoadPolicy
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -896,227 +256,6 @@ class PublisherConfig:
         return self.publisher_factory if self.publisher_factory is not None else DbPublisher
 
 
-# Advisory lock namespace. The two-int form gives a 32-bit namespace in the
-# high half; advisory locks are database-wide and shared with anything else
-# using them, so a bare hashtext(task_name) could collide with an unrelated
-# application's lock and present as this task mysteriously refusing to run.
-_ADVISORY_LOCK_NAMESPACE = 0x7A5C  # 'task_core', arbitrary but fixed
-
-# Ownership metadata attached to every staging table via COMMENT ON TABLE.
-# Compact JSON so cleanup can parse it, versioned so a future change can be
-# recognised rather than guessed at.
-STAGING_COMMENT_VERSION = 1
-_COMMENT_MARKER = 'task_core'
-
-
-def advisory_lock_key(task_name):
-    """(namespace, key) for pg_try_advisory_lock's two-int form.
-
-    32 bits of task-name hash. A collision means two DIFFERENT tasks
-    serialize against each other -- safe, since neither can corrupt the
-    other's data, but confusing to diagnose: one task appears to skip
-    because 'another run is in progress' when the culprit is a different
-    task entirely. Birthday-bounded far beyond any plausible number of
-    tasks, so not worth widening; worth knowing before someone spends an
-    afternoon on it.
-    """
-    digest = hashlib.blake2b(task_name.encode('utf-8'), digest_size=4).digest()
-    # Signed 32-bit, which is what PostgreSQL's int4 accepts.
-    key = int.from_bytes(digest, 'big', signed=True)
-    return _ADVISORY_LOCK_NAMESPACE, key
-
-
-def build_staging_comment(*, task_name, run_token, schema, table_name):
-    return json.dumps(
-        {
-            'marker': _COMMENT_MARKER,
-            'v': STAGING_COMMENT_VERSION,
-            'task': task_name,
-            'run': run_token,
-            'target_schema': schema,
-            'target_table': table_name,
-            'created_at': datetime.now(timezone.utc).isoformat(),
-        },
-        separators=(',', ':'),
-        ensure_ascii=False,
-    )
-
-
-def build_published_comment(*, task_name, run_token, rows):
-    """Replaces the staging comment on the live table after the swap.
-
-    Two purposes. It stops a published table from carrying staging
-    ownership metadata that cleanup would later read -- ALTER TABLE ...
-    RENAME preserves comments, so without this every published table looks
-    like an abandoned staging artifact. And it is genuinely useful
-    provenance: 'which run produced this data' answered from the catalog is
-    the question actually asked when a number looks wrong.
-    """
-    return json.dumps(
-        {
-            'marker': _COMMENT_MARKER,
-            'v': STAGING_COMMENT_VERSION,
-            'published_by': task_name,
-            'run': run_token,
-            'rows': rows,
-            'published_at': datetime.now(timezone.utc).isoformat(),
-        },
-        separators=(',', ':'),
-        ensure_ascii=False,
-    )
-
-
-# \Z, not $. Python's `$` also matches immediately before a trailing
-# newline, and a quoted PostgreSQL identifier may contain one -- so
-# 'x__stg_deadbeef_deadbeef\n' satisfied a rule advertised as exact.
-_STAGING_NAME_SUFFIX_RE = re.compile(
-    rf'__{STAGING_NAME_KIND}_([0-9a-f]{{{_STAGING_TOKEN_HEX}}})_([0-9a-f]{{{_RUN_TOKEN_HEX}}})\Z'
-)
-
-
-def owned_staging_tokens(relname):
-    """(target_token, run_token) if this name has the exact staging shape,
-    else None.
-
-    The catalog scan uses a broad LIKE because SQL cannot express the
-    token shapes; this is what turns that into the strict rule. Without
-    it, any table whose name merely contained the infix could be dropped
-    on the strength of a syntactically valid comment -- confirmed directly
-    with `not_really__stg_whatever`.
-
-    The readable prefix is deliberately NOT recomputed. It may have been
-    truncated under a different configured identifier limit, so a prefix
-    comparison would refuse to clean up artifacts this project genuinely
-    created.
-    """
-    match = _STAGING_NAME_SUFFIX_RE.search(relname)
-    if match is None:
-        return None
-    return match.group(1), match.group(2)
-
-
-def parse_staging_comment(comment):
-    """Ownership metadata, or None when this is not ours.
-
-    Defensive by design: an unparseable or unrecognised comment means
-    ownership is UNKNOWN, and the cleanup rule is to drop only what can be
-    positively identified. A parse failure must never fall through to a
-    drop -- that is the failure mode that turns cleanup from hygiene into
-    an outage.
-    """
-    if not comment:
-        return None
-    try:
-        parsed = json.loads(comment)
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    # `type(...) is int`, not equality: Python considers True == 1 and
-    # 1.0 == 1, so a comment carrying "v": true or "v": 1.0 passed a
-    # straight comparison -- confirmed directly. A version field that is
-    # not an integer is not a version this code wrote.
-    if parsed.get('marker') != _COMMENT_MARKER:
-        return None
-    if type(parsed.get('v')) is not int or parsed['v'] != STAGING_COMMENT_VERSION:
-        return None
-
-    # EVERY documented field, with its type checked. Requiring only the
-    # marker, the version and the presence of task/run meant a comment
-    # missing target_schema, target_table and created_at still authorized
-    # a drop -- metadata that does not satisfy the documented format was
-    # being treated as positive identification, which is precisely what
-    # 'unknown ownership is never dropped' is supposed to prevent.
-    #
-    # Extra fields are tolerated on purpose, so a later version can add
-    # one without older code refusing to recognise its own artifacts.
-    required_strings = ('task', 'run', 'target_table', 'created_at')
-    for field in required_strings:
-        value = parsed.get(field)
-        if not isinstance(value, str) or not value:
-            return None
-
-    # target_schema may legitimately be None (an unqualified target), but
-    # the key must be present and, when set, a non-empty string.
-    if 'target_schema' not in parsed:
-        return None
-    schema = parsed['target_schema']
-    if schema is not None and (not isinstance(schema, str) or not schema):
-        return None
-
-    return parsed
-
-
-def _quote_identifier(name):
-    """Double-quote for interpolation into DDL that cannot be parameterised.
-    DROP TABLE and ALTER TABLE ... RENAME take identifiers, not bind
-    parameters. Embedded quotes are doubled.
-    """
-    return '"' + str(name).replace('"', '""') + '"'
-
-
-def _quoted_name(schema, table_name):
-    if schema:
-        return f'{_quote_identifier(schema)}.{_quote_identifier(table_name)}'
-    return _quote_identifier(table_name)
-
-
-def _truncate_utf8(text, max_bytes):
-    """Cut to a byte budget without ever emitting a partial character.
-
-    Bytes, not characters, because PostgreSQL's limit is bytes and this
-    project handles Russian data: confirmed directly that a 62-character
-    Cyrillic name is 116 UTF-8 bytes, so truncating to 41 *characters*
-    still leaves 77 bytes and blows the budget anyway.
-
-    errors='ignore' drops a trailing multi-byte sequence the slice cut in
-    half, rather than producing invalid UTF-8.
-    """
-    encoded = text.encode('utf-8')
-    if len(encoded) <= max_bytes:
-        return text
-    return encoded[:max_bytes].decode('utf-8', errors='ignore')
-
-
-def staging_target_token(schema, table_name):
-    """The collision-bearing half. A function of the TARGET only -- schema,
-    final table name, and the namespace constant -- and deliberately not of
-    the run, nor of pipeline position.
-
-    Excluding the run is what makes cross-spec collisions statically
-    checkable: preflight computes exactly the tokens the real run will use,
-    so a collision is caught before any resource is built rather than
-    depending on which run id happened to come up. Folding the run into
-    this hash instead would make two targets collide under one run and not
-    another.
-
-    Excluding position is what keeps a repeated publication of the same
-    target detectable: it produces the same name, so the generated-name
-    registry sees it. Including position would produce two different
-    staging names that both swap into one final table, silently -- the same
-    overwrite class that duplicate-target rejection exists to prevent,
-    reappearing a layer down.
-    """
-    material = '\x1f'.join((schema or '', table_name, STAGING_NAME_KIND))
-    return hashlib.blake2b(material.encode('utf-8'), digest_size=_STAGING_TOKEN_HEX // 2).hexdigest()
-
-
-def staging_table_name(schema, table_name, run_token, *, max_bytes=MAX_IDENTIFIER_BYTES):
-    """`<shortened readable prefix>__stg_<target_token>_<run_token>`, e.g.
-
-        employee_funnel__stg_a13f294c_7b32e910
-
-    Only the human-readable prefix is ever shortened. The uniqueness-bearing
-    suffix is fixed width and is never truncated -- truncating it would
-    defeat the entire reason it exists. The suffix being fixed width is also
-    what lets preflight calculate the full length statically.
-    """
-    suffix = f'__{STAGING_NAME_KIND}_{staging_target_token(schema, table_name)}_{run_token}'
-    return _truncate_utf8(table_name, max_bytes - len(suffix.encode('utf-8'))) + suffix
-
-
-def new_run_token():
-    return uuid4().hex[:_RUN_TOKEN_HEX]
 
 
 class DbPublisher:

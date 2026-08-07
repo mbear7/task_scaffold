@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tests for task_core.db_copy: the COPY-loader spool subsystem primitives.
+"""Tests for task_core.db.copy: the COPY-loader spool subsystem primitives.
 
 Phase 5.b of ADR 0011 introduces four independent primitives, each
 tested in its own TestN class:
@@ -25,10 +25,26 @@ from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import task_core.db_copy as db_copy_module
+import task_core.db.copy as db_copy_module
+import task_core.db.spool_format as spool_format_module
+import task_core.db.spool_io as spool_io_module
 
-from task_core.db_copy import (
+from task_core.db.copy import (
     CopyLoadPolicy,
+    SpoolIdentity,
+    cleanup_spool_paths,
+    load_copy_into_staging,
+    open_spool_for_read,
+    open_spool_for_write,
+    prepare_copy_source,
+    read_neutral_preamble,
+    read_neutral_row,
+    write_neutral_preamble,
+    write_neutral_row,
+    write_neutral_terminator,
+)
+from task_core.db.copytext import serialize_row_to_copytext
+from task_core.db.spool_format import (
     DEFAULT_SPOOL_SUBDIR,
     FORMAT_VERSION,
     MAGIC,
@@ -37,27 +53,15 @@ from task_core.db_copy import (
     SPOOL_FILENAME_RE,
     SPOOL_STAGES,
     SpoolFormatError,
-    SpoolIdentity,
-    cleanup_predecessor_spools,
-    cleanup_spool_paths,
-    load_copy_into_staging,
     compose_ownership_token,
     compose_spool_filename,
-    open_spool_for_read,
-    open_spool_for_write,
     parse_spool_filename,
-    prepare_copy_source,
-    read_neutral_preamble,
-    read_neutral_row,
     read_spool_header,
     resolve_spool_directory,
-    serialize_row_to_copytext,
-    write_neutral_preamble,
-    write_neutral_row,
-    write_neutral_terminator,
     write_spool_header,
 )
-from task_core.db_values import DbPublishError, ResolvedColumn
+from task_core.db.spool_io import cleanup_predecessor_spools
+from task_core.db.values import DbPublishError, ResolvedColumn
 
 import math
 from datetime import date
@@ -517,7 +521,7 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
     def test_a_successful_spool_lifecycle_leaves_the_root_in_place(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+                spool_format_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 policy = CopyLoadPolicy()
                 directory = resolve_spool_directory(policy)
@@ -538,7 +542,7 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
     def test_external_deletion_after_resolution_is_survived_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+                spool_format_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 policy = CopyLoadPolicy()
                 directory = resolve_spool_directory(policy)
@@ -569,10 +573,10 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+                spool_format_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 directory = resolve_spool_directory(CopyLoadPolicy())
-                real_open = db_copy_module.os.open
+                real_open = spool_io_module.os.open
                 state = {'n': 0}
 
                 def always_missing(path, flags, mode=0o777, **kwargs):
@@ -583,7 +587,7 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
                     return real_open(path, flags, mode, **kwargs)
 
                 with patch.object(
-                    db_copy_module.os, 'open', side_effect=always_missing,
+                    spool_io_module.os, 'open', side_effect=always_missing,
                 ):
                     with self.assertRaises(FileNotFoundError) as caught:
                         open_spool_for_write(
@@ -623,7 +627,7 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
     def test_declared_prepare_failure_leaves_the_root_in_place(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+                spool_format_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 policy = CopyLoadPolicy()
                 directory = resolve_spool_directory(policy)
@@ -640,7 +644,7 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
     def test_inferred_prepare_failure_leaves_the_root_in_place(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+                spool_format_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 policy = CopyLoadPolicy()
                 directory = resolve_spool_directory(policy)
@@ -664,11 +668,11 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+                spool_format_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 directory = resolve_spool_directory(CopyLoadPolicy())
                 with patch.object(
-                    db_copy_module.os, 'open',
+                    spool_io_module.os, 'open',
                     side_effect=[FileNotFoundError(), FileExistsError()],
                 ):
                     with self.assertRaises(FileExistsError):
@@ -694,11 +698,11 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
             with self.subTest(errno=label):
                 with tempfile.TemporaryDirectory() as tmp:
                     with patch.object(
-                        db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+                        spool_format_module.tempfile, 'gettempdir', return_value=tmp,
                     ):
                         directory = resolve_spool_directory(CopyLoadPolicy())
                         with patch.object(
-                            db_copy_module.os, 'open',
+                            spool_io_module.os, 'open',
                             side_effect=[FileNotFoundError(), error],
                         ):
                             with self.assertRaises(expected) as caught:
@@ -723,7 +727,7 @@ class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+                spool_format_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 directory = resolve_spool_directory(CopyLoadPolicy())
                 first = open_spool_for_write(
@@ -1724,7 +1728,7 @@ class Test16CleanupSpoolPathsIsBestEffortAndNeverRaises(unittest.TestCase):
     def test_residual_path_is_returned_and_logged_exactly(self):
         path = Path('/tmp/cannot-remove-this-spool')
         with patch.object(Path, 'unlink', side_effect=OSError('still open')):
-            with self.assertLogs('task_core.db_copy', level='WARNING') as captured:
+            with self.assertLogs('task_core.db.spool_io', level='WARNING') as captured:
                 failed = cleanup_spool_paths(
                     [path], attempts=2, retry_delay_seconds=0,
                 )
@@ -2025,7 +2029,7 @@ class Test17EncryptedSpoolContainer(unittest.TestCase):
             path = directory / compose_spool_filename(
                 token=ident.token, stage='neutral',
             )
-            with patch('task_core.db_copy.os.fdopen', side_effect=RuntimeError('boom')):
+            with patch('task_core.db.spool_io.os.fdopen', side_effect=RuntimeError('boom')):
                 with self.assertRaisesRegex(RuntimeError, 'boom'):
                     open_spool_for_write(
                         directory, stage='neutral', identity=ident,
@@ -2217,7 +2221,7 @@ class Test19bDeclaredPreparationIsOnePassAndSerializationIsCompiled(unittest.Tes
             ResolvedColumn('id', sa.Integer(), False),
         )
         stages = []
-        original = db_copy_module.open_spool_for_write
+        original = spool_io_module.open_spool_for_write
 
         def recording_open(*args, **kwargs):
             stages.append(kwargs['stage'])
@@ -2225,7 +2229,7 @@ class Test19bDeclaredPreparationIsOnePassAndSerializationIsCompiled(unittest.Tes
 
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                'task_core.db_copy.open_spool_for_write',
+                'task_core.db.copy.open_spool_for_write',
                 side_effect=recording_open,
             ):
                 prepared = prepare_copy_source(
@@ -2249,7 +2253,7 @@ class Test19bDeclaredPreparationIsOnePassAndSerializationIsCompiled(unittest.Tes
         ident = _make_identity()
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                'task_core.db_copy.serialize_row_to_copytext',
+                'task_core.db.copytext.serialize_row_to_copytext',
                 side_effect=AssertionError(
                     'prepare_copy_source rebuilt a mapping serializer per row'
                 ),
@@ -2308,20 +2312,20 @@ class Test19cDeclaredDirectSerializerHotPath(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with (
                 patch(
-                    'task_core.db_copy._normalize_value',
+                    'task_core.db.copytext._normalize_value',
                     side_effect=AssertionError(
                         'native declared COPY called generic normalization'
                     ),
                 ),
                 patch(
-                    'task_core.db_copy._validate_declared_value_family',
+                    'task_core.db.values._validate_declared_value_family',
                     side_effect=AssertionError(
                         'native declared COPY called generic validation'
                     ),
                     create=True,
                 ),
                 patch(
-                    'task_core.db_copy._serialize_value_copytext_family',
+                    'task_core.db.copytext._serialize_value_copytext_family',
                     side_effect=AssertionError(
                         'native declared COPY called generic serialization'
                     ),
@@ -2357,7 +2361,7 @@ class Test19cDeclaredDirectSerializerHotPath(unittest.TestCase):
         original = db_copy_module._normalize_value
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                'task_core.db_copy._normalize_value',
+                'task_core.db.copytext._normalize_value',
                 wraps=original,
             ) as normalize:
                 prepared = prepare_copy_source(
@@ -2386,7 +2390,7 @@ class Test19cDeclaredDirectSerializerHotPath(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             with patch(
-                'task_core.db_copy._normalize_value',
+                'task_core.db.copytext._normalize_value',
                 side_effect=AssertionError(
                     'native NaN markers called generic normalization'
                 ),
@@ -2833,16 +2837,16 @@ class Test24CloseAndWriteFailureSemantics(unittest.TestCase):
     def test_close_failure_surfaces_on_success_path(self):
         stream = self._CloseFails()
         with self.assertRaisesRegex(OSError, 'close failed'):
-            with db_copy_module._close_preserving_primary(
+            with spool_io_module._close_preserving_primary(
                 stream, description='test spool',
             ):
                 pass
 
     def test_close_failure_does_not_replace_primary_failure(self):
         stream = self._CloseFails()
-        with self.assertLogs('task_core.db_copy', level='ERROR') as logs:
+        with self.assertLogs('task_core.db.spool_io', level='ERROR') as logs:
             with self.assertRaisesRegex(RuntimeError, 'primary failed'):
-                with db_copy_module._close_preserving_primary(
+                with spool_io_module._close_preserving_primary(
                     stream, description='test spool',
                 ):
                     raise RuntimeError('primary failed')
@@ -2850,7 +2854,7 @@ class Test24CloseAndWriteFailureSemantics(unittest.TestCase):
 
     def test_write_all_retries_short_writes(self):
         writer = self._ShortWriter()
-        db_copy_module._write_all(writer, b'abcdef')
+        spool_format_module._write_all(writer, b'abcdef')
         self.assertEqual(bytes(writer.data), b'abcdef')
 
     def test_write_all_rejects_zero_progress(self):
@@ -2859,7 +2863,7 @@ class Test24CloseAndWriteFailureSemantics(unittest.TestCase):
                 return 0
 
         with self.assertRaisesRegex(OSError, 'short write'):
-            db_copy_module._write_all(ZeroWriter(), b'x')
+            spool_format_module._write_all(ZeroWriter(), b'x')
 
 
 class Test19DbapiCopyTransport(unittest.TestCase):

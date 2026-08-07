@@ -89,7 +89,7 @@ class Test2DbContractAndTypeOverridesGenuinelyImmutable(unittest.TestCase):
         # db_contract end to end, not just this isolated check, before
         # trusting the fix.
         spec = tc.PipelineSpec(db_contract={'source_col': 'target_col'})
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         import petl as etl
         tbl = etl.wrap([('source_col',), ('value',)])
         payload = from_petl(tbl, table_name='t', schema='s', db_contract=spec.db_contract)

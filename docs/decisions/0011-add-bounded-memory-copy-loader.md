@@ -406,6 +406,18 @@ task_core/
 
 The split follows ownership and lifecycle, not line count.
 
+> **Since 0.7.4** the four modules live in a `task_core/db/` subpackage and
+> are ten rather than four: `values.py`, `identifiers.py`, `payload.py`,
+> `policies.py`, `spool_format.py`, `copytext.py`, `spool_io.py`,
+> `insert.py`, `copy.py` and `publish.py`. `db_publish.py remains the sole
+> owner of publication correctness` below still holds — everything that
+> connects, locks or commits is in `publish.py` — and `db_copy.py`'s
+> boundaries hold across the four modules it became. The order is stated in
+> `docs/architecture.md` and enforced by
+> `tests/test_docs.py::test_the_db_subsystem_order_is_as_documented`. This
+> section keeps the original names because they are what the decision
+> proposed.
+
 ### `db_publish.py`
 
 `db_publish.py` remains the sole owner of publication correctness.

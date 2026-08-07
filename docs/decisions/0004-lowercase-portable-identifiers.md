@@ -41,8 +41,8 @@ quoting in hand-written SQL downstream.
 **In `types.py`, not `db_publish.py`.** The convention is engine-neutral —
 it is a scaffold rule about what names we choose to use, not a PostgreSQL
 constraint. PostgreSQL's actual constraint is the 63-byte limit, which
-stays in `db_publish.py` along with staging-name generation and
-normalization rules. `source_state.py` shares the pattern rather than
+stays in `db_publish.py` (`task_core/db/publish.py` since 0.7.4) along
+with staging-name generation and normalization rules. `source_state.py` shares the pattern rather than
 keeping a second copy.
 
 **A mode, not a boolean.** `allow_unsafe_identifiers=True` would conflate

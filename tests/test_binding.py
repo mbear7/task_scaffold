@@ -19,7 +19,7 @@ import unittest
 import pandas as pd
 
 import task_core as tc
-from task_core.db_publish import DbPublishError
+from task_core.db.values import DbPublishError
 
 
 def make_resource(tag='r', tracker=False, on_load=None):
@@ -840,7 +840,7 @@ class Test12RunnerInvokesBackendPreflightBeforeBuildingResources(unittest.TestCa
         class ConnectionWatchingPublisher:
             @classmethod
             def preflight(cls, specs, *, schema, **kwargs):
-                from task_core.db_publish import DbPublisher
+                from task_core.db.publish import DbPublisher
                 return DbPublisher.preflight(specs, schema=schema, **kwargs)
 
             def __init__(self, **kwargs):

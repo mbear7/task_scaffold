@@ -10,6 +10,84 @@ chronologically rather than by release.
 
 
 
+## 0.7.4
+
+Splits the database subsystem into a `task_core/db/` package of ten modules.
+It was four files of 6,472 lines, 57% of the package, of which two were
+~2,700 each. No behavior changes anywhere: every definition was moved
+verbatim and compares identical by AST with docstrings stripped.
+
+### Changed
+- **`task_core/db_{publish,copy,insert,values}.py` became
+  `task_core/db/{publish,copy,insert,values}.py`.** The four modules form one
+  subsystem with its own ADRs, exception hierarchy, policies and lifecycle;
+  the `db_` prefix was a namespace spelled by hand, and `resources/` had
+  already set the precedent.
+- **`publish.py` shed its stateless neighbours**, 2,702 lines to 1,841:
+  - `payload.py` — `DbPayload`, `DbTableResult`, `RowProjection`,
+    `_ProjectedRowSource`, `from_petl()`, `from_pandas()`
+  - `identifiers.py` — byte limits and truncation, portable identifiers,
+    staging names, the advisory-lock key, ownership comments
+  - `policies.py` — `PublicationPlan`, `IdentifierPolicy`,
+    `PublicationLockPolicy`, and `CopyLoadPolicy`, which no longer has to be
+    re-exported from `publish.py` to reach its users
+- **`copy.py` split along its own section boundaries**, 2,699 lines to 614:
+  - `spool_format.py` — what a spool *is*: the five ownership ingredients and
+    their token, filename grammar, versioned header, default location, and
+    the type-neutral binary framing an inferred run replays
+  - `copytext.py` — serialization to PostgreSQL COPY text, including the
+    compiled declared writers and the single escaper ADR 0011 requires
+  - `spool_io.py` — handles, AES-256-GCM streams, the bounded decrypting
+    reader, and current-run and predecessor cleanup
+- `PublisherConfig` stays with the publisher: `resolved_factory()` defaults
+  to `DbPublisher`, so that coupling is real.
+- **`publish.py` no longer imports pandas.** Building a payload from a
+  DataFrame is `payload.py`'s job; the publisher publishes a `DbPayload`.
+- Removed 15 imports left unused by the split, including `errno` in
+  `copy.py` — orphaned when `cleanup_default_spool_directory()` was removed
+  in 0.7.3 and unnoticed at the time.
+
+### Fixed
+- **The layering check no longer skips subpackage modules.** It resolved a
+  module's level by last path segment, so `task_core.resources.excel` looked
+  up `excel.py`, found nothing in the diagram, and was passed over in
+  silence. That hole already exempted `resources/`; a `db/` package would
+  have extended it to 57% of the codebase with the suite still green.
+  Imports now resolve by package-relative path, and the diagram lists
+  submodules individually because a group entry matches nothing.
+- The coverage check that every module appears in the diagram walks
+  `task_core/` recursively instead of listing only its top level.
+- **The engine-importer check is exact rather than a subset.** As a subset
+  check it kept passing after `from_pandas()` moved, leaving `db/publish.py`
+  documented as an engine importer when it had stopped being one.
+- **`db/copy.py`'s `__all__` is checked for existence, not just for leading
+  underscores.** The old check let it keep naming 17 symbols that had moved
+  to sibling modules.
+
+### Added
+- **The subsystem's internal order is enforced, not just drawn.** The global
+  level check is too coarse — most of these modules sit at level 1, so it
+  cannot tell `policies → identifiers` from the reverse. A test asserts the
+  documented order `values → identifiers → payload → policies →
+  spool_format → copytext → spool_io → insert → copy → publish` against real
+  imports, and fails if a `db/` module is added without being placed in it.
+
+### Breaking
+- Direct submodule imports change: `from task_core.db_publish import X` is
+  now `from task_core.db.publish import X`, and names that moved come from
+  their new module — `from_petl` and `RowProjection` from `db.payload`,
+  `SpoolIdentity` and `cleanup_spool_paths` from `db.spool_io`, and so on.
+  No compatibility re-exports were added; each module imports only what it
+  uses. Package and test call sites were updated in this change.
+- `task_core.db_publish` and its siblings are no longer bound as attributes
+  of `task_core`; `task_core.db` is. Those were an accident of the import
+  machinery rather than declared API.
+- Numbered as a patch because the facade is the public surface and it is
+  unchanged. Submodule paths have never been API: no README or authoring
+  example imports one, and every shipped task imports `from task_core import
+  ...`. Rearranging them is internal structure, not a caller-visible break.
+
+
 ## 0.7.3
 
 Removes the framework-created race between spool-directory resolution and
@@ -53,11 +131,9 @@ could not close it.
   re-exported from the `task_core` facade, so only direct
   `task_core.db_copy` importers are affected. Callers should delete the call:
   the root is now intended to persist.
-- Numbered as a patch by deliberate choice, not by the usual rule. Removing a
-  public name would ordinarily be a minor bump; the 0.7 line is being kept
-  contiguous, and nothing outside this repository imports the removed
-  function. Recorded here because the version number does not carry the
-  warning in this one case — this entry does.
+- Numbered as a patch: the removed function was never re-exported through
+  the facade, which is the public surface, so no caller using the documented
+  API can observe its absence.
 
 ### Documentation
 - ADR 0011 records the reversal, why a retry loop was rejected, and that

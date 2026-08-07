@@ -31,12 +31,12 @@ import unittest
 import petl as etl
 
 import task_core as tc
-from task_core.db_publish import (
+from task_core.db.identifiers import (
     MAX_IDENTIFIER_BYTES,
     STAGING_NAME_KIND,
-    DbPublisher,
-    from_petl,
 )
+from task_core.db.payload import from_petl
+from task_core.db.publish import DbPublisher
 from task_core.table_adapters import _ADAPTERS, VALID_TABLE_ADAPTERS
 from task_core.types import PORTABLE_IDENTIFIER_RE
 
@@ -333,10 +333,21 @@ class Test2DocumentedLayeringHolds(unittest.TestCase):
     worth printing if it is true."""
 
     def _modules(self):
+        """(package-relative name, path) for every module under task_core/.
+
+        Package-relative -- `db/publish.py`, not `publish.py` -- so callers
+        can distinguish `db/copy.py` from a future `copy.py` elsewhere, and
+        so the names match the architecture diagram's entries.
+        """
         for root, _, files in os.walk('task_core'):
+            if '__pycache__' in root:
+                continue
             for name in sorted(files):
-                if name.endswith('.py'):
-                    yield name, os.path.join(root, name)
+                if not name.endswith('.py'):
+                    continue
+                path = os.path.join(root, name)
+                relative = os.path.relpath(path, 'task_core')
+                yield relative.replace(os.sep, '/'), path
 
     def test_nothing_below_the_runner_imports_the_runner(self):
         for name, path in self._modules():
@@ -351,13 +362,55 @@ class Test2DocumentedLayeringHolds(unittest.TestCase):
         source = Path('task_core/runner.py').read_text(encoding='utf-8')
         self.assertIsNone(re.search(r'^(import|from) (petl|pandas)', source, re.M))
 
+    def test_no_authoring_document_imports_from_a_submodule(self):
+        """The facade is the public surface, and documents must say so.
+
+        `task_core/__init__.py` promises every name it re-exports resolves as
+        it did when task_core was one flat file. That only holds as an API
+        boundary while the documents a task author copies from import from
+        `task_core` and nothing deeper -- the moment one shows
+        `from task_core.db.publish import ...`, a submodule path becomes
+        something a caller depends on, and moving a module stops being a
+        patch.
+
+        decisions/ is excluded: an ADR discusses internals by name, which is
+        its job.
+        """
+        offenders = []
+        candidates = [Path('README.md')] + sorted(Path('docs').glob('*.md'))
+        for path in candidates:
+            for number, line in enumerate(
+                path.read_text(encoding='utf-8').splitlines(), 1
+            ):
+                if re.match(r'\s*(from|import) task_core\.\w', line):
+                    offenders.append(f'{path.as_posix()}:{number} {line.strip()}')
+
+        self.assertEqual(
+            offenders, [],
+            'authoring documentation imports from a submodule; import from '
+            'the task_core facade instead, or the module layout becomes API'
+        )
+
     def test_only_the_documented_modules_import_an_engine(self):
         # architecture.md names these and says why each needs one.
-        allowed = {'table_adapters.py', 'db_publish.py', 'db_values.py', 'excel.py', 'db.py'}
-        for name, path in self._modules():
-            if re.search(r'^(import|from) (petl|pandas)', Path(path).read_text(encoding='utf-8'), re.M):
-                with self.subTest(module=name):
-                    self.assertIn(name, allowed)
+        expected = {
+            'table_adapters.py', 'db/values.py', 'db/payload.py',
+            'resources/excel.py', 'resources/db.py',
+        }
+        actual = {
+            name for name, path in self._modules()
+            if re.search(r'^(import|from) (petl|pandas)',
+                         Path(path).read_text(encoding='utf-8'), re.M)
+        }
+        # Exact, not a subset. As a subset check this kept passing after
+        # from_pandas() moved out of db/publish.py, leaving that module
+        # listed here and in architecture.md as an engine importer when it
+        # had stopped being one -- the stale claim this file exists to catch.
+        self.assertEqual(
+            actual, expected,
+            'the set of modules importing petl or pandas has changed; '
+            'update architecture.md and this list together'
+        )
 
     def test_the_runner_reaches_context_only_under_type_checking(self):
         source = Path('task_core/runner.py').read_text(encoding='utf-8')
@@ -574,22 +627,96 @@ class Test5TheDocumentedLevelMapMatchesRealImports(unittest.TestCase):
         return levels
 
     def _module_path(self, entry):
+        """Diagram entry -> file path. Entries are package-relative."""
         if entry.endswith('/'):
             return None
-        for candidate in (os.path.join('task_core', entry),
-                          os.path.join('task_core', 'resources', entry)):
-            if os.path.exists(candidate):
-                return candidate
-        return None
+        candidate = os.path.join('task_core', *entry.split('/'))
+        return candidate if os.path.exists(candidate) else None
+
+    @staticmethod
+    def _diagram_key(module):
+        """`task_core.db.publish` -> `db/publish.py`, matching the diagram.
+
+        Keyed on the whole package-relative path rather than the last
+        segment. The last-segment form silently skipped every submodule: a
+        `task_core.db.publish` import looked up `publish.py`, found nothing,
+        and was passed over. Nothing failed -- the check simply stopped
+        applying to `resources/`, and would have stopped applying to `db/`
+        as well, which is 57% of the package.
+        """
+        return '/'.join(module.split('.')[1:]) + '.py'
 
     def test_the_diagram_parses_and_covers_the_package(self):
         levels = self._documented_levels()
         self.assertGreater(len(levels), 8, 'level diagram did not parse')
-        # Every non-package module in task_core/ is either in the diagram
-        # or deliberately outside it.
+        # Every module in task_core/ is either in the diagram or deliberately
+        # outside it. Walked recursively: listing only the top level left
+        # subpackage modules undocumented and unchecked.
         outside = {'__init__.py'}
-        actual = {f for f in os.listdir('task_core') if f.endswith('.py')} - outside
-        self.assertLessEqual(actual, set(levels), 'module missing from the level diagram')
+        actual = set()
+        for dirpath, _dirs, filenames in os.walk('task_core'):
+            if '__pycache__' in dirpath:
+                continue
+            for filename in filenames:
+                if not filename.endswith('.py') or filename in outside:
+                    continue
+                relative = os.path.relpath(
+                    os.path.join(dirpath, filename), 'task_core',
+                )
+                actual.add(relative.replace(os.sep, '/'))
+        self.assertLessEqual(
+            actual, set(levels), 'module missing from the level diagram',
+        )
+
+    # Order inside db/, lowest first. The global level check is too coarse
+    # to see this: values, identifiers, payload and policies all sit at
+    # level 1, so it cannot tell `policies -> identifiers` from
+    # `identifiers -> policies`. The subsystem is 57% of the package and its
+    # internal direction is the thing the split exists to protect, so it is
+    # asserted here rather than only drawn in the diagram.
+    DB_SUBSYSTEM_ORDER = [
+        'values',
+        'identifiers',
+        'payload',
+        'policies',
+        'spool_format',
+        'copytext',
+        'spool_io',
+        'insert',
+        'copy',
+        'publish',
+    ]
+
+    def test_the_db_subsystem_order_is_as_documented(self):
+        rank = {name: i for i, name in enumerate(self.DB_SUBSYSTEM_ORDER)}
+        present = {
+            path.stem for path in Path('task_core/db').glob('*.py')
+            if path.stem != '__init__'
+        }
+        self.assertEqual(
+            present, set(rank),
+            'a db/ module is missing from DB_SUBSYSTEM_ORDER; place it in '
+            'the order and in the architecture diagram'
+        )
+
+        offenders = []
+        for name, level in rank.items():
+            source = Path(f'task_core/db/{name}.py').read_text(encoding='utf-8')
+            for node in ast.walk(ast.parse(source)):
+                if not isinstance(node, ast.ImportFrom) or not node.module:
+                    continue
+                parts = node.module.split('.')
+                if parts[:2] != ['task_core', 'db'] or len(parts) < 3:
+                    continue
+                imported = parts[2]
+                if rank.get(imported, -1) >= level:
+                    offenders.append(f'db/{name}.py imports db/{imported}.py')
+
+        self.assertEqual(
+            sorted(set(offenders)), [],
+            'db/ import direction contradicts the documented order '
+            f'{" -> ".join(self.DB_SUBSYSTEM_ORDER)}'
+        )
 
     def test_no_module_imports_from_a_higher_level(self):
         levels = self._documented_levels()
@@ -604,7 +731,7 @@ class Test5TheDocumentedLevelMapMatchesRealImports(unittest.TestCase):
                     continue
                 if not node.module.startswith('task_core.'):
                     continue
-                imported = node.module.split('.')[-1] + '.py'
+                imported = self._diagram_key(node.module)
                 imported_level = levels.get(imported)
                 if imported_level is None:
                     continue
@@ -684,7 +811,7 @@ class Test7DbInsertBoundary(unittest.TestCase):
 
     Scope: these are architectural tripwires, not exhaustive enforcement.
     They catch the obvious regressions (direct `create_engine`, `.begin`,
-    `from task_core.db_publish import DbPublisher`) that would show up
+    `from task_core.db.publish import DbPublisher`) that would show up
     literally in the source; they do not catch `engine.raw_connection()`,
     `engine_from_config()`, or a transitive import that reaches the
     publisher through an intermediate helper. The current loader is 44
@@ -693,7 +820,7 @@ class Test7DbInsertBoundary(unittest.TestCase):
     through a parameter -- is fair to add if the loader grows.
     """
 
-    _SOURCE = Path('task_core/db_insert.py').read_text(encoding='utf-8')
+    _SOURCE = Path('task_core/db/insert.py').read_text(encoding='utf-8')
     _TREE = ast.parse(_SOURCE)
 
     def _all_attribute_and_name_calls(self):
@@ -771,7 +898,7 @@ class Test8DbCopyBoundary(unittest.TestCase):
     engine, connection or transaction. The lightweight form is enough today.
     """
 
-    _SOURCE = Path('task_core/db_copy.py').read_text(encoding='utf-8')
+    _SOURCE = Path('task_core/db/copy.py').read_text(encoding='utf-8')
     _TREE = ast.parse(_SOURCE)
 
     def _all_attribute_and_name_calls(self):
@@ -791,8 +918,8 @@ class Test8DbCopyBoundary(unittest.TestCase):
                 with self.subTest(module=node.module, names=imported):
                     self.assertNotIn('DbPublisher', imported)
                     self.assertNotEqual(
-                        node.module, 'task_core.db_publish',
-                        f'db_copy imports from task_core.db_publish -- the '
+                        node.module, 'task_core.db.publish',
+                        f'db_copy imports from task_core.db.publish -- the '
                         f'spool-preparation module must not know the publisher exists',
                     )
             elif isinstance(node, ast.Import):
@@ -840,10 +967,10 @@ class Test9DbValuesBoundary(unittest.TestCase):
     someone tries extracting it a second time.
     """
 
-    _TREE = ast.parse(Path('task_core/db_values.py').read_text(encoding='utf-8'))
+    _TREE = ast.parse(Path('task_core/db/values.py').read_text(encoding='utf-8'))
 
     def test_db_values_imports_neither_publisher_nor_loader_modules(self):
-        forbidden = {'task_core.db_publish', 'task_core.db_insert', 'task_core.db_copy'}
+        forbidden = {'task_core.db.publish', 'task_core.db.insert', 'task_core.db.copy'}
         for node in ast.walk(self._TREE):
             if isinstance(node, ast.ImportFrom):
                 with self.subTest(module=node.module):
@@ -905,7 +1032,7 @@ class Test11SafeSourceHygiene(unittest.TestCase):
     """Low-risk cleanup stays low-risk and does not grow a new public API."""
 
     def test_db_publish_does_not_reexport_unused_private_value_kernel_names(self):
-        module = importlib.import_module('task_core.db_publish')
+        module = importlib.import_module('task_core.db.publish')
         private_leaks = (
             '_TYPE_OVERRIDES',
             '_INTEGER_RANGES',
@@ -926,37 +1053,46 @@ class Test11SafeSourceHygiene(unittest.TestCase):
                 )
 
     def test_db_copy_all_contains_only_public_names(self):
-        module = importlib.import_module('task_core.db_copy')
+        module = importlib.import_module('task_core.db.copy')
         self.assertEqual(
             [name for name in module.__all__ if name.startswith('_')],
             [],
         )
         self.assertTrue(hasattr(module, '_build_copy_sql'))
+        # Also that every listed name is really there. Checking only for
+        # leading underscores let __all__ keep naming 17 symbols after the
+        # 0.7.4 split moved them to sibling modules -- a public-surface
+        # declaration listing names the module does not have.
+        self.assertEqual(
+            [name for name in module.__all__ if not hasattr(module, name)],
+            [],
+            '__all__ names symbols this module does not provide',
+        )
 
     def test_confirmed_dead_symbols_and_stale_runtime_comments_are_absent(self):
         sources = {
             path: Path(path).read_text(encoding='utf-8')
             for path in (
-                'task_core/db_copy.py',
-                'task_core/db_publish.py',
-                'task_core/db_values.py',
+                'task_core/db/copy.py',
+                'task_core/db/publish.py',
+                'task_core/db/values.py',
                 'task_core/export.py',
-                'task_core/db_insert.py',
+                'task_core/db/insert.py',
                 'task_core/source_state.py',
                 'tests/test_source_change_runner.py',
             )
         }
         forbidden = {
-            'task_core/db_copy.py': (
+            'task_core/db/copy.py': (
                 '_GCM_TAG_BYTES',
                 'Public shape as of 0.6.11',
             ),
-            'task_core/db_publish.py': (
+            'task_core/db/publish.py': (
                 'from datetime import date, datetime, timezone',
                 'from decimal import Decimal',
                 "no observable effect until db_loader='copy'",
             ),
-            'task_core/db_values.py': (
+            'task_core/db/values.py': (
                 're-exports the\nsame names (public and private)',
             ),
             'task_core/export.py': (
@@ -967,7 +1103,7 @@ class Test11SafeSourceHygiene(unittest.TestCase):
             # db_insert stopped being the only loader in 0.6.6, but its
             # module docstring still said so through 0.7.1 -- including
             # across the 0.6.13 comment-hygiene pass.
-            'task_core/db_insert.py': (
+            'task_core/db/insert.py': (
                 'and today, only -- loader',
             ),
             'task_core/source_state.py': ('import re',),

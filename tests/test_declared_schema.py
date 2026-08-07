@@ -9,8 +9,10 @@ import pandas as pd
 import sqlalchemy as sa
 
 import task_core as tc
-from task_core.db_publish import DbPayload, DbPublishError, DbPublisher
-from task_core.db_values import (
+from task_core.db.payload import DbPayload
+from task_core.db.publish import DbPublisher
+from task_core.db.values import DbPublishError
+from task_core.db.values import (
     ResolvedColumn,
     ResolvedSchema,
     _resolve_payload_schema,
@@ -485,13 +487,13 @@ class Test4DeclaredPublicationControlFlow(unittest.TestCase):
 
     def test_non_table_declared_target_is_rejected_explicitly(self):
         publisher = self._publisher()
-        with mock.patch('task_core.db_publish._find_relation', side_effect=[(10, 'r'), (20, 'v')]):
+        with mock.patch('task_core.db.publish._find_relation', side_effect=[(10, 'r'), (20, 'v')]):
             with self.assertRaisesRegex(DbPublishError, 'view'):
                 publisher._prepare_declared_targets_before_lock()
 
     def test_schema_mismatch_and_incoming_fk_are_rejected_before_lock(self):
         publisher = self._publisher()
-        with mock.patch('task_core.db_publish._relation_columns', side_effect=[(('id', 1),), (('id', 2),)]):
+        with mock.patch('task_core.db.publish._relation_columns', side_effect=[(('id', 1),), (('id', 2),)]):
             with self.assertRaisesRegex(DbPublishError, 'does not match'):
                 publisher._verify_declared_target_compatibility(
                     schema='bsr', table_name='target', staging_name='stg',
@@ -499,8 +501,8 @@ class Test4DeclaredPublicationControlFlow(unittest.TestCase):
                 )
 
         columns = (('id', 20, -1, True, 0, '', '', False),)
-        with mock.patch('task_core.db_publish._relation_columns', side_effect=[columns, columns]), \
-             mock.patch('task_core.db_publish._external_incoming_foreign_keys', return_value=(('x', 'child', 'fk'),)):
+        with mock.patch('task_core.db.publish._relation_columns', side_effect=[columns, columns]), \
+             mock.patch('task_core.db.publish._external_incoming_foreign_keys', return_value=(('x', 'child', 'fk'),)):
             with self.assertRaisesRegex(DbPublishError, 'incoming'):
                 publisher._verify_declared_target_compatibility(
                     schema='bsr', table_name='target', staging_name='stg',
@@ -512,7 +514,7 @@ class Test4DeclaredPublicationControlFlow(unittest.TestCase):
         target = (('id', 20, -1, True, 0, '', '', True),)
         staging = (('id', 20, -1, True, 0, '', '', False),)
         with mock.patch(
-            'task_core.db_publish._relation_columns',
+            'task_core.db.publish._relation_columns',
             side_effect=[target, staging],
         ):
             with self.assertRaisesRegex(DbPublishError, 'default metadata'):
@@ -565,7 +567,7 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
     def _publish(self, publisher, strategy):
         import petl as etl
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         publisher.publish(from_petl(
             etl.wrap([['v'], [9]]), table_name='t', schema=None,
             output_schema=self.COLUMNS, publication_strategy=strategy,
@@ -602,7 +604,7 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
     def test_the_strategy_is_carried_on_the_payload(self):
         import petl as etl
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         for strategy in ('replace', 'refill'):
             with self.subTest(strategy=strategy):
                 payload = from_petl(
@@ -621,7 +623,10 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
     def test_adapter_constructors_apply_the_same_strategy_validation(self):
         import petl as etl
-        from task_core.db_publish import from_pandas, from_petl
+        from task_core.db.payload import (
+            from_pandas,
+            from_petl,
+        )
 
         with self.assertRaisesRegex(DbPublishError, 'publication_strategy'):
             from_petl(
@@ -657,7 +662,7 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
     def test_mutated_payload_strategy_is_revalidated_at_publish_boundary(self):
         import petl as etl
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         payload = from_petl(
             etl.wrap([['v'], [9]]), table_name='t', schema=None,
             output_schema=self.COLUMNS, publication_strategy='replace',

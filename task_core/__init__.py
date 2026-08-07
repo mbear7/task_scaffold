@@ -9,6 +9,14 @@ below must resolve exactly as it did when task_core was a single flat
 file, so that existing *_task.py files (ops_task.py and friends) need zero
 source changes.
 
+That makes this list the public surface, and the only one. Submodule paths
+-- task_core.db.publish, task_core.file_access -- are internal structure:
+no README or authoring example imports one, and every shipped task imports
+from here. Modules may be split, renamed or moved between packages without
+that being a caller-visible break, and such a change is a patch. Removing
+or changing a name *below* is the break that costs a minor version.
+
+
 One recorded, deliberate behavior exception to that guarantee (v0.2.0):
 select_file_infos() given a *file* path now raises ValueError directing
 callers to select_fixed_file(), instead of silently returning a
@@ -18,9 +26,9 @@ resolves; this one behavior intentionally does not. See README
 message for the rationale.
 """
 
-__version__ = '0.7.3'
+__version__ = '0.7.4'
 
-from task_core.db_publish import (
+from task_core.db.publish import (
     CopyLoadPolicy,
     DbPublishError,
     DbPublishInvariantError,

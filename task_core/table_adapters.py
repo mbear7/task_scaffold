@@ -4,8 +4,8 @@ Level 2: engine adapters for pipeline output. Sits below export.py within
 level 2 -- export.py imports get_table_adapter from here (lateral,
 acyclic); this module must never import anything back from export.py.
 Depends on types.py (VALID_TABLE_ADAPTERS, PipelineContractError),
-task_core.db_publish (from_petl/from_pandas -- internal to task_core),
-task_core.db_values (missing-value semantics), petl (etl, real package,
+task_core.db.publish (from_petl/from_pandas -- internal to task_core),
+task_core.db.values (missing-value semantics), petl (etl, real package,
 imported directly),
 pandas, and openpyxl_compat.
 
@@ -22,8 +22,11 @@ from __future__ import annotations
 import pandas as pd
 import petl as etl
 
-from task_core.db_publish import from_pandas, from_petl
-from task_core.db_values import is_missing
+from task_core.db.payload import (
+    from_pandas,
+    from_petl,
+)
+from task_core.db.values import is_missing
 
 from task_core.types import PipelineContractError, VALID_TABLE_ADAPTERS
 from task_core.openpyxl_compat import suppress_openpyxl_data_validation_warning
@@ -62,7 +65,7 @@ def normalize_for_excel(value):
     # in-memory table/DataFrame value, precisely because that's what let
     # the regression through unnoticed the first time.
     #
-    # is_missing() (db_values.py), not a bare value != value check: a
+    # is_missing() (db/values.py), not a bare value != value check: a
     # further review found that check genuinely broken for pd.NA
     # specifically -- see is_missing()'s own docstring for why -- which
     # this function had too, independently of _normalize_value() having

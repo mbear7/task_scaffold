@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Level 2: technical task_scaffold_meta persistence for source-change
-tracking. Moved OUT of db_publish.py so db_publish.py stays fully
+tracking. Moved OUT of db/publish.py so db/publish.py stays fully
 task-agnostic.
 """
 
@@ -10,7 +10,7 @@ import logging
 
 import sqlalchemy as sa
 
-from task_core.db_publish import (
+from task_core.db.publish import (
     MAX_IDENTIFIER_BYTES,
     DbPublishError,
     server_identifier_limit,
@@ -19,14 +19,14 @@ from task_core.db_publish import (
 from task_core.types import SourceCheckError, PORTABLE_IDENTIFIER_RE
 
 
-# Shared with db_publish.py's target validation via types.py rather than
+# Shared with db/publish.py's target validation via types.py rather than
 # duplicated here -- one convention, one definition. See its docstring for
 # why it is lower-case only.
 _SAFE_IDENTIFIER_RE = PORTABLE_IDENTIFIER_RE
 
 
 def _validate_identifier(name, *, kind):
-    # Raises SourceCheckError (task_core.types), not db_publish.DbPublishError:
+    # Raises SourceCheckError (task_core.types), not db/publish.DbPublishError:
     # "unsafe schema/table identifier" is a source-tracking *configuration*
     # problem (schema/table come from SourceChangeCheckConfig, a task_core
     # concept), not a generic publish failure.

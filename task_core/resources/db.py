@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """Level 2: Postgres input resource. No source_access/source_tracking
-dependency -- reads via psycopg2 and task_core.db_publish (internal)
+dependency -- reads via psycopg2 and task_core.db.publish (internal)
 only."""
 
 import re
 
 import petl as etl
 
-from task_core.db_publish import validate_pg_creds
+from task_core.db.publish import validate_pg_creds
 
 
 _SAFE_TABLE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$')

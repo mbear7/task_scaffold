@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Tests against the real DbPublisher class (task_core/db_publish.py), not
+Tests against the real DbPublisher class (task_core/db/publish.py), not
 a fake one -- this file exists specifically because the existing
 FakeDbPublisher (tests/test_source_change_runner.py) called its fake
 connection's commit() unconditionally, which meant it could never have
@@ -45,23 +45,27 @@ import sqlalchemy as sa
 from sqlalchemy import exc as sa_exc
 
 import task_core as tc
-from task_core.db_publish import (
+from task_core.db.identifiers import (
     MAX_IDENTIFIER_BYTES,
     STAGING_NAME_KIND,
-    DbPublishError,
-    DbPublishInvariantError,
-    DbPublisher,
     new_run_token,
+    server_identifier_limit,
     staging_table_name,
     staging_target_token,
     validate_identifier,
     validate_portable_identifier,
-    IdentifierPolicy,
-    server_identifier_limit,
+)
+from task_core.db.payload import (
     DbPayload,
     from_pandas,
 )
-from task_core.db_values import (
+from task_core.db.policies import IdentifierPolicy
+from task_core.db.publish import DbPublisher
+from task_core.db.values import (
+    DbPublishError,
+    DbPublishInvariantError,
+)
+from task_core.db.values import (
     _InferenceStreamState,
     _infer_column_type,
     _normalize_value,
@@ -328,7 +332,8 @@ class Test3DuplicateColumnsRejected(unittest.TestCase):
 
     def test_from_pandas_rejects_literal_duplicate_names(self):
         import pandas as pd
-        from task_core.db_publish import from_pandas, DbPublishError
+        from task_core.db.payload import from_pandas
+        from task_core.db.publish import DbPublishError
 
         df = pd.DataFrame([[1, 2]], columns=['a', 'a'])
         with self.assertRaises(DbPublishError):
@@ -340,7 +345,8 @@ class Test3DuplicateColumnsRejected(unittest.TestCase):
         # stringified list by validation time, so this must be caught
         # identically to a literal duplicate.
         import pandas as pd
-        from task_core.db_publish import from_pandas, DbPublishError
+        from task_core.db.payload import from_pandas
+        from task_core.db.publish import DbPublishError
 
         df = pd.DataFrame([[1, 2]])
         df.columns = [1, '1']
@@ -349,7 +355,8 @@ class Test3DuplicateColumnsRejected(unittest.TestCase):
 
     def test_from_petl_rejects_duplicate_names(self):
         import petl as etl
-        from task_core.db_publish import from_petl, DbPublishError
+        from task_core.db.payload import from_petl
+        from task_core.db.publish import DbPublishError
 
         tbl = etl.wrap([('a', 'a'), (1, 2)])
         with self.assertRaises(DbPublishError):
@@ -357,7 +364,7 @@ class Test3DuplicateColumnsRejected(unittest.TestCase):
 
     def test_unique_columns_still_work_normally(self):
         import pandas as pd
-        from task_core.db_publish import from_pandas
+        from task_core.db.payload import from_pandas
 
         df = pd.DataFrame([[1, 2]], columns=['a', 'b'])
         payload = from_pandas(df, table_name='t', schema='s')
@@ -372,12 +379,12 @@ class Test4ChunkSizeValidation(unittest.TestCase):
     itself still gets created, so publication appears successful."""
 
     def test_zero_is_rejected(self):
-        from task_core.db_publish import DbPublishError
+        from task_core.db.publish import DbPublishError
         with self.assertRaises(DbPublishError):
             DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t', chunk_size=0)
 
     def test_negative_is_rejected(self):
-        from task_core.db_publish import DbPublishError
+        from task_core.db.publish import DbPublishError
         with self.assertRaises(DbPublishError):
             DbPublisher(creds={'user': 'x', 'host': 'x', 'dbname': 'x'}, schema='bsr', task_name='t', chunk_size=-1)
 
@@ -1085,7 +1092,7 @@ class Test11IdentifierValidationPreflightAndRuntime(unittest.TestCase):
 
     def _payload(self, **kwargs):
         import petl as etl
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         kwargs.setdefault('table_name', 't')
         kwargs.setdefault('schema', None)
         tbl = kwargs.pop('tbl', etl.wrap([['v'], ['x']]))
@@ -1297,7 +1304,7 @@ class Test12StagingSwapAndReviewCorrections(unittest.TestCase):
         return conn
 
     def _payload(self, table_name, tbl):
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         return from_petl(tbl, table_name=table_name, schema=None)
 
     def _tables(self, conn):
@@ -1624,7 +1631,7 @@ class Test15StagedPublicationModel(unittest.TestCase):
         return conn
 
     def _payload(self, table_name, tbl):
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         return from_petl(tbl, table_name=table_name, schema=None)
 
     def _staging_tables(self, conn):
@@ -1701,7 +1708,7 @@ class Test15StagedPublicationModel(unittest.TestCase):
         publication must not advance the stored fingerprints.
         """
         import petl as etl
-        from task_core.db_publish import PublicationPlan
+        from task_core.db.publish import PublicationPlan
 
         plan = PublicationPlan()
         performed = []
@@ -1719,7 +1726,7 @@ class Test15StagedPublicationModel(unittest.TestCase):
     def test_a_run_with_no_prepared_targets_still_runs_the_plan(self):
         # The source-check-only shape: no db_table anywhere, but the
         # fingerprints still have to be written and committed.
-        from task_core.db_publish import PublicationPlan
+        from task_core.db.publish import PublicationPlan
 
         plan = PublicationPlan()
         performed = []
@@ -1754,7 +1761,7 @@ class Test16RollbackIsCleanupNotRollback(unittest.TestCase):
     def _prepared(self):
         import petl as etl
         import sqlalchemy as sa
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
 
         publisher = self._publisher()
         conn = publisher.ensure_connection()
@@ -1808,7 +1815,7 @@ class Test16RollbackIsCleanupNotRollback(unittest.TestCase):
         publisher.rollback()
 
     def test_rollback_clears_the_publication_plan(self):
-        from task_core.db_publish import PublicationPlan
+        from task_core.db.publish import PublicationPlan
         plan = PublicationPlan()
         plan.add('source state', lambda: None)
         publisher = self._publisher(publication_plan=plan)
@@ -1948,14 +1955,14 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
         return publisher
 
     def _payload(self, columns=('a', 'b')):
-        from task_core.db_publish import DbPayload
+        from task_core.db.publish import DbPayload
         return DbPayload(
             table_name='target', schema=None, columns=list(columns),
             rows=[{name: 1 for name in columns}],
         )
 
     def test_a_prepared_table_carries_this_run_s_ownership_metadata(self):
-        from task_core.db_publish import parse_staging_comment
+        from task_core.db.publish import parse_staging_comment
         conn = self._Conn(columns=['a', 'b'])
         publisher = self._publisher(conn)
 
@@ -1995,24 +2002,24 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
         publisher = self._publisher(conn)
         publisher.chunk_size = 1
 
-        from task_core.db_publish import DbPayload
+        from task_core.db.publish import DbPayload
         payload = DbPayload(table_name='target', schema=None, columns=['a'],
                             rows=[{'a': 1}, {'a': 2}, {'a': 3}])
 
-        # Patch _chunked in task_core.db_insert -- that is where the
-        # loader resolves it. Patching task_core.db_publish would be a
+        # Patch _chunked in task_core.db.insert -- that is where the
+        # loader resolves it. Patching task_core.db.publish would be a
         # dead statement now (0.6.0), and defaults-to-permissive means
         # the invariant would silently stop being tested.
-        real_chunked = sys.modules['task_core.db_insert']._chunked
+        real_chunked = sys.modules['task_core.db.insert']._chunked
         try:
-            sys.modules['task_core.db_insert']._chunked = (
+            sys.modules['task_core.db.insert']._chunked = (
                 lambda rows, size: real_chunked(rows[:-1], size)   # silently drops one
             )
             with self.assertRaises(DbPublishInvariantError) as caught:
                 publisher.publish(payload)
             self.assertIn('loaded 2 rows', str(caught.exception))
         finally:
-            sys.modules['task_core.db_insert']._chunked = real_chunked
+            sys.modules['task_core.db.insert']._chunked = real_chunked
 
     def test_publication_refuses_a_staging_table_that_lost_its_metadata(self):
         conn = self._Conn(columns=['a'])
@@ -2027,7 +2034,7 @@ class Test17PreparationValidationAndOwnership(unittest.TestCase):
         # ALTER TABLE ... RENAME preserves comments, so without replacement
         # every published table would look to cleanup like an abandoned
         # staging artifact.
-        from task_core.db_publish import parse_staging_comment
+        from task_core.db.publish import parse_staging_comment
         conn = self._Conn(columns=['a'])
         publisher = self._publisher(conn)
         publisher.publish(self._payload(('a',)))
@@ -2074,7 +2081,10 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         # covers both for the same reason: a future refactor that split the
         # constructors would otherwise silently lose coverage on one side.
         import petl as etl
-        from task_core.db_publish import from_pandas, from_petl
+        from task_core.db.payload import (
+            from_pandas,
+            from_petl,
+        )
         with self.assertRaises(DbPublishError):
             from_petl(
                 etl.wrap([['v'], [1]]), table_name='t', schema=None,
@@ -2105,7 +2115,7 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         # back down to after staging_table.create() must make this test
         # fail on the no-DDL assertion, not on the exception assertion.
         import petl as etl
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         payload = from_petl(
             etl.wrap([['a'], [1]]), table_name='target', schema=None,
         )
@@ -2159,7 +2169,7 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         checked the row count would pass identically if publish() bypassed
         LOADERS and called load_rows_into_staging() directly -- which is
         exactly the regression this seam has to prevent."""
-        import task_core.db_publish as dbp
+        import task_core.db.publish as dbp
 
         conn = Test17PreparationValidationAndOwnership._Conn(columns=['a'])
         publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
@@ -2216,7 +2226,10 @@ class Test17cRowSourceProjection(unittest.TestCase):
         return _S(rows)
 
     def test_identity_projection_passes_rows_through_unchanged(self):
-        from task_core.db_publish import RowProjection, _ProjectedRowSource
+        from task_core.db.payload import (
+            RowProjection,
+            _ProjectedRowSource,
+        )
         proj = RowProjection.build(
             ('a', 'b'), db_contract=None, framework_columns=(),
             run_started_at=None,
@@ -2232,7 +2245,10 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # _apply_db_contract_columns: source column names get mapped to
         # target names, and a source column not listed in the mapping
         # is dropped from output.
-        from task_core.db_publish import RowProjection, _ProjectedRowSource
+        from task_core.db.payload import (
+            RowProjection,
+            _ProjectedRowSource,
+        )
         proj = RowProjection.build(
             ('a', 'b', 'c'),
             db_contract={'a': 'x', 'c': 'z'},
@@ -2251,7 +2267,10 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # today; the parity test below re-asserts it against real
         # from_petl output as ground truth.
         from datetime import datetime, timezone
-        from task_core.db_publish import RowProjection, _ProjectedRowSource
+        from task_core.db.payload import (
+            RowProjection,
+            _ProjectedRowSource,
+        )
         from task_core.types import OutputColumn
         ts = datetime(2026, 8, 1, 12, 0, 0, tzinfo=timezone.utc)
         proj = RowProjection.build(
@@ -2275,7 +2294,10 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # the user's directive named ('calculate the timestamp once per
         # payload/run, not once per row').
         from datetime import datetime, timezone
-        from task_core.db_publish import RowProjection, _ProjectedRowSource
+        from task_core.db.payload import (
+            RowProjection,
+            _ProjectedRowSource,
+        )
         from task_core.types import OutputColumn
         ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
         proj = RowProjection.build(
@@ -2296,7 +2318,7 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # not assumed, so a future non-terminal framework column keeps
         # the projection honest without a rewrite.
         from datetime import datetime, timezone
-        from task_core.db_publish import RowProjection
+        from task_core.db.payload import RowProjection
         from task_core.types import OutputColumn
         ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
         proj = RowProjection.build(
@@ -2311,7 +2333,11 @@ class Test17cRowSourceProjection(unittest.TestCase):
         self.assertNotIn(3, proj.constants)
 
     def test_source_row_wrong_width_raises_with_row_number(self):
-        from task_core.db_publish import RowProjection, _ProjectedRowSource, DbPublishError
+        from task_core.db.payload import (
+            RowProjection,
+            _ProjectedRowSource,
+        )
+        from task_core.db.publish import DbPublishError
         proj = RowProjection.build(
             ('a', 'b'), db_contract=None, framework_columns=(),
             run_started_at=None,
@@ -2325,7 +2351,8 @@ class Test17cRowSourceProjection(unittest.TestCase):
         self.assertIn('row 2', message)
 
     def test_missing_source_column_in_contract_is_a_configuration_error(self):
-        from task_core.db_publish import RowProjection, DbPublishError
+        from task_core.db.payload import RowProjection
+        from task_core.db.publish import DbPublishError
         with self.assertRaises(DbPublishError) as caught:
             RowProjection.build(
                 ('a', 'b'), db_contract={'c': 'z'}, framework_columns=(),
@@ -2340,7 +2367,7 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # existing PipelineSpec bug (mutable dict inside a frozen
         # dataclass) is exactly the failure mode this closes.
         import dataclasses
-        from task_core.db_publish import RowProjection
+        from task_core.db.payload import RowProjection
         proj = RowProjection.build(
             ('a',), db_contract=None, framework_columns=(),
             run_started_at=None,
@@ -2365,8 +2392,10 @@ class Test17cRowSourceProjection(unittest.TestCase):
         """
         from datetime import datetime, timezone
         import petl as etl
-        from task_core.db_publish import (
-            RowProjection, _ProjectedRowSource, from_petl,
+        from task_core.db.payload import (
+            RowProjection,
+            _ProjectedRowSource,
+            from_petl,
         )
         from task_core.export import apply_db_updated_at
         from task_core.table_adapters import PETL_ADAPTER
@@ -2422,7 +2451,8 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # (dict {name: index} discards duplicates), so a broken source
         # would look valid at the projection layer and fail cryptically
         # much later.
-        from task_core.db_publish import RowProjection, DbPublishError
+        from task_core.db.payload import RowProjection
+        from task_core.db.publish import DbPublishError
         with self.assertRaises(DbPublishError) as caught:
             RowProjection.build(
                 ('a', 'b', 'a'),
@@ -2436,7 +2466,8 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # check. Without this, RowProjection.build would produce
         # output_columns=('x', 'x') which then fails inside SQLAlchemy
         # CREATE TABLE. Reproducing the reviewer's example exactly.
-        from task_core.db_publish import RowProjection, DbPublishError
+        from task_core.db.payload import RowProjection
+        from task_core.db.publish import DbPublishError
         with self.assertRaises(DbPublishError) as caught:
             RowProjection.build(
                 ('a', 'b'),
@@ -2453,7 +2484,8 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # produce two output columns with the same name and one
         # would silently override the other in any consumer that
         # keys by name.
-        from task_core.db_publish import RowProjection, DbPublishError
+        from task_core.db.payload import RowProjection
+        from task_core.db.publish import DbPublishError
         from task_core.types import OutputColumn
         with self.assertRaises(DbPublishError) as caught:
             RowProjection.build(
@@ -2473,7 +2505,8 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # future framework column could accidentally duplicate the
         # timestamp's name. Catch it at the same boundary as the other
         # collision checks.
-        from task_core.db_publish import RowProjection, DbPublishError
+        from task_core.db.payload import RowProjection
+        from task_core.db.publish import DbPublishError
         from task_core.types import OutputColumn
         with self.assertRaises(DbPublishError) as caught:
             RowProjection.build(
@@ -2496,9 +2529,11 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # be silently accepted here. This test uses a re-iterable
         # fake source specifically to prove the _ProjectedRowSource
         # layer enforces one-shot itself, not by delegation.
-        from task_core.db_publish import (
-            RowProjection, _ProjectedRowSource, DbPublishError,
+        from task_core.db.payload import (
+            RowProjection,
+            _ProjectedRowSource,
         )
+        from task_core.db.publish import DbPublishError
         proj = RowProjection.build(
             ('a',), db_contract=None, framework_columns=(),
             run_started_at=None,
@@ -2525,7 +2560,8 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # would never emit such a shape, but the invariant belongs
         # here regardless.
         from types import MappingProxyType
-        from task_core.db_publish import RowProjection, DbPublishInvariantError
+        from task_core.db.payload import RowProjection
+        from task_core.db.publish import DbPublishInvariantError
         with self.assertRaises(DbPublishInvariantError) as caught:
             RowProjection(
                 source_columns=('a',),
@@ -2703,7 +2739,7 @@ class Test17d2RunnerCopyEndToEnd(unittest.TestCase):
             def publish(self, payload):
                 self.assert_payload(payload)
                 rows = list(payload.row_source.iter_rows())
-                from task_core.db_publish import DbTableResult
+                from task_core.db.publish import DbTableResult
                 result = DbTableResult(
                     schema=payload.schema,
                     table_name=payload.table_name,
@@ -2799,7 +2835,7 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
 
     def _run_helper(self, task_cls, tbl, spec, **overrides):
         from task_core.export import _prepare_copy_source_for_pipeline
-        from task_core.db_copy import CopyLoadPolicy
+        from task_core.db.copy import CopyLoadPolicy
         kwargs = dict(
             task_name='t_task',
             run_started_at=datetime(2026, 5, 6, tzinfo=tz.utc),
@@ -2956,7 +2992,8 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
         spec = self._make_spec(db_copy_spool_encryption=False)
         tbl = [('id',), (1,)]
         from task_core.export import _prepare_copy_source_for_pipeline
-        from task_core.db_copy import CopyLoadPolicy, PROTECTION_NONE
+        from task_core.db.copy import CopyLoadPolicy
+        from task_core.db.spool_format import PROTECTION_NONE
         with tempfile.TemporaryDirectory() as tmp:
             prepared = _prepare_copy_source_for_pipeline(
                 cls, tbl, spec, 'bsr',
@@ -2998,7 +3035,7 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
         )
 
     def _publisher(self, conn, spool_dir):
-        from task_core.db_copy import CopyLoadPolicy
+        from task_core.db.copy import CopyLoadPolicy
         publisher = DbPublisher(
             creds=_CREDS,
             schema=None,
@@ -3016,7 +3053,7 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
         return publisher
 
     def test_prepares_loads_reorders_counts_and_reaps_before_commit(self):
-        from task_core import db_publish as module
+        from task_core.db import publish as module
         source = self._OneShotSource([('a', 1), ('b', 2)])
         conn = Test17PreparationValidationAndOwnership._Conn(
             columns=['id', 'amount'],
@@ -3049,9 +3086,10 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
             self.assertEqual(publisher._pending_swaps[-1][-1], 2)
 
     def test_successful_copy_removes_its_spool_and_retains_the_root(self):
-        from task_core import db_copy as db_copy_module
-        from task_core import db_publish as module
-        from task_core.db_copy import CopyLoadPolicy, DEFAULT_SPOOL_SUBDIR
+        from task_core.db import spool_format as db_copy_module
+        from task_core.db import publish as module
+        from task_core.db.copy import CopyLoadPolicy
+        from task_core.db.spool_format import DEFAULT_SPOOL_SUBDIR
 
         source = self._OneShotSource([('a', 1), ('b', 2)])
         conn = Test17PreparationValidationAndOwnership._Conn(
@@ -3103,9 +3141,10 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
                 self.assertEqual(list(root.iterdir()), [])
 
     def test_failed_copy_removes_its_spool_and_retains_the_root(self):
-        from task_core import db_copy as db_copy_module
-        from task_core import db_publish as module
-        from task_core.db_copy import CopyLoadPolicy, DEFAULT_SPOOL_SUBDIR
+        from task_core.db import spool_format as db_copy_module
+        from task_core.db import publish as module
+        from task_core.db.copy import CopyLoadPolicy
+        from task_core.db.spool_format import DEFAULT_SPOOL_SUBDIR
 
         source = self._OneShotSource([('a', 1)])
         conn = Test17PreparationValidationAndOwnership._Conn(
@@ -3157,7 +3196,7 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
                 )
 
     def test_copy_failure_preserves_primary_and_reaps_final_spool(self):
-        from task_core import db_publish as module
+        from task_core.db import publish as module
         source = self._OneShotSource([('a', 1)])
         conn = Test17PreparationValidationAndOwnership._Conn(
             columns=['id', 'amount'],
@@ -3218,7 +3257,7 @@ class Test18ConnectionLossIsFatal(unittest.TestCase):
 
     def test_publish_after_a_lost_connection_raises_rather_than_reconnecting(self):
         import petl as etl
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
         publisher = self._publisher()
         publisher.ensure_connection()
         publisher.mark_connection_lost()
@@ -3336,7 +3375,7 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
             pass
 
     def _publisher(self, conn, task_name='demo_task', spool_directory=None):
-        from task_core.db_copy import CopyLoadPolicy
+        from task_core.db.copy import CopyLoadPolicy
 
         publisher = DbPublisher(
             creds=_CREDS,
@@ -3351,7 +3390,7 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
         return publisher
 
     def _owned_by(self, task, run='deadbeef', target='hr_staff'):
-        from task_core.db_publish import build_staging_comment
+        from task_core.db.publish import build_staging_comment
         return build_staging_comment(
             task_name=task, run_token=run, schema='bsr', table_name=target,
         )
@@ -3360,7 +3399,7 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
         """A name with the exact staging shape the strict rule requires:
         __stg_<8 hex>_<8 hex>, with the target token actually derived from
         the logical target."""
-        from task_core.db_publish import staging_target_token
+        from task_core.db.publish import staging_target_token
         return f'{target}__stg_{staging_target_token("bsr", target)}_{run}'
 
     def test_begin_run_acquires_the_lock_and_reports_success(self):
@@ -3390,7 +3429,7 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
         Before the fix the helper was fully tested but never called by the
         run lifecycle, so a spool left by a crashed process survived.
         """
-        from task_core.db_copy import SpoolIdentity, open_spool_for_write
+        from task_core.db.copy import SpoolIdentity, open_spool_for_write
 
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -3417,7 +3456,7 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
             self.assertEqual([kind for kind, _ in conn.lock_calls], ['acquire'])
 
     def test_losing_task_lock_does_not_clean_predecessor_spool(self):
-        from task_core.db_copy import SpoolIdentity, open_spool_for_write
+        from task_core.db.copy import SpoolIdentity, open_spool_for_write
 
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -3451,7 +3490,7 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
                 publisher._cleanup_predecessor_spools()
 
     def test_the_lock_key_is_namespaced_and_stable(self):
-        from task_core.db_publish import advisory_lock_key
+        from task_core.db.publish import advisory_lock_key
         first = advisory_lock_key('hr_task')
         self.assertEqual(first, advisory_lock_key('hr_task'))
         self.assertNotEqual(first, advisory_lock_key('ops_task'))
@@ -3494,7 +3533,7 @@ class Test19TaskAdvisoryLockAndPredecessorCleanup(unittest.TestCase):
 
     def test_the_name_and_the_comment_must_agree(self):
         # Each being well-formed on its own is not positive identification.
-        from task_core.db_publish import build_staging_comment
+        from task_core.db.publish import build_staging_comment
         mine = self._conforming_name('hr_staff')
 
         wrong_run = build_staging_comment(
@@ -3662,7 +3701,7 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
         return publisher
 
     def _payload(self, table_name='target', schema=None):
-        from task_core.db_publish import DbPayload
+        from task_core.db.publish import DbPayload
         return DbPayload(table_name=table_name, schema=schema,
                          columns=['a'], rows=[{'a': 1}])
 
@@ -3744,7 +3783,7 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
     # --- 4: unknown ownership is never authority ------------------------
 
     def test_an_incomplete_ownership_comment_does_not_authorize_cleanup(self):
-        from task_core.db_publish import parse_staging_comment
+        from task_core.db.publish import parse_staging_comment
 
         incomplete = (
             '{"marker":"task_core","v":1,"task":"demo_task","run":"deadbeef"}',
@@ -3774,7 +3813,7 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
         self.assertNotIn('drop table', ' '.join(conn.statements).lower())
 
     def test_a_complete_ownership_comment_is_still_accepted(self):
-        from task_core.db_publish import build_staging_comment, parse_staging_comment
+        from task_core.db.publish import build_staging_comment, parse_staging_comment
         comment = build_staging_comment(
             task_name='demo_task', run_token='abc', schema=None, table_name='t',
         )
@@ -3792,7 +3831,7 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
         name is a collision, not something to tidy away.
         """
         import sqlalchemy as sa
-        from task_core.db_publish import staging_table_name
+        from task_core.db.publish import staging_table_name
 
         conn = self._Conn()
         publisher = self._publisher(conn)
@@ -3866,7 +3905,7 @@ class Test21CleanupNeverReconnectsAfterSessionLoss(unittest.TestCase):
     def _prepared_publisher(self):
         import petl as etl
         import sqlalchemy as sa
-        from task_core.db_publish import from_petl
+        from task_core.db.payload import from_petl
 
         publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
         publisher._engine = sa.create_engine('sqlite://')
@@ -3977,7 +4016,7 @@ class Test23ProtocolAndTransactionRefinements(unittest.TestCase):
         direct caller without ever claiming the task. Queued work writes to
         the database exactly as a swap does.
         """
-        from task_core.db_publish import PublicationPlan
+        from task_core.db.publish import PublicationPlan
 
         plan = PublicationPlan()
         plan.add('source state', lambda: None)
@@ -4061,7 +4100,7 @@ class Test24InvariantsEnforcedRatherThanAssumed(unittest.TestCase):
         advertised as exactly `__stg_<8 hex>_<8 hex>` accepted a trailing
         newline.
         """
-        from task_core.db_publish import owned_staging_tokens
+        from task_core.db.publish import owned_staging_tokens
 
         self.assertIsNotNone(owned_staging_tokens('x__stg_deadbeef_cafebabe'))
         for rejected in ('x__stg_deadbeef_cafebabe\n',
@@ -4073,7 +4112,7 @@ class Test24InvariantsEnforcedRatherThanAssumed(unittest.TestCase):
     def test_a_boolean_identifier_limit_is_rejected(self):
         # bool subclasses int, so isinstance() accepted True and produced
         # an effective one-byte limit instead of rejecting the config.
-        from task_core.db_publish import IdentifierPolicy
+        from task_core.db.publish import IdentifierPolicy
 
         for bad in (True, False, 1.0, '63', None, 0, -1):
             with self.subTest(value=bad):
@@ -4086,7 +4125,7 @@ class Test24InvariantsEnforcedRatherThanAssumed(unittest.TestCase):
         )
 
     def test_identifier_policy_rejects_positional_configuration(self):
-        from task_core.db_publish import IdentifierPolicy
+        from task_core.db.publish import IdentifierPolicy
 
         with self.assertRaises(TypeError):
             IdentifierPolicy(63)
@@ -4149,7 +4188,7 @@ class Test25TheLockProvesIdentityNotMerelyPresence(unittest.TestCase):
         publisher.begin_run()
         publisher.release_task_lock()
 
-        from task_core.db_publish import advisory_lock_key
+        from task_core.db.publish import advisory_lock_key
         released = [params for kind, params in conn.lock_calls if kind == 'release']
         self.assertEqual(len(released), 1)
         namespace, key = advisory_lock_key('task_a')
@@ -4225,7 +4264,7 @@ class Test26TaskNameIsRequiredAndUsable(unittest.TestCase):
     def test_a_usable_name_round_trips_through_ownership_metadata(self):
         # The property that was actually broken: a publisher's own comment
         # must parse back as its own.
-        from task_core.db_publish import build_staging_comment, parse_staging_comment
+        from task_core.db.publish import build_staging_comment, parse_staging_comment
 
         for name in ('hr_task', 'Отчёт по HR / weekly', 'a'):
             with self.subTest(task_name=name):
@@ -4245,7 +4284,7 @@ class Test27PostgresqlCommentDDL(unittest.TestCase):
     def test_numeric_json_fields_are_not_parsed_as_bind_parameters(self):
         import sqlalchemy as sa
         from sqlalchemy.dialects import postgresql
-        from task_core.db_publish import build_published_comment
+        from task_core.db.publish import build_published_comment
 
         class CapturingConnection:
             dialect = postgresql.dialect()
@@ -4323,7 +4362,7 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
         def close(self): pass
 
     def _publisher(self, conn, policy=None):
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         publisher = DbPublisher(
             creds=_CREDS, schema='bsr', task_name='demo_task',
             publication_lock_policy=policy or PublicationLockPolicy(
@@ -4335,7 +4374,7 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
         publisher._conn = conn
         publisher._engine = type('E', (), {'dispose': lambda self: None})()
         publisher.begin_run()
-        from task_core.db_publish import build_staging_comment, staging_table_name
+        from task_core.db.publish import build_staging_comment, staging_table_name
         staging = staging_table_name('bsr', 'target', publisher._run_token)
         conn.owner_comment = build_staging_comment(
             task_name='demo_task', run_token=publisher._run_token,
@@ -4357,7 +4396,7 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
         """
         conn = self._Conn()
         publisher = self._publisher(conn)
-        from task_core.db_publish import build_staging_comment, staging_table_name
+        from task_core.db.publish import build_staging_comment, staging_table_name
         for table in ('zebra', 'alpha'):
             staging = staging_table_name('bsr', table, publisher._run_token)
             publisher._pending_swaps.append(('bsr', table, staging, 1))
@@ -4455,7 +4494,7 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
         """A horizon that only gated permission to START an attempt would
         let one begun just inside it run well past -- a hint, not a limit.
         """
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         conn = self._Conn(lock_failures=99)
         publisher = self._publisher(conn, PublicationLockPolicy(
             lock_timeout_ms=10, acquisition_timeout_ms=100,
@@ -4477,7 +4516,7 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
         # A remaining budget too small for lock_timeout to sit below
         # statement_timeout cannot produce a well-formed attempt, so there
         # is nothing worth starting.
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         conn = self._Conn(lock_failures=99)
         publisher = self._publisher(conn, PublicationLockPolicy(
             lock_timeout_ms=10, acquisition_timeout_ms=100,
@@ -4492,7 +4531,7 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
     def test_exhaustion_reports_actual_elapsed_and_attempts(self):
         # Budgets are derived from the remaining horizon, so reporting the
         # configured policy would not reconcile with what happened.
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         conn = self._Conn(lock_failures=99)
         publisher = self._publisher(conn, PublicationLockPolicy(
             lock_timeout_ms=10, acquisition_timeout_ms=100,
@@ -4507,7 +4546,7 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
         self.assertGreater(conn.lock_attempts, 1)
 
     def test_max_attempts_is_a_defensive_ceiling(self):
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         conn = self._Conn(lock_failures=99)
         publisher = self._publisher(conn, PublicationLockPolicy(
             lock_timeout_ms=10, acquisition_timeout_ms=100,
@@ -4543,7 +4582,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
 
 
     def test_the_relation_primitive_returns_oid_and_kind_from_exact_values(self):
-        from task_core.db_publish import _find_relation
+        from task_core.db.publish import _find_relation
 
         calls = []
 
@@ -4609,7 +4648,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         self.assertFalse(any('to_regclass' in statement.lower() for statement in conn.statements))
 
     def _publisher(self, conn, table_name='target', policy=None):
-        from task_core.db_publish import (
+        from task_core.db.publish import (
             PublicationLockPolicy, build_staging_comment, staging_table_name,
         )
         publisher = DbPublisher(
@@ -4638,7 +4677,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         the whole statement while lock_timeout applies to each acquisition.
         A < n*L+M can therefore turn ordinary contention into terminal 57014.
         """
-        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+        from task_core.db.publish import PublicationLockPolicy, staging_table_name
 
         conn = Test27PublicationLockIsBounded._Conn()
         publisher = self._publisher(conn, policy=PublicationLockPolicy(
@@ -4656,7 +4695,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
 
     def test_the_multi_target_boundary_is_accepted(self):
         # A == n*L + M exactly satisfies the hard requirement.
-        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+        from task_core.db.publish import PublicationLockPolicy, staging_table_name
 
         conn = Test27PublicationLockIsBounded._Conn()
         publisher = self._publisher(conn, policy=PublicationLockPolicy(
@@ -4671,7 +4710,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         self.assertEqual(conn.lock_attempts, 1)
 
     def test_an_infeasible_multi_target_policy_does_not_suggest_1ms(self):
-        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+        from task_core.db.publish import PublicationLockPolicy, staging_table_name
 
         conn = Test27PublicationLockIsBounded._Conn()
         publisher = self._publisher(conn, policy=PublicationLockPolicy(
@@ -4692,7 +4731,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         self.assertEqual(conn.lock_attempts, 0)
 
     def test_a_well_sized_multi_target_policy_proceeds(self):
-        from task_core.db_publish import PublicationLockPolicy, staging_table_name
+        from task_core.db.publish import PublicationLockPolicy, staging_table_name
 
         conn = Test27PublicationLockIsBounded._Conn()
         publisher = self._publisher(conn, policy=PublicationLockPolicy(
@@ -4708,7 +4747,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         self.assertEqual(conn.lock_attempts, 1)
 
     def test_short_final_attempt_preserves_multi_target_ordering(self):
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
 
         policy = PublicationLockPolicy(
             lock_timeout_ms=500, acquisition_timeout_ms=5000,
@@ -4727,7 +4766,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         57014 -- ordinary contention would end the run instead of being
         retried.
         """
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         for acquisition in (100, 500, 549):
             with self.subTest(acquisition_timeout_ms=acquisition):
                 with self.assertRaises(DbPublishError) as caught:
@@ -4740,7 +4779,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         # Clamping both to the same remaining budget made them EQUAL on a
         # short final attempt -- the same inversion, arrived at by
         # arithmetic instead of configuration.
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         policy = PublicationLockPolicy()
         for remaining in (60, 5, 1, 0.6, 0.55, 0.051):
             with self.subTest(remaining=remaining):
@@ -4751,7 +4790,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
                 self.assertLess(lock_ms, statement_ms)
 
     def test_no_attempt_is_started_after_the_deadline(self):
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         policy = PublicationLockPolicy()
         self.assertIsNone(policy.attempt_budgets_ms(0))
         self.assertIsNone(policy.attempt_budgets_ms(-5))
@@ -4763,7 +4802,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         that work kept every live target under ACCESS EXCLUSIVE for its
         duration, recreating the outage this is meant to bound.
         """
-        from task_core.db_publish import PublicationPlan
+        from task_core.db.publish import PublicationPlan
 
         order = []
         plan = PublicationPlan()
@@ -4788,7 +4827,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         range, a 4.5s draw ended it while a shorter delay and another
         bounded attempt would have fitted.
         """
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         conn = Test27PublicationLockIsBounded._Conn(lock_failures=1)
         publisher = self._publisher(conn, policy=PublicationLockPolicy(
             lock_timeout_ms=10, acquisition_timeout_ms=100,
@@ -4808,7 +4847,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
         eventually; a direct caller, or one catching the exception, was
         left holding a dirty transaction.
         """
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
 
         # Horizon too short to form an attempt -> DbPublishError, not DBAPI.
         conn = Test27PublicationLockIsBounded._Conn()
@@ -4825,7 +4864,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
     def test_a_non_dbapi_failure_is_still_terminal_and_clean(self):
         # Rolling back on everything must not turn an invariant violation
         # or an interruption into a retry.
-        from task_core.db_publish import PublicationPlan
+        from task_core.db.publish import PublicationPlan
 
         plan = PublicationPlan()
         plan.add('boom', lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
@@ -4859,14 +4898,14 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
     def test_the_margin_boundary_matches_its_own_error_message(self):
         # The check rejected a difference of exactly the margin while the
         # message said "by at least" it.
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         margin = PublicationLockPolicy.TIMEOUT_MARGIN_MS
         PublicationLockPolicy(lock_timeout_ms=500, acquisition_timeout_ms=500 + margin)
         with self.assertRaises(DbPublishError):
             PublicationLockPolicy(lock_timeout_ms=500, acquisition_timeout_ms=500 + margin - 1)
 
     def test_the_config_rejects_a_missing_policy(self):
-        from task_core.db_publish import PublisherConfig
+        from task_core.db.publish import PublisherConfig
         for kwargs in ({'identifier_policy': None},
                        {'publication_lock_policy': None},
                        {'publisher_factory': 3}):
@@ -4875,7 +4914,7 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
                     PublisherConfig(**kwargs)
 
     def test_the_policy_rejects_non_finite_numbers(self):
-        from task_core.db_publish import PublicationLockPolicy
+        from task_core.db.publish import PublicationLockPolicy
         for field in ('retry_horizon_seconds', 'retry_delay_min_seconds',
                       'retry_delay_max_seconds'):
             for value in (float('nan'), float('inf')):
@@ -4893,7 +4932,7 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
     """
 
     def test_defaults(self):
-        from task_core.db_publish import CopyLoadPolicy
+        from task_core.db.publish import CopyLoadPolicy
         policy = CopyLoadPolicy()
         self.assertIsNone(policy.spool_directory)
         self.assertEqual(policy.buffer_bytes, 1_048_576)
@@ -4902,7 +4941,7 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
         # A string is easy to accidentally pass and would push the
         # str-vs-Path decision downstream into the spool machinery.
         # Reject it here so the type stays crisp at the boundary.
-        from task_core.db_publish import CopyLoadPolicy
+        from task_core.db.publish import CopyLoadPolicy
         for bad in ('/tmp/spool', 3, b'/tmp/spool', object()):
             with self.subTest(value=bad):
                 with self.assertRaises(DbPublishError):
@@ -4913,7 +4952,7 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
         # creation with mode 0o700 belongs in the spool machinery
         # (Phase 5.b), not here.
         from pathlib import Path
-        from task_core.db_publish import CopyLoadPolicy
+        from task_core.db.publish import CopyLoadPolicy
         policy = CopyLoadPolicy(spool_directory=Path('/nonexistent/spool'))
         self.assertEqual(policy.spool_directory, Path('/nonexistent/spool'))
 
@@ -4921,14 +4960,14 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
         # bool subclasses int, so isinstance() would accept True and
         # produce a one-byte buffer -- same trap IdentifierPolicy's own
         # int field already documents.
-        from task_core.db_publish import CopyLoadPolicy
+        from task_core.db.publish import CopyLoadPolicy
         for bad in (True, False, 0, -1, 1.0, '1048576', None):
             with self.subTest(value=bad):
                 with self.assertRaises(DbPublishError):
                     CopyLoadPolicy(buffer_bytes=bad)
 
     def test_encrypt_spools_must_be_bool(self):
-        from task_core.db_publish import CopyLoadPolicy
+        from task_core.db.publish import CopyLoadPolicy
         for bad in (None, 0, 1, 'true'):
             with self.subTest(value=bad):
                 with self.assertRaises(DbPublishError):
@@ -4939,14 +4978,14 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
         # for the other two policy fields: PublisherConfig substituting
         # its own default when handed a bad value would silently diverge
         # from what the caller thinks was validated.
-        from task_core.db_publish import PublisherConfig
+        from task_core.db.publish import PublisherConfig
         for bad in (None, {}, 'default'):
             with self.subTest(value=bad):
                 with self.assertRaises(DbPublishError):
                     PublisherConfig(copy_load_policy=bad)
 
     def test_publisher_config_default_is_a_default_policy(self):
-        from task_core.db_publish import CopyLoadPolicy, PublisherConfig
+        from task_core.db.publish import CopyLoadPolicy, PublisherConfig
         cfg = PublisherConfig()
         self.assertIsInstance(cfg.copy_load_policy, CopyLoadPolicy)
         self.assertIsNone(cfg.copy_load_policy.spool_directory)
@@ -4956,7 +4995,7 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
         # Every public config class is reachable from `task_core`
         # directly, matching IdentifierPolicy / PublicationLockPolicy /
         # PublisherConfig. Confirms the __init__.py wiring landed.
-        from task_core.db_publish import CopyLoadPolicy as _direct
+        from task_core.db.publish import CopyLoadPolicy as _direct
         self.assertIs(tc.CopyLoadPolicy, _direct)
 
 

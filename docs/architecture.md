@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.7.3. This describes the present system, not
+How `task_core` works as of 0.7.4. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -16,18 +16,27 @@ level 0   types.py                    dataclasses, errors, PORTABLE_IDENTIFIER_R
           cleanup.py                  attempt_all_cleanup()
           logging_setup.py
           openpyxl_compat.py
-          db_insert.py                staging-table INSERT loader
+          db/insert.py                staging-table INSERT loader
 
 level 1   file_access.py              local and SMB file/workbook access
           excel_metadata.py
           source_tracking.py          fingerprints
-          db_values.py                stateless schema/value kernel
+          db/values.py                stateless schema/value kernel
+          db/identifiers.py           names, staging comments, lock key
+          db/payload.py               DbPayload, RowProjection, constructors
+          db/policies.py              plan, lock, identifier and COPY policy
+          db/spool_format.py          spool identity, header, neutral framing
+          db/copytext.py              PostgreSQL COPY-text serialization
+          db/spool_io.py              spool handles, AES-GCM, cleanup
 
 level 2   context.py                  task_context: lazy resources, close-once
           binding.py                  ResourceSpec, bind(), wiring
-          resources/                  excel, file_set, db
-          db_publish.py               DbPublisher, payload construction
-          db_copy.py                  COPY spool preparation + DBAPI transport
+          resources/factories.py      latest_xlsx(), xlsx_file_set()
+          resources/excel.py          one workbook
+          resources/file_set.py       a folder of workbooks
+          resources/db.py             petl tables from queries
+          db/publish.py               DbPublisher, payload construction
+          db/copy.py                  COPY spool preparation + DBAPI transport
           source_state.py             SourceStateStore
           table_adapters.py           petl / pandas behind one interface
           export.py
@@ -35,13 +44,37 @@ level 2   context.py                  task_context: lazy resources, close-once
 level 3   runner.py                   run_pipelines()
 ```
 
+`db/` is one subsystem — publication lifecycle, staging loaders, spool
+format and the schema/value kernel — with its own internal layering, shown
+above and enforced by the same test. Within it:
+
+```
+publish → payload      → values
+publish → identifiers  → values
+publish → policies     → identifiers
+publish → insert
+publish → copy         → spool_io → spool_format → policies
+publish → copy         → copytext → values
+```
+
+`values.py` is the bottom of the subsystem and imports nothing from it.
+`publish.py` is the top and is the only member that connects, locks or
+commits. The rest are stateless: shapes, names and configuration. That order
+is enforced, not just drawn — see
+`tests/test_docs.py::test_the_db_subsystem_order_is_as_documented`.
+
+Submodules are listed individually rather than as `db/` and `resources/`
+group entries. The level check resolves an import by its package-relative
+path, so a group entry would match nothing and silently exempt everything
+inside it.
+
 Within level 2 there are lateral dependencies: `table_adapters.py` imports
-payload constructors from `db_publish.py` and missing-value semantics directly
-from `db_values.py`; `export.py` imports `get_table_adapter` from
-`table_adapters.py`; and `db_publish.py` re-exports `CopyLoadPolicy` from
-`db_copy.py` (the config's home matches its layer; `db_copy` does not import
-back from `db_publish`). Private value/schema helpers stay in `db_values.py`
-rather than being proxied through `db_publish.py`.
+payload constructors from `db/publish.py` and missing-value semantics
+directly from `db/values.py`; `export.py` imports `get_table_adapter` from
+`table_adapters.py`; and `db/publish.py` re-exports `CopyLoadPolicy` from
+`db/copy.py` (the config's home matches its layer; `db/copy.py` does not
+import back from `db/publish.py`). Private value/schema helpers stay in
+`db/values.py` rather than being proxied through `db/publish.py`.
 
 `runner.py` imports `context.py` and `source_tracking.py` under
 `TYPE_CHECKING` only — it duck-types the context and the source-change
@@ -53,10 +86,12 @@ adapter interface.
 
 Other modules do import an engine, for different reasons:
 `table_adapters.py` imports both because encapsulating their differences
-is its job; `db_publish.py` imports pandas to accept a DataFrame in
-`from_pandas()`; `db_values.py` imports pandas to normalize scalar values
+is its job; `db/payload.py` imports pandas to accept a DataFrame in
+`from_pandas()`; `db/values.py` imports pandas to normalize scalar values
 and identify missing markers; `resources/excel.py` and `resources/db.py`
-import petl because **resources return petl tables**. That last one is visible to task
+import petl because **resources return petl tables**. `db/publish.py`
+imports neither: it publishes a `DbPayload`, and building one from a
+DataFrame is `db/payload.py`'s job. That last one is visible to task
 authors: a pandas pipeline reading an Excel or DB resource receives petl
 tables and converts them itself.
 

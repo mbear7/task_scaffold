@@ -4,8 +4,8 @@
 
 The default loader that fills a staging table during publish(), and the
 compatibility baseline against which COPY is measured. Since 0.6.6 the
-COPY loader in db_copy.py is the other member of DB_LOADERS. The path was
-factored out of db_publish.py so the loader has a name and a single call
+COPY loader in copy.py is the other member of DB_LOADERS. The path was
+factored out of publish.py so the loader has a name and a single call
 site, without pulling any of the publisher's lifecycle (transactions,
 locks, comments) with it.
 

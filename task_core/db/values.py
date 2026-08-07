@@ -2,13 +2,13 @@
 """Stateless value and schema kernel for db publication.
 
 Everything here is independent of the connection, transaction, and
-publication policy that live in db_publish.py -- exception classes,
+publication policy that live in publish.py -- exception classes,
 value normalization, declared/inferred schema resolution, and the
 family classification used by inference. Public publication exceptions
-are imported by db_publish.py; private kernel helpers remain owned here.
+are imported by publish.py; private kernel helpers remain owned here.
 
-Import direction is one way: db_publish depends on db_values. Nothing
-here imports db_publish, db_insert or db_copy -- keeping that arrow
+Import direction is one way: publish depends on values. Nothing
+here imports publish, insert or copy -- keeping that arrow
 straight is the whole reason the split exists.
 """
 

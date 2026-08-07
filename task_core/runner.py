@@ -3,7 +3,7 @@
 Level 3: run_pipelines() orchestration. Sits above everything else in
 the package. context.py and source_tracking.py are TYPE_CHECKING-only
 imports (run_pipelines() only ever duck-types ctx/source_change_check);
-db_publish.py, source_state.py, export.py, table_adapters.py, and
+db/publish.py, source_state.py, export.py, table_adapters.py, and
 types.py are real runtime imports.
 
 Deliberately engine-neutral: no petl or pandas import here, and no
@@ -21,7 +21,7 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
-from task_core.db_publish import (
+from task_core.db.publish import (
     DbPublisher,
     PublicationPlan,
     PublisherConfig,

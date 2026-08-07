@@ -155,7 +155,10 @@ def _compose_copy_row_source(task_cls, tbl, spec, *, run_started_at):
     source is claimed, so the combination is rejected structurally and
     repeated defensively here for direct helper callers.
     """
-    from task_core.db_publish import RowProjection, _ProjectedRowSource
+    from task_core.db.payload import (
+        RowProjection,
+        _ProjectedRowSource,
+    )
 
     dynamic_contract_fn = getattr(task_cls, 'get_dynamic_db_contract', None)
     if callable(dynamic_contract_fn):
@@ -188,7 +191,7 @@ def _build_copy_payload_with_spec(
     staging DDL, selected transport, verification, comment, commit, and
     cleanup of the final spool on every exit path.
     """
-    from task_core.db_publish import DbPayload
+    from task_core.db.publish import DbPayload
 
     if not spec.db_table:
         return None
@@ -238,15 +241,17 @@ def _prepare_copy_source_for_pipeline(
     the moment this returns.
     """
     # Deferred imports keep export.py's module-level dependency surface
-    # minimal (db_copy is level 2 alongside export; the imports are
+    # minimal (db/copy is level 2 alongside export; the imports are
     # acyclic but noisy at the top of the file) and mirror the
     # dependency direction the tests enforce: nothing at level 2 pulls
-    # in db_copy unconditionally.
-    from task_core.db_copy import (
-        CopyLoadPolicy, SpoolIdentity, prepare_copy_source,
-        resolve_spool_directory,
+    # in db/copy unconditionally.
+    from task_core.db.copy import (
+        CopyLoadPolicy,
+        SpoolIdentity,
+        prepare_copy_source,
     )
-    from task_core.db_values import ResolvedColumn, _resolve_declared_type
+    from task_core.db.spool_format import resolve_spool_directory
+    from task_core.db.values import ResolvedColumn, _resolve_declared_type
 
     if not spec.db_table:
         raise PipelineContractError(
@@ -272,7 +277,7 @@ def _prepare_copy_source_for_pipeline(
     )
 
     # Framework columns as ResolvedColumn using the same OutputColumn
-    # -> concrete TypeEngine converter db_values uses on the INSERT
+    # -> concrete TypeEngine converter db/values uses on the INSERT
     # path, so aware timestamps stay aware regardless of loader. Built
     # unconditionally: declared mode folds them into declared_columns
     # (below), inferred mode hands them to prepare_copy_source as the
@@ -285,7 +290,7 @@ def _prepare_copy_source_for_pipeline(
     if spec.output_schema is not None:
         # Declared mode: convert OutputColumn (which accepts a SA type
         # instance, class or string alias) into ResolvedColumn
-        # (concrete TypeEngine) exactly the way db_values does on the
+        # (concrete TypeEngine) exactly the way db/values does on the
         # INSERT path -- same converter, so declared-mode value
         # validation stays byte-identical between the two loaders.
         # Framework columns are appended in projection order.
