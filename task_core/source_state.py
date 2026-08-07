@@ -10,12 +10,12 @@ import logging
 
 import sqlalchemy as sa
 
-from task_core.db.publish import (
+from task_core.db.identifiers import (
     MAX_IDENTIFIER_BYTES,
-    DbPublishError,
     server_identifier_limit,
     validate_identifier,
 )
+from task_core.db.values import DbPublishError
 from task_core.types import SourceCheckError, PORTABLE_IDENTIFIER_RE
 
 

@@ -72,6 +72,30 @@ verbatim and compares identical by AST with docstrings stripped.
   spool_format → copytext → spool_io → insert → copy → publish` against real
   imports, and fails if a `db/` module is added without being placed in it.
 
+### Internal
+- **Every module imports a name from the module that defines it**, not
+  through one that merely re-imports it. Sixteen imports across six files
+  still reached for symbols via `db/publish.py` and `db/copy.py` after the
+  definitions moved — `source_state.py` taking identifier rules through the
+  publisher, `publish.py` taking `SpoolIdentity` and `cleanup_spool_paths`
+  through `copy.py`, the facade taking `DbPublishError` and the policies
+  through the publisher. Definitions moving without their dependency edges
+  moving is how a package stays coupled while looking split, and the
+  ordering test cannot see it: both spellings are legal edges either way.
+- `CopyLoadPolicy` no longer needs the re-export comment in `publish.py`; it
+  lives in `db/policies.py` with the other three publication policies.
+
+### Documentation
+- Corrected leftovers from before the split: `architecture.md` said
+  `table_adapters.py` takes payload constructors from `db/publish.py` and
+  that `db/publish.py` re-exports `CopyLoadPolicy` from `db/copy.py`; ADR
+  0004 placed the 63-byte identifier limit and staging-name generation in
+  the publisher; `table_adapters.py`'s own docstring named `db.publish` for
+  `from_petl`/`from_pandas` while its imports already said `db.payload`.
+- `db/__init__.py` described four modules and a three-arrow diagram. It now
+  points at the architecture document rather than keeping a second copy of
+  an order that had already gone stale once.
+
 ### Breaking
 - Direct submodule imports change: `from task_core.db_publish import X` is
   now `from task_core.db.publish import X`, and names that moved come from

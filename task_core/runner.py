@@ -21,9 +21,9 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+from task_core.db.policies import PublicationPlan
 from task_core.db.publish import (
     DbPublisher,
-    PublicationPlan,
     PublisherConfig,
 )
 

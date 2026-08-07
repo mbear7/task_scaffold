@@ -4,7 +4,7 @@ Level 2: engine adapters for pipeline output. Sits below export.py within
 level 2 -- export.py imports get_table_adapter from here (lateral,
 acyclic); this module must never import anything back from export.py.
 Depends on types.py (VALID_TABLE_ADAPTERS, PipelineContractError),
-task_core.db.publish (from_petl/from_pandas -- internal to task_core),
+task_core.db.payload (from_petl/from_pandas -- internal to task_core),
 task_core.db.values (missing-value semantics), petl (etl, real package,
 imported directly),
 pandas, and openpyxl_compat.

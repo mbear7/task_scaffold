@@ -28,14 +28,13 @@ message for the rationale.
 
 __version__ = '0.7.4'
 
-from task_core.db.publish import (
+from task_core.db.policies import (
     CopyLoadPolicy,
-    DbPublishError,
-    DbPublishInvariantError,
     IdentifierPolicy,
     PublicationLockPolicy,
-    PublisherConfig,
 )
+from task_core.db.publish import PublisherConfig
+from task_core.db.values import DbPublishError, DbPublishInvariantError
 from task_core.types import (
     DbRunResult,
     PipelineContractError,

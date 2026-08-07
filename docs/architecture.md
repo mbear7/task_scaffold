@@ -69,12 +69,18 @@ path, so a group entry would match nothing and silently exempt everything
 inside it.
 
 Within level 2 there are lateral dependencies: `table_adapters.py` imports
-payload constructors from `db/publish.py` and missing-value semantics
+payload constructors from `db/payload.py` and missing-value semantics
 directly from `db/values.py`; `export.py` imports `get_table_adapter` from
-`table_adapters.py`; and `db/publish.py` re-exports `CopyLoadPolicy` from
-`db/copy.py` (the config's home matches its layer; `db/copy.py` does not
-import back from `db/publish.py`). Private value/schema helpers stay in
-`db/values.py` rather than being proxied through `db/publish.py`.
+`table_adapters.py`.
+
+Every module imports a name from the module that *defines* it, never
+through one that merely re-imports it. `CopyLoadPolicy` lives in
+`db/policies.py` with the other three publication policies, so
+`db/publish.py` takes it from there rather than through `db/copy.py`, and
+`source_state.py` takes identifier rules from `db/identifiers.py` rather
+than through `db/publish.py`. Definitions moving without their dependency
+edges moving is how a package stays coupled while looking split, and the
+ordering test cannot see it: both spellings are legal edges.
 
 `runner.py` imports `context.py` and `source_tracking.py` under
 `TYPE_CHECKING` only — it duck-types the context and the source-change

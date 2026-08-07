@@ -191,7 +191,7 @@ def _build_copy_payload_with_spec(
     staging DDL, selected transport, verification, comment, commit, and
     cleanup of the final spool on every exit path.
     """
-    from task_core.db.publish import DbPayload
+    from task_core.db.payload import DbPayload
 
     if not spec.db_table:
         return None
@@ -245,11 +245,9 @@ def _prepare_copy_source_for_pipeline(
     # acyclic but noisy at the top of the file) and mirror the
     # dependency direction the tests enforce: nothing at level 2 pulls
     # in db/copy unconditionally.
-    from task_core.db.copy import (
-        CopyLoadPolicy,
-        SpoolIdentity,
-        prepare_copy_source,
-    )
+    from task_core.db.copy import prepare_copy_source
+    from task_core.db.policies import CopyLoadPolicy
+    from task_core.db.spool_io import SpoolIdentity
     from task_core.db.spool_format import resolve_spool_directory
     from task_core.db.values import ResolvedColumn, _resolve_declared_type
 

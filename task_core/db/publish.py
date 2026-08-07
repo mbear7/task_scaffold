@@ -17,11 +17,11 @@ from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
 from task_core.db.insert import load_rows_into_staging
-from task_core.db.copy import (
+from task_core.db.copy import load_copy_into_staging, prepare_copy_source
+from task_core.db.spool_io import (
     SpoolIdentity,
+    cleanup_predecessor_spools,
     cleanup_spool_paths,
-    load_copy_into_staging,
-    prepare_copy_source,
 )
 from task_core.db.spool_format import resolve_spool_directory
 from task_core.db.spool_io import cleanup_predecessor_spools
@@ -53,6 +53,7 @@ from task_core.db.identifiers import (
 )
 from task_core.db.policies import (
     DEFAULT_IDENTIFIER_POLICY,
+    CopyLoadPolicy,
     IdentifierPolicy,
     PublicationLockPolicy,
     PublicationPlan,
@@ -192,12 +193,6 @@ def _external_incoming_foreign_keys(conn, oid):
     )
 
 
-
-
-# CopyLoadPolicy moved out of this module in 0.6.4 so its home matches
-# its layer (publish -> copy -> values). Re-exported here so
-# every existing importer keeps working; the class object is the same.
-from task_core.db.copy import CopyLoadPolicy
 
 
 @dataclass(frozen=True, kw_only=True)
