@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 1: local/SMB file selection and Excel-workbook-metadata access.
 Depends on openpyxl_compat.py, a same-level (level 1) lateral dependency
@@ -11,14 +10,14 @@ resources/excel.py (level 2) would make this module (level 1) import
 upward, which the package's own layering rule forbids.
 """
 
-from contextlib import contextmanager
-from dataclasses import dataclass
-from fnmatch import fnmatch
-from pathlib import Path
 import gc
 import io
 import stat
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from fnmatch import fnmatch
+from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook

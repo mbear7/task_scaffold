@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 2: resource binding. Depends on context.py (task_context),
 source_tracking.py (TrackedResourceSource) and types.py.
@@ -62,7 +61,6 @@ from typing import Callable, Mapping
 from task_core.context import task_context
 from task_core.source_tracking import TrackedResourceSource
 from task_core.types import PipelineContractError, find_duplicates
-
 
 # === Resource environment ===
 

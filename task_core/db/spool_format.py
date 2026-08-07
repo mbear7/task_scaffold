@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """What a COPY spool file is: identity, location, header and framing.
 
 Split out of copy.py in 0.7.4. This module defines the on-disk grammar and
@@ -17,15 +16,15 @@ pickle, not CSV, not PostgreSQL binary COPY, and not a user-facing export.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
 import hashlib
 import io
 import json
 import re
 import struct
 import tempfile
+from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, BinaryIO
 

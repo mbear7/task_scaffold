@@ -1,14 +1,12 @@
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
 import logging
 import os
 import random
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any
 
 import sqlalchemy as sa
@@ -16,25 +14,10 @@ from sqlalchemy.engine import URL
 from sqlalchemy.pool import NullPool
 
 from task_core.cleanup import attempt_all_cleanup
-from task_core.db.insert import load_rows_into_staging
 from task_core.db.copy import load_copy_into_staging, prepare_copy_source
-from task_core.db.spool_io import (
-    SpoolIdentity,
-    cleanup_predecessor_spools,
-    cleanup_spool_paths,
-)
-from task_core.db.spool_format import resolve_spool_directory
-from task_core.types import (
-    DB_LOADERS, validate_db_loader, validate_payload_source_state,
-    validate_publication_strategy,
-)
-from task_core.db.payload import (
-    DbPayload,
-    DbTableResult,
-)
 from task_core.db.identifiers import (
-    MAX_IDENTIFIER_BYTES,
     _RUN_TOKEN_HEX,
+    MAX_IDENTIFIER_BYTES,
     STAGING_NAME_KIND,
     _quote_identifier,
     _quoted_name,
@@ -51,12 +34,23 @@ from task_core.db.identifiers import (
     validate_portable_identifier,
     validate_published_column_name,
 )
+from task_core.db.insert import load_rows_into_staging
+from task_core.db.payload import (
+    DbPayload,
+    DbTableResult,
+)
 from task_core.db.policies import (
     DEFAULT_IDENTIFIER_POLICY,
     CopyLoadPolicy,
     IdentifierPolicy,
     PublicationLockPolicy,
     PublicationPlan,
+)
+from task_core.db.spool_format import resolve_spool_directory
+from task_core.db.spool_io import (
+    SpoolIdentity,
+    cleanup_predecessor_spools,
+    cleanup_spool_paths,
 )
 from task_core.db.values import (
     DbPublishError,
@@ -66,9 +60,12 @@ from task_core.db.values import (
     _resolve_declared_type,
     _resolve_payload_schema,
 )
-
-
-
+from task_core.types import (
+    DB_LOADERS,
+    validate_db_loader,
+    validate_payload_source_state,
+    validate_publication_strategy,
+)
 
 _REQUIRED_CRED_KEYS = ('user', 'host', 'dbname')
 

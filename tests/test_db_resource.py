@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 resources/db.py had no persistent test coverage at all before this file
 -- confirmed directly (grep found nothing) before writing it.

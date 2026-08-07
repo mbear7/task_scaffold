@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Spool file lifecycle: handles, encryption, reading and cleanup.
 
 Split out of copy.py in 0.7.4. Everything that touches the filesystem is
@@ -14,15 +13,15 @@ then refuses to continue -- a decision, not a restatement of the errno.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime
 import io
 import logging
 import os
 import secrets
 import time
+from collections.abc import Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -30,14 +29,14 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from task_core.db.spool_format import (
-    PROTECTION_AES256_GCM,
-    PROTECTION_NONE,
-    SPOOL_STAGES,
-    SpoolFormatError,
     _AES_KEY_BYTES,
     _GCM_FOOTER,
     _GCM_FOOTER_MAGIC,
     _GCM_NONCE_BYTES,
+    PROTECTION_AES256_GCM,
+    PROTECTION_NONE,
+    SPOOL_STAGES,
+    SpoolFormatError,
     _read_spool_header_with_bytes,
     _write_all,
     compose_ownership_token,

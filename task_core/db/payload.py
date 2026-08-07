@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """What flows into publication: the payload shape and its constructors.
 
 Split out of publish.py in 0.7.4. `DbPayload` is the one representation the

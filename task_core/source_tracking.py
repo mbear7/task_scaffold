@@ -1,15 +1,14 @@
-# -*- coding: utf-8 -*-
 """
 Level 1: source-change-tracking dataclasses and helpers. Depends only
 on task_core.types (for SourceCheckError).
 """
 
-from dataclasses import dataclass
-from datetime import datetime, date
-from decimal import Decimal
-from typing import Any
 import hashlib
 import json
+from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Any
 
 from task_core.types import SourceCheckError
 

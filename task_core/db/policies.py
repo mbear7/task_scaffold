@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Declarative publication policy: what to do, and how long to wait.
 
 Split out of publish.py in 0.7.4. These are frozen dataclasses a task or
@@ -10,9 +9,8 @@ PublisherConfig stays in publish.py, because its resolved_factory() defaults
 to DbPublisher and the coupling is real rather than incidental.
 """
 
-from dataclasses import dataclass
 import math
-
+from dataclasses import dataclass
 from pathlib import Path
 
 from task_core.db.identifiers import MAX_IDENTIFIER_BYTES

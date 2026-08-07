@@ -1,27 +1,24 @@
-# -*- coding: utf-8 -*-
 """
 Level 2: Excel resource. Depends on file_access.py (level 1) and
 source_tracking.py (level 1) for fingerprint construction, and
 openpyxl_compat.py (level 1) for warning suppression.
 """
 
-from datetime import datetime, timezone
 import warnings
-
-from openpyxl.utils.cell import range_boundaries
+from datetime import datetime, timezone
 
 import petl as etl
+from openpyxl.utils.cell import range_boundaries
 
 from task_core.excel_metadata import read_excel_row_metadata as _read_excel_row_metadata
-
-from task_core.types import SourceCheckError
+from task_core.file_access import _resolve_source_access, _ResourceSelection
+from task_core.openpyxl_compat import suppress_openpyxl_data_validation_warning
 from task_core.source_tracking import (
     SourceFileMeta,
     SourceFingerprint,
     make_source_signature,
 )
-from task_core.file_access import _resolve_source_access, _ResourceSelection
-from task_core.openpyxl_compat import suppress_openpyxl_data_validation_warning
+from task_core.types import SourceCheckError
 
 
 def load_table(wb, table):

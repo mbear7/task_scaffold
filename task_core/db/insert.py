@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 """Staging-table INSERT loader for db publication.
 
 The default loader that fills a staging table during publish(), and the

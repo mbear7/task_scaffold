@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Tests against the real DbPublisher class (task_core/db/publish.py), not
 a fake one -- this file exists specifically because the existing
@@ -35,10 +34,11 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
-from datetime import date, datetime, timedelta, timezone as tz
+from datetime import date, datetime, timedelta
+from datetime import timezone as tz
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import sqlalchemy as sa
@@ -64,14 +64,11 @@ from task_core.db.publish import DbPublisher
 from task_core.db.values import (
     DbPublishError,
     DbPublishInvariantError,
-)
-from task_core.db.values import (
-    _InferenceStreamState,
     _infer_column_type,
+    _InferenceStreamState,
     _normalize_value,
     is_missing,
 )
-
 
 _CREDS = {'user': 'x', 'host': 'x', 'dbname': 'x'}
 
@@ -332,6 +329,7 @@ class Test3DuplicateColumnsRejected(unittest.TestCase):
 
     def test_from_pandas_rejects_literal_duplicate_names(self):
         import pandas as pd
+
         from task_core.db.payload import from_pandas
         from task_core.db.publish import DbPublishError
 
@@ -345,6 +343,7 @@ class Test3DuplicateColumnsRejected(unittest.TestCase):
         # stringified list by validation time, so this must be caught
         # identically to a literal duplicate.
         import pandas as pd
+
         from task_core.db.payload import from_pandas
         from task_core.db.publish import DbPublishError
 
@@ -355,6 +354,7 @@ class Test3DuplicateColumnsRejected(unittest.TestCase):
 
     def test_from_petl_rejects_duplicate_names(self):
         import petl as etl
+
         from task_core.db.payload import from_petl
         from task_core.db.publish import DbPublishError
 
@@ -364,6 +364,7 @@ class Test3DuplicateColumnsRejected(unittest.TestCase):
 
     def test_unique_columns_still_work_normally(self):
         import pandas as pd
+
         from task_core.db.payload import from_pandas
 
         df = pd.DataFrame([[1, 2]], columns=['a', 'b'])
@@ -1092,6 +1093,7 @@ class Test11IdentifierValidationPreflightAndRuntime(unittest.TestCase):
 
     def _payload(self, **kwargs):
         import petl as etl
+
         from task_core.db.payload import from_petl
         kwargs.setdefault('table_name', 't')
         kwargs.setdefault('schema', None)
@@ -1768,6 +1770,7 @@ class Test15StagedPublicationModel(unittest.TestCase):
         publication must not advance the stored fingerprints.
         """
         import petl as etl
+
         from task_core.db.publish import PublicationPlan
 
         plan = PublicationPlan()
@@ -1821,6 +1824,7 @@ class Test16RollbackIsCleanupNotRollback(unittest.TestCase):
     def _prepared(self):
         import petl as etl
         import sqlalchemy as sa
+
         from task_core.db.payload import from_petl
 
         publisher = self._publisher()
@@ -2141,6 +2145,7 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         # covers both for the same reason: a future refactor that split the
         # constructors would otherwise silently lose coverage on one side.
         import petl as etl
+
         from task_core.db.payload import (
             from_pandas,
             from_petl,
@@ -2175,6 +2180,7 @@ class Test17bDbLoaderBoundary(unittest.TestCase):
         # back down to after staging_table.create() must make this test
         # fail on the no-DDL assertion, not on the exception assertion.
         import petl as etl
+
         from task_core.db.payload import from_petl
         payload = from_petl(
             etl.wrap([['a'], [1]]), table_name='target', schema=None,
@@ -2327,6 +2333,7 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # today; the parity test below re-asserts it against real
         # from_petl output as ground truth.
         from datetime import datetime, timezone
+
         from task_core.db.payload import (
             RowProjection,
             _ProjectedRowSource,
@@ -2354,6 +2361,7 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # the user's directive named ('calculate the timestamp once per
         # payload/run, not once per row').
         from datetime import datetime, timezone
+
         from task_core.db.payload import (
             RowProjection,
             _ProjectedRowSource,
@@ -2378,6 +2386,7 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # not assumed, so a future non-terminal framework column keeps
         # the projection honest without a rewrite.
         from datetime import datetime, timezone
+
         from task_core.db.payload import RowProjection
         from task_core.types import OutputColumn
         ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
@@ -2427,6 +2436,7 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # existing PipelineSpec bug (mutable dict inside a frozen
         # dataclass) is exactly the failure mode this closes.
         import dataclasses
+
         from task_core.db.payload import RowProjection
         proj = RowProjection.build(
             ('a',), db_contract=None, framework_columns=(),
@@ -2451,7 +2461,9 @@ class Test17cRowSourceProjection(unittest.TestCase):
         Every column value in every row must match, in order.
         """
         from datetime import datetime, timezone
+
         import petl as etl
+
         from task_core.db.payload import (
             RowProjection,
             _ProjectedRowSource,
@@ -2620,6 +2632,7 @@ class Test17cRowSourceProjection(unittest.TestCase):
         # would never emit such a shape, but the invariant belongs
         # here regardless.
         from types import MappingProxyType
+
         from task_core.db.payload import RowProjection
         from task_core.db.publish import DbPublishInvariantError
         with self.assertRaises(DbPublishInvariantError) as caught:
@@ -2775,8 +2788,10 @@ class Test17dRunnerCopyBranching(unittest.TestCase):
 
 class Test17d2RunnerCopyEndToEnd(unittest.TestCase):
     def test_copy_path_skips_nrows_and_publishes_one_shot_payload(self):
-        import petl as etl
         from unittest.mock import patch
+
+        import petl as etl
+
         from task_core.table_adapters import get_table_adapter
 
         instances = []
@@ -2894,8 +2909,8 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
         return PipelineSpec(**defaults)
 
     def _run_helper(self, task_cls, tbl, spec, **overrides):
-        from task_core.export import _prepare_copy_source_for_pipeline
         from task_core.db.copy import CopyLoadPolicy
+        from task_core.export import _prepare_copy_source_for_pipeline
         kwargs = dict(
             task_name='t_task',
             run_started_at=datetime(2026, 5, 6, tzinfo=tz.utc),
@@ -3051,9 +3066,9 @@ class Test17eComposeCopySourceForPipeline(unittest.TestCase):
         cls = self._pipeline_cls()
         spec = self._make_spec(db_copy_spool_encryption=False)
         tbl = [('id',), (1,)]
-        from task_core.export import _prepare_copy_source_for_pipeline
         from task_core.db.copy import CopyLoadPolicy
         from task_core.db.spool_format import PROTECTION_NONE
+        from task_core.export import _prepare_copy_source_for_pipeline
         with tempfile.TemporaryDirectory() as tmp:
             prepared = _prepare_copy_source_for_pipeline(
                 cls, tbl, spec, 'bsr',
@@ -3146,8 +3161,8 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
             self.assertEqual(publisher._pending_swaps[-1][-1], 2)
 
     def test_successful_copy_removes_its_spool_and_retains_the_root(self):
-        from task_core.db import spool_format as db_copy_module
         from task_core.db import publish as module
+        from task_core.db import spool_format as db_copy_module
         from task_core.db.copy import CopyLoadPolicy
         from task_core.db.spool_format import DEFAULT_SPOOL_SUBDIR
 
@@ -3201,8 +3216,8 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
                 self.assertEqual(list(root.iterdir()), [])
 
     def test_failed_copy_removes_its_spool_and_retains_the_root(self):
-        from task_core.db import spool_format as db_copy_module
         from task_core.db import publish as module
+        from task_core.db import spool_format as db_copy_module
         from task_core.db.copy import CopyLoadPolicy
         from task_core.db.spool_format import DEFAULT_SPOOL_SUBDIR
 
@@ -3317,6 +3332,7 @@ class Test18ConnectionLossIsFatal(unittest.TestCase):
 
     def test_publish_after_a_lost_connection_raises_rather_than_reconnecting(self):
         import petl as etl
+
         from task_core.db.payload import from_petl
         publisher = self._publisher()
         publisher.ensure_connection()
@@ -3776,6 +3792,7 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
         it for the entire run.
         """
         import sqlalchemy as sa
+
         from task_core.source_state import SourceStateStore
 
         engine = sa.create_engine('sqlite://')
@@ -3891,6 +3908,7 @@ class Test20GapsFoundReviewingTheStagedModel(unittest.TestCase):
         name is a collision, not something to tidy away.
         """
         import sqlalchemy as sa
+
         from task_core.db.publish import staging_table_name
 
         conn = self._Conn()
@@ -3965,6 +3983,7 @@ class Test21CleanupNeverReconnectsAfterSessionLoss(unittest.TestCase):
     def _prepared_publisher(self):
         import petl as etl
         import sqlalchemy as sa
+
         from task_core.db.payload import from_petl
 
         publisher = DbPublisher(creds=_CREDS, schema=None, task_name='demo_task')
@@ -4344,6 +4363,7 @@ class Test27PostgresqlCommentDDL(unittest.TestCase):
     def test_numeric_json_fields_are_not_parsed_as_bind_parameters(self):
         import sqlalchemy as sa
         from sqlalchemy.dialects import postgresql
+
         from task_core.db.publish import build_published_comment
 
         class CapturingConnection:
@@ -4709,7 +4729,9 @@ class Test28LockPhaseFindingsFromReview(unittest.TestCase):
 
     def _publisher(self, conn, table_name='target', policy=None):
         from task_core.db.publish import (
-            PublicationLockPolicy, build_staging_comment, staging_table_name,
+            PublicationLockPolicy,
+            build_staging_comment,
+            staging_table_name,
         )
         publisher = DbPublisher(
             creds=_CREDS, schema='bsr', task_name='demo_task',
@@ -5012,6 +5034,7 @@ class Test29CopyLoadPolicyValidation(unittest.TestCase):
         # creation with mode 0o700 belongs in the spool machinery
         # (Phase 5.b), not here.
         from pathlib import Path
+
         from task_core.db.publish import CopyLoadPolicy
         policy = CopyLoadPolicy(spool_directory=Path('/nonexistent/spool'))
         self.assertEqual(policy.spool_directory, Path('/nonexistent/spool'))

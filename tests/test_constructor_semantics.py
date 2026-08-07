@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Constructor semantics from ADR 0013.
 
 Configuration choices are named. Natural values may be positional. Stable
@@ -6,9 +5,9 @@ result contracts remain unchanged. Internal records choose constructor shape
 for clarity and measured performance rather than by blanket convention.
 """
 
-from datetime import datetime, timezone
 import inspect
 import unittest
+from datetime import datetime, timezone
 
 import sqlalchemy as sa
 

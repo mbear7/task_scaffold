@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Real, generated .xlsx fixtures for excel_metadata.py -- mocks alone
 aren't sufficient here, since the behavior under test is genuinely
@@ -20,7 +19,11 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from task_core.excel_metadata import align_row_metadata, get_sheets, read_excel_row_metadata
+from task_core.excel_metadata import (
+    align_row_metadata,
+    get_sheets,
+    read_excel_row_metadata,
+)
 
 
 class Test1MultipleSheetsAndNameResolution(unittest.TestCase):

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 task_core.binding test suite -- covers the ten cases from the review
 process (bind()/validate_bindings()/PipelineBinding/runner.py integration).

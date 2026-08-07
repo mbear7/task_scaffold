@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Serialization to PostgreSQL COPY text.
 
 Split out of copy.py in 0.7.4. Escaping exists exactly once in this

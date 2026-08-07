@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 hr_task.py -- the full HR reporting task on task_core's mixed-engine
 machinery (table_adapter='pandas' throughout): staff, prepare_funnel,

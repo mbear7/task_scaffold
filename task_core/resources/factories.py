@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 2: convenience factories on top of ResourceSpec (task_core/binding.py)
 and the existing build_latest_xlsx_resource/build_file_set_resource/

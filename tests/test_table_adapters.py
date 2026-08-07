@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 table_adapters.py had no persistent test coverage at all before this
 file -- confirmed directly (grep found nothing) before writing it. That
@@ -29,7 +28,7 @@ from pathlib import Path
 import pandas as pd
 import petl as etl
 
-from task_core.table_adapters import PETL_ADAPTER, PANDAS_ADAPTER, normalize_for_excel
+from task_core.table_adapters import PANDAS_ADAPTER, PETL_ADAPTER, normalize_for_excel
 
 _NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 
@@ -265,6 +264,7 @@ class Test4StabilizePreventsRepeatedTraversal(unittest.TestCase):
         # unstabilized db_resource table re-issues its SQL query on every
         # traversal.
         import petl as etl
+
         from task_core.resources.db import db_resource
 
         execute_count = [0]
@@ -311,6 +311,7 @@ class Test4StabilizePreventsRepeatedTraversal(unittest.TestCase):
         # This one goes through the real run_pipelines() to exercise
         # that actual sequencing.
         import petl as etl
+
         import task_core as tc
 
         call_count = [0]

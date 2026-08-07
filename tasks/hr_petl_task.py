@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 hr_petl_task.py -- standalone example of the petl branch of task_core's
 mixed-engine machinery (table_adapter left unset -> petl). Reads the same

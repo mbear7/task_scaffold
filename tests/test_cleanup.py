@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Resource-management failure modes: a resource's own close() raising,
 publisher.close() raising, two loader keys resolving to the same object,

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 A complete, runnable task. No SMB share, no PostgreSQL, nothing outside
 this project's declared requirements -- it creates its own input workbook
@@ -37,7 +36,6 @@ from task_core import (
     run_pipelines,
     setup_logging,
 )
-
 
 TASK_NAME = 'local_example'
 

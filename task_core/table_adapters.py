@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 2: engine adapters for pipeline output. Sits below export.py within
 level 2 -- export.py imports get_table_adapter from here (lateral,
@@ -27,9 +26,8 @@ from task_core.db.payload import (
     from_petl,
 )
 from task_core.db.values import is_missing
-
-from task_core.types import PipelineContractError, VALID_TABLE_ADAPTERS
 from task_core.openpyxl_compat import suppress_openpyxl_data_validation_warning
+from task_core.types import VALID_TABLE_ADAPTERS, PipelineContractError
 
 
 def normalize_for_excel(value):

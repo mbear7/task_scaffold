@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Level 1 leaf: zero task_core dependencies. Only ever called by end users
 (ops_task.py-style task files), never imported by another task_core
 submodule -- kept out of __init__.py itself so the facade stays pure

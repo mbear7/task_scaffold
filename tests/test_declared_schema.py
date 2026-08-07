@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -11,14 +9,13 @@ import sqlalchemy as sa
 import task_core as tc
 from task_core.db.payload import DbPayload
 from task_core.db.publish import DbPublisher
-from task_core.db.values import DbPublishError
 from task_core.db.values import (
+    DbPublishError,
     ResolvedColumn,
     ResolvedSchema,
     _resolve_payload_schema,
 )
 from task_core.export import _build_db_payload_with_spec, apply_db_updated_at
-
 
 _CREDS = {'user': 'x', 'host': 'x', 'dbname': 'x'}
 
@@ -567,6 +564,7 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
     def _publish(self, publisher, strategy):
         import petl as etl
+
         from task_core.db.payload import from_petl
         publisher.publish(from_petl(
             etl.wrap([['v'], [9]]), table_name='t', schema=None,
@@ -604,6 +602,7 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
     def test_the_strategy_is_carried_on_the_payload(self):
         import petl as etl
+
         from task_core.db.payload import from_petl
         for strategy in ('replace', 'refill'):
             with self.subTest(strategy=strategy):
@@ -623,6 +622,7 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
     def test_adapter_constructors_apply_the_same_strategy_validation(self):
         import petl as etl
+
         from task_core.db.payload import (
             from_pandas,
             from_petl,
@@ -662,6 +662,7 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
     def test_mutated_payload_strategy_is_revalidated_at_publish_boundary(self):
         import petl as etl
+
         from task_core.db.payload import from_petl
         payload = from_petl(
             etl.wrap([['v'], [9]]), table_name='t', schema=None,

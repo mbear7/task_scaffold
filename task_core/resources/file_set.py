@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 2: multi-file/folder resource. Depends on file_access.py (level 1)
 and source_tracking.py (level 1) for fingerprint construction, same
@@ -15,14 +14,17 @@ from datetime import datetime, timezone
 from pathlib import PureWindowsPath
 
 from task_core.excel_metadata import read_excel_row_metadata as _read_excel_row_metadata
-
-from task_core.types import SourceCheckError
+from task_core.file_access import (
+    NoMatchingFilesError,
+    SelectedFile,
+    _resolve_source_access,
+)
 from task_core.source_tracking import (
     SourceFileMeta,
     SourceFingerprint,
     make_source_signature,
 )
-from task_core.file_access import NoMatchingFilesError, SelectedFile, _resolve_source_access
+from task_core.types import SourceCheckError
 
 
 @dataclass(frozen=True)

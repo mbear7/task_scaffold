@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 File-resource selection and fingerprinting -- which physical input gets
 processed, and whether a fingerprint change correctly triggers a rerun.
@@ -14,9 +13,11 @@ import time
 import unittest
 from pathlib import Path
 
-import task_core as tc
 import petl as etl
-from task_core.file_access import source_access as FileAccessImpl, NoMatchingFilesError
+
+import task_core as tc
+from task_core.file_access import NoMatchingFilesError
+from task_core.file_access import source_access as FileAccessImpl
 from task_core.resources.excel import build_latest_xlsx_resource
 from task_core.resources.file_set import build_file_set_resource
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for task_core.db.copy: the COPY-loader spool subsystem primitives.
 
 Phase 5.b of ADR 0011 introduces four independent primitives, each
@@ -17,18 +16,21 @@ whole module is filesystem + bytes work; the tests match.
 import errno
 import io
 import json
+import math
 import os
 import struct
 import tempfile
 import unittest
-from unittest.mock import patch
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
+
+import sqlalchemy as sa
 
 import task_core.db.copy as db_copy_module
 import task_core.db.spool_format as spool_format_module
 import task_core.db.spool_io as spool_io_module
-
 from task_core.db.copy import (
     CopyLoadPolicy,
     SpoolIdentity,
@@ -62,13 +64,6 @@ from task_core.db.spool_format import (
 )
 from task_core.db.spool_io import cleanup_predecessor_spools
 from task_core.db.values import DbPublishError, ResolvedColumn
-
-import math
-from datetime import date
-from decimal import Decimal
-
-import sqlalchemy as sa
-
 
 # A ready-made valid ingredient tuple used by several tests.
 _RUN_START = datetime(2026, 8, 1, 14, 23, 11, 123456, tzinfo=timezone.utc)

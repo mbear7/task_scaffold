@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 1 leaf: Excel structural metadata (outline level, indent, style)
 extracted directly from a workbook's raw XML, via zipfile + lxml -- not

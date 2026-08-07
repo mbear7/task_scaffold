@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 2: technical task_scaffold_meta persistence for source-change
 tracking. Moved OUT of db/publish.py so db/publish.py stays fully
@@ -16,8 +15,7 @@ from task_core.db.identifiers import (
     validate_identifier,
 )
 from task_core.db.values import DbPublishError
-from task_core.types import SourceCheckError, PORTABLE_IDENTIFIER_RE
-
+from task_core.types import PORTABLE_IDENTIFIER_RE, SourceCheckError
 
 # Shared with db/publish.py's target validation via types.py rather than
 # duplicated here -- one convention, one definition. See its docstring for

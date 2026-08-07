@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """COPY loader: spool preparation and DBAPI transport.
 
 Layering (ADR 0011 §Implementation sequence):
@@ -27,8 +26,8 @@ text) and `spool_io.py` (handles, encryption, cleanup).
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
 import logging
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Deliberately empty, matching task_core/resources/__init__.py:
 # task_core/__init__.py imports directly from the modules that define what
 # it re-exports, so there is no re-export logic here to keep in sync.

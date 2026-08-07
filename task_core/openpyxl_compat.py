@@ -1,10 +1,7 @@
-# -*- coding: utf-8 -*-
-
-
 """Level 1 leaf: openpyxl warning suppression only."""
 
-from contextlib import contextmanager
 import warnings
+from contextlib import contextmanager
 
 
 @contextmanager

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Stateless value and schema kernel for db publication.
 
 Everything here is independent of the connection, transaction, and

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Source-change execution paths and runner transaction/failure behavior.
 Both categories share the same underlying mechanism -- source-state

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 2: task_context. Depends on source_tracking.py (dispatch types,
 SourceFingerprint, make_source_signature, _json_safe_scalar), types.py
@@ -11,14 +10,14 @@ hand-rolled or built via build_resource_context()), never imported here.
 import logging
 
 from task_core.cleanup import attempt_all_cleanup
-from task_core.types import SourceCheckError
 from task_core.source_tracking import (
-    TrackedResourceSource,
-    TrackedDbQuerySource,
     SourceFingerprint,
-    make_source_signature,
+    TrackedDbQuerySource,
+    TrackedResourceSource,
     _json_safe_scalar,
+    make_source_signature,
 )
+from task_core.types import SourceCheckError
 
 
 class task_context:

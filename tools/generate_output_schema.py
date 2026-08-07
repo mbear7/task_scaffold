@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Generate task_core ``output_schema`` code from an existing PostgreSQL table.
 
 Standalone command-line use through the active PostgreSQL ``search_path``::
@@ -40,7 +39,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPOSITORY_ROOT) not in sys.path:

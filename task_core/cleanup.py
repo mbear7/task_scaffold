@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 1 leaf: attempt_all_cleanup(), used by task_context.close()
 (context.py) for its own multi-resource loop. Kept here, not in

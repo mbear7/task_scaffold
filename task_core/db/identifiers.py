@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """PostgreSQL identifier rules, staging names, and ownership comments.
 
 Split out of publish.py in 0.7.4. Everything here answers "what is this
@@ -12,17 +11,16 @@ connection but only reads `max_identifier_length`; nothing here issues DDL,
 holds a transaction, or imports the publisher.
 """
 
-from datetime import datetime, timezone
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import sqlalchemy as sa
 
 from task_core.db.values import DbPublishError, DbPublishInvariantError
 from task_core.types import PORTABLE_IDENTIFIER_RE, PUBLISHED_COLUMN_RE
-
 
 # PostgreSQL truncates any identifier past NAMEDATALEN-1 = 63 BYTES, and
 # announces it with a NOTICE rather than an error -- and psycopg2 exposes

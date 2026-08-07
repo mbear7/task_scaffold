@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 2: output preparation (Excel export, DB payload). Depends on
 types.py (PipelineSpec, get_pipeline_spec, PipelineContractError) and
@@ -21,14 +20,13 @@ enforced structurally, not by convention. The one deliberately dynamic
 exception is db_contract, via the get_dynamic_db_contract hook below.
 """
 
-from dataclasses import replace
-from datetime import datetime, timezone
 import logging
 import os
+from dataclasses import replace
+from datetime import datetime, timezone
 
-from task_core.types import OutputColumn, PipelineContractError, get_pipeline_spec
 from task_core.table_adapters import get_table_adapter
-
+from task_core.types import OutputColumn, PipelineContractError, get_pipeline_spec
 
 log = logging.getLogger(__name__)
 
@@ -247,8 +245,8 @@ def _prepare_copy_source_for_pipeline(
     # in db/copy unconditionally.
     from task_core.db.copy import prepare_copy_source
     from task_core.db.policies import CopyLoadPolicy
-    from task_core.db.spool_io import SpoolIdentity
     from task_core.db.spool_format import resolve_spool_directory
+    from task_core.db.spool_io import SpoolIdentity
     from task_core.db.values import ResolvedColumn, _resolve_declared_type
 
     if not spec.db_table:

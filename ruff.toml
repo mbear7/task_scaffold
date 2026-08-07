@@ -1,0 +1,19 @@
+# Not a linting policy. This file states two facts that are already true, so
+# that editors and other tools stop reporting them as problems:
+#
+#   - the Python floor is 3.11. task_core/types.py raises at import on
+#     anything older, because cleanup.py and runner.py use ExceptionGroup
+#     and BaseException.add_note(). Without this line a checker reports
+#     eight undefined names for builtins that exist on every version this
+#     package will ever run on.
+#
+#   - task_core is this repository, not a third-party package, so its
+#     imports belong in the first-party group.
+#
+# No rule selection is made here on purpose. Adding one would turn an
+# editor convenience into a project practice, which is a larger decision
+# than this file is making.
+target-version = "py311"
+
+[lint.isort]
+known-first-party = ["task_core"]

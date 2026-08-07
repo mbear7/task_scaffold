@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 task_core and tests/ must be standalone -- neither may ever import
 anything from tasks/ (hr_task.py, ops_task.py, hr_petl_task.py, or any
@@ -25,9 +24,9 @@ this test caught it before reverting.
 import ast
 import builtins
 import os
-from pathlib import Path
 import sys
 import unittest
+from pathlib import Path
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR)

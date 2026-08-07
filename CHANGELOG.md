@@ -10,6 +10,46 @@ chronologically rather than by release.
 
 
 
+## 0.7.6
+
+Housekeeping. No behavior change: across 50 files the import bindings and the
+executable code are identical to 0.7.5 by AST comparison, with only ordering
+and the removed encoding lines differing.
+
+### Changed
+- **Removed `# -*- coding: utf-8 -*-` from all 53 files that carried it.**
+  Redundant since PEP 3120 made UTF-8 the default source encoding in Python
+  3, and this package refuses to import below 3.11. Nothing read it: no test
+  references a cookie, and every source read in the suite passes
+  `encoding='utf-8'` explicitly, so the Cyrillic and emoji literals in the
+  tree are unaffected.
+- **Sorted imports** in `task_core/`, `tests/`, `tools/` and `examples/`.
+  The previous order encoded nothing — it was append-order left over from
+  the 0.7.4 split, not the module layering, which was checked before
+  touching it (`db/publish.py`'s first-party block ran levels
+  `0,0,2,1,1,0,1,1,1,1`).
+- `tasks/` is deliberately excluded from the sort. `docs/decisions/0002`
+  keeps it out of the test suite, so a break there is invisible to
+  `discover -s tests`, and it holds the one runtime-order-sensitive import
+  in the repository: a star-import from a task-level helper that registers
+  methods onto `petl.Table` as a side effect, and so must stay below the
+  `petl` import itself.
+
+### Added
+- **`ruff.toml`, selecting no rules.** It declares the 3.11 floor and that
+  `task_core` is first-party, and nothing else. Without the first, a checker
+  reports `BaseExceptionGroup` and `ExceptionGroup` as eight undefined names
+  — builtins on every version this package can run on. This is not a linting
+  policy; adding a rule selection would be a separate decision, and the file
+  says so.
+
+### Deliberately not fixed
+- The remaining 70 ruff findings are left alone. 58 are unused imports in
+  `task_core/__init__.py`, which is a pure re-export facade and unused by
+  design; the rest are small genuine findings in `tests/`. Both belong to a
+  separate discussion rather than to a cosmetic pass.
+
+
 ## 0.7.5
 
 Allows dots in published column names. Schemas, table names and generated

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 3: run_pipelines() orchestration. Sits above everything else in
 the package. context.py and source_tracking.py are TYPE_CHECKING-only
@@ -15,18 +14,25 @@ branches on which engine a pipeline uses.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import functools
 import logging
 import os
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from task_core.binding import PipelineBinding
 from task_core.db.policies import PublicationPlan
 from task_core.db.publish import (
     DbPublisher,
     PublisherConfig,
 )
-
+from task_core.export import (
+    _build_copy_payload_with_spec,
+    _build_db_payload_with_spec,
+    _export_excel_with_spec,
+)
+from task_core.source_state import build_source_state_store, update_source_state
+from task_core.table_adapters import get_table_adapter
 from task_core.types import (
     DbRunResult,
     PipelineContractError,
@@ -36,14 +42,6 @@ from task_core.types import (
     find_duplicates,
     get_pipeline_spec,
 )
-from task_core.source_state import build_source_state_store, update_source_state
-from task_core.export import (
-    _build_copy_payload_with_spec,
-    _build_db_payload_with_spec,
-    _export_excel_with_spec,
-)
-from task_core.table_adapters import get_table_adapter
-from task_core.binding import PipelineBinding
 
 if TYPE_CHECKING:
     from task_core.context import task_context

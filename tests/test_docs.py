@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Verifies that documented claims still match the code.
 
@@ -19,14 +18,14 @@ assertion belongs in the text with its uncertainty stated, not here.
 
 import ast
 import contextlib
-import io
 import dataclasses
 import importlib
 import inspect
+import io
 import os
-from pathlib import Path
 import re
 import unittest
+from pathlib import Path
 
 import petl as etl
 
@@ -444,6 +443,7 @@ class Test3DocumentedBehaviourOfDeclaredSpecFields(unittest.TestCase):
         # A pandas pipeline reading an Excel or DB resource converts them
         # itself; task-authoring.md says so because it is not obvious.
         import tempfile
+
         from openpyxl import Workbook
 
         with tempfile.TemporaryDirectory() as tmp:

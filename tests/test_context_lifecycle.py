@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Resource lifecycle and task_context guarantees. The first test here is
 the most important one in this file, maybe in this whole suite: it

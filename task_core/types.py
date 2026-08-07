@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Level 0: shared vocabulary for the rest of the package. Zero imports from
 anywhere else in task_core, or from db/publish.py -- not even under
