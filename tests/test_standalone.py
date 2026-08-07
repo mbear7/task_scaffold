@@ -206,6 +206,110 @@ class TestShippedFilesDoNotNameExternalModules(unittest.TestCase):
         )
 
 
+class TestImportsNameTheModuleThatDefinesTheSymbol(unittest.TestCase):
+    """`from task_core.X import Y` requires that X *defines* Y.
+
+    Python is happy to let a module import a name through any other module
+    that happens to have imported it. That is how a package stays coupled
+    while looking split: the definitions move, the dependency edges do not,
+    the tests pass, and the architecture diagram is describing a structure
+    the imports no longer follow.
+
+    It is invisible to the layering and subsystem-order checks, because both
+    spellings are legal edges. After the 0.7.4 split, sixteen imports across
+    six files still reached through `db/publish.py` and `db/copy.py` --
+    `source_state.py` taking identifier rules via the publisher,
+    `publish.py` taking `SpoolIdentity` via `copy.py`. All were legal; all
+    were wrong.
+
+    The duplicate check is here for the same reason and from the same
+    release: cleaning those up added a second import of
+    `cleanup_predecessor_spools` beside one that already existed, which
+    nothing noticed -- both named the correct module, and the name was used,
+    so neither a wrong-owner audit nor an unused-import pass could see it.
+    """
+
+    @staticmethod
+    def _module_file(dotted):
+        rel = dotted[len('task_core.'):].replace('.', os.sep)
+        for candidate in (
+            os.path.join(_PROJECT_ROOT, 'task_core', rel + '.py'),
+            os.path.join(_PROJECT_ROOT, 'task_core', rel, '__init__.py'),
+        ):
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    @classmethod
+    def _defined_names(cls, dotted):
+        """Top-level names a module defines. Its own imports do not count."""
+        path = cls._module_file(dotted)
+        if path is None:
+            return None
+        names = set()
+        for node in ast.parse(Path(path).read_text(encoding='utf-8')).body:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name):
+                    names.add(node.target.id)
+        return names
+
+    def test_no_module_imports_a_symbol_through_a_third_module(self):
+        offenders = []
+        for path in _iter_py_files(_TASK_CORE_DIR):
+            tree = ast.parse(Path(path).read_text(encoding='utf-8'))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or not node.module:
+                    continue
+                if not node.module.startswith('task_core.'):
+                    continue
+                defined = self._defined_names(node.module)
+                if defined is None:
+                    continue
+                for alias in node.names:
+                    if alias.name == '*' or alias.name in defined:
+                        continue
+                    offenders.append(
+                        f'{os.path.relpath(path, _PROJECT_ROOT)}:{node.lineno} '
+                        f'imports {alias.name} from {node.module}, '
+                        f'which does not define it'
+                    )
+
+        self.assertEqual(
+            sorted(set(offenders)), [],
+            'import each name from the module that defines it, not through '
+            'one that merely re-imports it'
+        )
+
+    def test_no_module_imports_the_same_name_twice(self):
+        offenders = []
+        for path in _iter_py_files(_TASK_CORE_DIR):
+            tree = ast.parse(Path(path).read_text(encoding='utf-8'))
+            seen = {}
+            for node in tree.body:
+                if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                    continue
+                for alias in node.names:
+                    bound = alias.asname or alias.name.split('.')[0]
+                    if bound in seen:
+                        offenders.append(
+                            f'{os.path.relpath(path, _PROJECT_ROOT)}: {bound} '
+                            f'imported at lines {seen[bound]} and {node.lineno}'
+                        )
+                    seen[bound] = node.lineno
+
+        self.assertEqual(
+            sorted(set(offenders)), [],
+            'the same name is imported more than once at module level'
+        )
+
+
 class TestFilesystemFailuresKeepTheirOwnType(unittest.TestCase):
     """ADR 0011 §Filesystem failures keep their own type, enforced.
 

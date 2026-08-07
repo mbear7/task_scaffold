@@ -24,7 +24,6 @@ from task_core.db.spool_io import (
     cleanup_spool_paths,
 )
 from task_core.db.spool_format import resolve_spool_directory
-from task_core.db.spool_io import cleanup_predecessor_spools
 from task_core.types import (
     DB_LOADERS, validate_db_loader, validate_payload_source_state,
     validate_publication_strategy,

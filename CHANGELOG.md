@@ -84,6 +84,15 @@ verbatim and compares identical by AST with docstrings stripped.
   ordering test cannot see it: both spellings are legal edges either way.
 - `CopyLoadPolicy` no longer needs the re-export comment in `publish.py`; it
   lives in `db/policies.py` with the other three publication policies.
+- **Two guards make that permanent**, because the invariant is architectural
+  rather than a one-off tidy-up and neither the layering nor the
+  subsystem-order check can see a violation — both spellings are legal
+  edges. One asserts that `from task_core.X import Y` names a module that
+  actually defines `Y`; the other rejects importing the same name twice at
+  module level. The second exists because cleaning up the first introduced a
+  duplicate import of `cleanup_predecessor_spools` that nothing caught: both
+  imports named the correct module and the name was used, so neither a
+  wrong-owner audit nor an unused-import pass could see it.
 
 ### Documentation
 - Corrected leftovers from before the split: `architecture.md` said
