@@ -38,7 +38,6 @@ from task_core.db_copy import (
     SPOOL_STAGES,
     SpoolFormatError,
     SpoolIdentity,
-    cleanup_default_spool_directory,
     cleanup_predecessor_spools,
     cleanup_spool_paths,
     load_copy_into_staging,
@@ -480,76 +479,70 @@ class Test4SpoolDirectoryResolvesAndCreatesBestEffort(unittest.TestCase):
                     resolve_spool_directory(bad)
 
 
-class Test4bDefaultSpoolDirectoryCleanup(unittest.TestCase):
-    """Only the implicit default root belongs to task_core.
+class Test4bSpoolRootIsNotRemovedByTaskCore(unittest.TestCase):
+    """task_core creates the shared spool root and never removes it.
 
-    Removal is best-effort and uses rmdir so concurrent or foreign contents
-    are never deleted. Configured directories remain operator-owned.
+    0.6.11 added best-effort `rmdir()` of the empty framework-owned root after
+    owned spools were deleted. Because `resolve_spool_directory()` and the
+    exclusive open are two operations, that made one task able to delete the
+    root another task had just resolved -- a race task_core created against
+    itself. open_spool_for_write() carried a single recreate-and-retry for it,
+    which measurably could not close it: one removal between resolve and open
+    is survived, a second, landing between the recreate and the retried open,
+    escaped as a bare FileNotFoundError.
+
+    0.7.3 removed the root removal rather than widening the retry, which
+    eliminates the framework-controlled source of the race. An empty directory
+    under the platform temporary directory is not residue -- ADR 0011 scopes
+    ownership to spool *files* -- and it may persist until external
+    temporary-directory maintenance removes it.
+
+    The recreate-and-retry is retained for genuinely external deletion. Its
+    failure, and every other filesystem failure here, keeps its native type --
+    see ADR 0011 §Filesystem failures keep their own type.
     """
 
-    def test_empty_default_directory_is_removed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
-            ):
-                directory = resolve_spool_directory(CopyLoadPolicy())
-                self.assertTrue(directory.is_dir())
-                self.assertTrue(
-                    cleanup_default_spool_directory(CopyLoadPolicy()),
-                )
-                self.assertFalse(directory.exists())
+    def test_task_core_does_not_remove_the_spool_root(self):
+        # The regression test for the 0.7.3 decision. If root removal ever
+        # returns, the race returns with it.
+        self.assertFalse(
+            hasattr(db_copy_module, 'cleanup_default_spool_directory'),
+            'db_copy re-exposed root removal; that is what created the '
+            'resolve/open race 0.7.3 removed'
+        )
+        self.assertNotIn(
+            'cleanup_default_spool_directory', db_copy_module.__all__,
+        )
 
-    def test_missing_default_directory_counts_as_success(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
-            ):
-                self.assertTrue(
-                    cleanup_default_spool_directory(CopyLoadPolicy()),
-                )
-
-    def test_nonempty_default_directory_is_preserved(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
-            ):
-                directory = resolve_spool_directory(CopyLoadPolicy())
-                foreign = directory / 'foreign.txt'
-                foreign.write_text('keep', encoding='utf-8')
-                self.assertFalse(
-                    cleanup_default_spool_directory(CopyLoadPolicy()),
-                )
-                self.assertTrue(directory.is_dir())
-                self.assertEqual(foreign.read_text(encoding='utf-8'), 'keep')
-
-    def test_configured_directory_is_never_removed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp) / 'operator-owned'
-            policy = CopyLoadPolicy(spool_directory=directory)
-            resolve_spool_directory(policy)
-            self.assertFalse(cleanup_default_spool_directory(policy))
-            self.assertTrue(directory.is_dir())
-
-    def test_explicit_default_path_is_still_operator_owned(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
-            ):
-                directory = (Path(tmp) / DEFAULT_SPOOL_SUBDIR).resolve(
-                    strict=False,
-                )
-                policy = CopyLoadPolicy(spool_directory=directory)
-                resolve_spool_directory(policy)
-                self.assertFalse(cleanup_default_spool_directory(policy))
-                self.assertTrue(directory.is_dir())
-
-    def test_spool_open_recreates_directory_removed_after_resolution(self):
+    def test_a_successful_spool_lifecycle_leaves_the_root_in_place(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
                 db_copy_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 policy = CopyLoadPolicy()
                 directory = resolve_spool_directory(policy)
+                handle = open_spool_for_write(
+                    directory,
+                    stage='copytext',
+                    identity=_make_identity(),
+                    encrypt=False,
+                )
+                handle.stream.close()
+                cleanup_spool_paths([handle.path])
+
+                # Owned file gone, root retained.
+                self.assertFalse(handle.path.exists())
+                self.assertTrue(directory.is_dir())
+                self.assertEqual(list(directory.iterdir()), [])
+
+    def test_external_deletion_after_resolution_is_survived_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                policy = CopyLoadPolicy()
+                directory = resolve_spool_directory(policy)
+                # Something outside task_core removes the root.
                 directory.rmdir()
 
                 handle = open_spool_for_write(
@@ -564,120 +557,193 @@ class Test4bDefaultSpoolDirectoryCleanup(unittest.TestCase):
                 finally:
                     handle.stream.close()
                     cleanup_spool_paths([handle.path])
-                    cleanup_default_spool_directory(policy)
 
-                self.assertFalse(directory.exists())
+    def test_repeated_external_deletion_propagates_the_native_error(self):
+        """The retry is single-shot, and its failure keeps its own type.
 
-    def test_transient_rmdir_failure_is_retried(self):
+        An earlier 0.7.3 commit wrapped this one case as DbPublishError, which
+        gave the retry a different exception type from the first attempt for
+        the same errno. ADR 0011 §Filesystem failures keep their own type
+        settles it: OSError subclasses propagate, and OSError already carries
+        errno and filename, so declining to wrap loses no context.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
                 db_copy_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 directory = resolve_spool_directory(CopyLoadPolicy())
-                with patch.object(
-                    Path, 'rmdir',
-                    side_effect=[OSError(errno.EACCES, 'busy'), None],
-                ) as rmdir:
-                    removed = cleanup_default_spool_directory(
-                        CopyLoadPolicy(),
-                        attempts=2,
-                        retry_delay_seconds=0,
-                    )
-                self.assertTrue(removed)
-                self.assertEqual(rmdir.call_count, 2)
-                directory.rmdir()
+                real_open = db_copy_module.os.open
+                state = {'n': 0}
 
-    def test_final_unexpected_failure_is_logged_not_raised(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(
-                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
-            ):
-                directory = resolve_spool_directory(CopyLoadPolicy())
+                def always_missing(path, flags, mode=0o777, **kwargs):
+                    # Two removals: one before the recreate, one after it.
+                    if state['n'] < 2:
+                        state['n'] += 1
+                        raise FileNotFoundError(2, 'No such file', str(path))
+                    return real_open(path, flags, mode, **kwargs)
+
                 with patch.object(
-                    Path, 'rmdir',
-                    side_effect=OSError(errno.EACCES, 'still busy'),
+                    db_copy_module.os, 'open', side_effect=always_missing,
                 ):
-                    with self.assertLogs(
-                        'task_core.db_copy', level='WARNING',
-                    ) as captured:
-                        removed = cleanup_default_spool_directory(
-                            CopyLoadPolicy(),
-                            attempts=2,
-                            retry_delay_seconds=0,
+                    with self.assertRaises(FileNotFoundError) as caught:
+                        open_spool_for_write(
+                            directory,
+                            stage='copytext',
+                            identity=_make_identity(),
+                            encrypt=False,
                         )
-                self.assertFalse(removed)
-                self.assertIn(str(directory), '\n'.join(captured.output))
-                self.assertIn('still busy', '\n'.join(captured.output))
-                directory.rmdir()
+                self.assertNotIsInstance(caught.exception, DbPublishError)
+                # Context is not lost by declining to wrap.
+                self.assertIn('copytext', str(caught.exception))
 
-    def test_invalid_retry_arguments_are_rejected(self):
-        for attempts in (0, -1, True):
-            with self.subTest(attempts=attempts):
-                with self.assertRaises(DbPublishError):
-                    cleanup_default_spool_directory(
-                        CopyLoadPolicy(), attempts=attempts,
-                    )
-        for delay in (-1, 'slow', True):
-            with self.subTest(delay=delay):
-                with self.assertRaises(DbPublishError):
-                    cleanup_default_spool_directory(
-                        CopyLoadPolicy(), retry_delay_seconds=delay,
-                    )
+    def _failing_prepare(self, directory, policy, *, declared):
+        """Drive one preparation through its failure-cleanup path.
 
-    def test_declared_prepare_failure_removes_empty_default_root(self):
+        Declared and inferred preparation have separate failure-cleanup
+        blocks, and each used to remove the root. They are asserted apart so
+        one covering the other cannot hide a regression.
+        """
+        # Declared mode rejects the wrong scalar family. Inferred mode
+        # legitimately widens text, so it needs a constraint violation
+        # instead -- a NULL in a column declared NOT NULL by override.
+        with self.assertRaises(DbPublishError):
+            prepare_copy_source(
+                row_source=[('not-an-integer',)] if declared else [(None,)],
+                columns=['id'],
+                declared_schema=(
+                    (ResolvedColumn('id', sa.BigInteger(), False),)
+                    if declared else None
+                ),
+                identity=_make_identity(),
+                directory=directory,
+                policy=policy,
+                not_null_columns=() if declared else ('id',),
+            )
+
+    def test_declared_prepare_failure_leaves_the_root_in_place(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
                 db_copy_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 policy = CopyLoadPolicy()
                 directory = resolve_spool_directory(policy)
-                with self.assertRaises(DbPublishError):
-                    prepare_copy_source(
-                        row_source=[('not-an-integer',)],
-                        columns=['id'],
-                        declared_schema=(
-                            ResolvedColumn('id', sa.BigInteger(), False),
-                        ),
-                        identity=_make_identity(),
-                        directory=directory,
-                        policy=policy,
-                    )
-                self.assertFalse(
-                    directory.exists(),
-                    'failed preparation left the empty default spool root',
+                self._failing_prepare(directory, policy, declared=True)
+                self.assertTrue(
+                    directory.is_dir(),
+                    'declared preparation failure removed the shared root'
+                )
+                self.assertEqual(
+                    list(directory.iterdir()), [],
+                    'declared preparation failure left an owned spool behind'
                 )
 
-    def test_rmdir_failure_does_not_replace_prepare_error(self):
+    def test_inferred_prepare_failure_leaves_the_root_in_place(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(
                 db_copy_module.tempfile, 'gettempdir', return_value=tmp,
             ):
                 policy = CopyLoadPolicy()
                 directory = resolve_spool_directory(policy)
+                self._failing_prepare(directory, policy, declared=False)
+                self.assertTrue(
+                    directory.is_dir(),
+                    'inferred preparation failure removed the shared root'
+                )
+                self.assertEqual(
+                    list(directory.iterdir()), [],
+                    'inferred preparation failure left an owned spool behind'
+                )
+
+    def test_a_collision_on_the_retry_also_raises_FileExistsError(self):
+        """The recreate can lose to another process creating the same path.
+
+        This branch is reachable independently of a first-attempt collision:
+        ENOENT, then recreate, then a peer wins the create, then the retry
+        gets EEXIST. A blanket `except OSError` on the retry converted that
+        ownership signal into DbPublishError.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                directory = resolve_spool_directory(CopyLoadPolicy())
                 with patch.object(
-                    Path, 'rmdir',
-                    side_effect=OSError(errno.EACCES, 'still busy'),
+                    db_copy_module.os, 'open',
+                    side_effect=[FileNotFoundError(), FileExistsError()],
                 ):
-                    with self.assertLogs(
-                        'task_core.db_copy', level='WARNING',
+                    with self.assertRaises(FileExistsError):
+                        open_spool_for_write(
+                            directory,
+                            stage='copytext',
+                            identity=_make_identity(),
+                            encrypt=False,
+                        )
+
+    def test_other_retry_time_errors_keep_their_native_type(self):
+        """Only a repeated ENOENT is wrapped.
+
+        A blanket `except OSError` on the retry gave it a different contract
+        from the first attempt: a first-attempt EACCES stayed PermissionError
+        while a retry-time EACCES became DbPublishError, and ENOSPC likewise
+        -- an accidental contract none of the documentation described.
+        """
+        for label, error, expected in (
+            ('EACCES', PermissionError(errno.EACCES, 'denied'), PermissionError),
+            ('ENOSPC', OSError(errno.ENOSPC, 'no space'), OSError),
+        ):
+            with self.subTest(errno=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    with patch.object(
+                        db_copy_module.tempfile, 'gettempdir', return_value=tmp,
                     ):
-                        with self.assertRaisesRegex(
-                            DbPublishError, 'expected int',
+                        directory = resolve_spool_directory(CopyLoadPolicy())
+                        with patch.object(
+                            db_copy_module.os, 'open',
+                            side_effect=[FileNotFoundError(), error],
                         ):
-                            prepare_copy_source(
-                                row_source=[('not-an-integer',)],
-                                columns=['id'],
-                                declared_schema=(
-                                    ResolvedColumn(
-                                        'id', sa.BigInteger(), False,
-                                    ),
-                                ),
-                                identity=_make_identity(),
-                                directory=directory,
-                                policy=policy,
-                            )
-                self.assertTrue(directory.is_dir())
-                directory.rmdir()
+                            with self.assertRaises(expected) as caught:
+                                open_spool_for_write(
+                                    directory,
+                                    stage='copytext',
+                                    identity=_make_identity(),
+                                    encrypt=False,
+                                )
+                        self.assertNotIsInstance(
+                            caught.exception, DbPublishError,
+                            f'retry-time {label} was wrapped; only a repeated '
+                            f'ENOENT is'
+                        )
+
+    def test_an_existing_spool_still_raises_FileExistsError(self):
+        """Only the retry is wrapped.
+
+        A first-attempt O_EXCL collision means a spool with this token already
+        exists -- an ownership signal, not a creation failure -- and keeps its
+        own exception type.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                db_copy_module.tempfile, 'gettempdir', return_value=tmp,
+            ):
+                directory = resolve_spool_directory(CopyLoadPolicy())
+                first = open_spool_for_write(
+                    directory,
+                    stage='copytext',
+                    identity=_make_identity(),
+                    encrypt=False,
+                )
+                try:
+                    with self.assertRaises(FileExistsError):
+                        open_spool_for_write(
+                            directory,
+                            stage='copytext',
+                            identity=_make_identity(),
+                            encrypt=False,
+                        )
+                finally:
+                    first.stream.close()
+                    cleanup_spool_paths([first.path])
+
 
 
 class Test5ConstantsAreStable(unittest.TestCase):

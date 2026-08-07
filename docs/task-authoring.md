@@ -717,11 +717,13 @@ Plaintext COPY is useful as a diagnostic benchmark, not as a default tuning
 switch.
 
 When no custom spool path is configured, task_core uses its own
-`task_core-copy-spool` directory below the platform temporary directory. After
-owned spool files are removed, it best-effort removes that directory if it is
-empty. A configured `CopyLoadPolicy.spool_directory` is operator-owned and is
-never removed. Concurrent default-root removal is tolerated: spool creation
-recreates a directory removed between path resolution and file creation.
+`task_core-copy-spool` directory below the platform temporary directory. It
+removes the spool files it owns and leaves that directory in place, so an
+empty `task_core-copy-spool` between runs is expected rather than residue. A
+configured `CopyLoadPolicy.spool_directory` is operator-owned and is never
+removed. If something outside task_core deletes the spool directory between
+path resolution and file creation, spool creation recreates it once and
+retries; if that also fails the run stops before any database work.
 
 ### Understand replacement and refill cost
 

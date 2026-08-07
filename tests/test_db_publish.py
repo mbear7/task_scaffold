@@ -3048,7 +3048,7 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
             self.assertEqual(publisher.table_rows['None.target'], 2)
             self.assertEqual(publisher._pending_swaps[-1][-1], 2)
 
-    def test_default_spool_root_is_removed_after_successful_copy(self):
+    def test_successful_copy_removes_its_spool_and_retains_the_root(self):
         from task_core import db_copy as db_copy_module
         from task_core import db_publish as module
         from task_core.db_copy import CopyLoadPolicy, DEFAULT_SPOOL_SUBDIR
@@ -3082,7 +3082,8 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
                 publisher._engine = type('E', (), {'dispose': lambda self: None})()
                 self.addCleanup(publisher.close)
                 self.assertTrue(publisher.begin_run())
-                self.assertFalse(root.exists())
+                # begin_run resolves the root, which creates it.
+                self.assertTrue(root.is_dir())
 
                 module.LOADERS['copy'] = fake_copy_loader
                 try:
@@ -3091,12 +3092,17 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
                     module.LOADERS['copy'] = original
 
                 self.assertEqual(result.rows, 2)
-                self.assertFalse(
-                    root.exists(),
-                    'successful COPY left the empty task_core-owned spool root',
+                # Owned spool files are removed; the shared root is not.
+                # 0.7.3 stopped removing it -- see
+                # Test4bSpoolRootIsNotRemovedByTaskCore.
+                self.assertTrue(
+                    root.is_dir(),
+                    'successful COPY removed the shared spool root, which '
+                    'reintroduces the resolve/open race 0.7.3 eliminated',
                 )
+                self.assertEqual(list(root.iterdir()), [])
 
-    def test_default_spool_root_is_removed_after_copy_failure(self):
+    def test_failed_copy_removes_its_spool_and_retains_the_root(self):
         from task_core import db_copy as db_copy_module
         from task_core import db_publish as module
         from task_core.db_copy import CopyLoadPolicy, DEFAULT_SPOOL_SUBDIR
@@ -3140,9 +3146,14 @@ class Test17fPublisherCopyIntegration(unittest.TestCase):
                     module.LOADERS['copy'] = original
                     publisher.rollback()
 
-                self.assertFalse(
-                    root.exists(),
-                    'failed COPY left the empty task_core-owned spool root',
+                self.assertTrue(
+                    root.is_dir(),
+                    'failed COPY removed the shared spool root, which '
+                    'reintroduces the resolve/open race 0.7.3 eliminated',
+                )
+                self.assertEqual(
+                    list(root.iterdir()), [],
+                    'failed COPY left an owned spool behind',
                 )
 
     def test_copy_failure_preserves_primary_and_reaps_final_spool(self):

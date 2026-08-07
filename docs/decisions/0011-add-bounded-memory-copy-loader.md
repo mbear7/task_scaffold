@@ -978,6 +978,65 @@ Examples:
 
 Result is the same as source failure: no staging DDL and no live-target work.
 
+### Filesystem failures keep their own type
+
+Native filesystem exceptions are not wrapped merely to normalize them into
+task_core exception types. When a filesystem exception propagates directly
+from a spool I/O operation, it retains its native type; it may be re-raised as
+itself with a better message, but not converted. task_core exception types are
+reserved for framework validation, ownership, serialization and spool-format
+failures.
+
+The exclusive-open path performs one recovery from a missing directory; if the
+retry also fails, the native filesystem exception propagates with contextual
+information where useful. `OSError` already carries `errno` and `filename`, so
+the path is not lost by declining to wrap.
+
+A higher-level lifecycle policy may deliberately handle a filesystem failure
+and raise its own semantic error. **Predecessor cleanup is that case.**
+`cleanup_spool_paths()` retries a failing `unlink()` and returns the residual
+path rather than propagating; `cleanup_predecessor_spools()` then raises
+`DbPublishError` because known task-owned residue remains and continuing would
+accumulate another spool beside it. The `DbPublishError` there is not a
+restatement of the `EACCES` — it is the refusal to proceed, which is a
+task_core decision. Such policies act on a returned residual path rather than
+inside an `except` block, which is also how the tripwire in
+`tests/test_standalone.py` distinguishes them.
+
+That placement is a deliberate constraint, not an accident of how the check
+was written: **a task_core semantic error may not be raised directly from
+inside a handler catching a filesystem exception.** Interpretation happens
+after the failure has been reduced to ordinary data — a returned residual
+path, a count, a flag — not in the `except` block itself. The rule is
+stricter than "do not normalize filesystem errors", and it is chosen because
+it is mechanically checkable: where a semantic decision may be made is
+visible in the AST, whereas whether a raise "restates" or "interprets" an
+errno is not. Predecessor cleanup already had this shape; the constraint
+records it rather than imposing something new.
+
+The tripwire enforces type preservation exactly: a handler may bare-`raise`,
+re-raise its own bound name, or reconstruct the single class it caught. It
+may not convert one native type into another — telling a caller `EACCES` when
+`ENOENT` occurred is as much a false report as wrapping it — and a tuple
+handler may only bare-`raise` or re-raise its bound name, since constructing
+one of several caught classes could convert the others.
+
+The rule exists because the alternative is a per-errno contract nobody can
+hold in their head. An earlier implementation wrapped the second `ENOENT` of
+the recreate-and-open retry, which meant `EACCES` on the first attempt and
+`EACCES` on the retry raised different exception types. That distinction was
+accidental, and documenting it in four places did not make it a semantic worth
+having. `ENOENT` on a spool open is not more meaningful to a caller than
+`ENOSPC`; both mean the local spool could not be written and the run stops
+before any database work.
+
+A caller that wants one type across every failure should catch `OSError`
+alongside `DbPublishError`. The two are not a split by blame — predecessor
+cleanup is precisely a case where the filesystem fails first and task_core then
+refuses to continue. An `OSError` means the filesystem failure remains the
+reported failure; a `DbPublishError` means task_core made a higher-level
+semantic decision to stop.
+
 ### Schema or value failure
 
 Examples:
@@ -1727,9 +1786,10 @@ against the optimized implementation.
 0.6.10 completed Phase 8 on the target localhost PostgreSQL 18.4 instance.
 The complete repository, adversarial concurrency/failure, lazy-source memory
 and randomized 1m/10m release campaigns all passed. ADR 0011 is therefore
-closed. Version 0.6.11 is a post-closure cleanup hardening change: after owned
-spool files are removed, task_core best-effort removes its empty implicit
-default spool root with `rmdir()`. Configured directories are never removed.
+closed. Version 0.6.11 was a post-closure cleanup hardening change: after owned
+spool files were removed, task_core best-effort removed its empty implicit
+default spool root with `rmdir()`. That was reversed two releases later; see
+the final entry below.
 
 ADR 0011 required the implementation to demonstrate:
 
@@ -1770,6 +1830,41 @@ escapes as `FileNotFoundError`. That matches what the code comment claims
 ("Recreate the directory once"), fails loudly before any database work, and
 cannot corrupt or partially publish data. Whether to make the retry bounded
 rather than single-shot is open.
+
+0.7.3 removed the 0.6.11 root removal. Because `resolve_spool_directory()` and
+the exclusive spool open are two separate operations, a root that task_core
+itself deletes is a root one task can remove after another has resolved it —
+a race the framework created against itself. Removing that deletion eliminates
+the framework-controlled source of the race; deletion by something outside
+task_core remains possible and is what the retained retry is for.
+`open_spool_for_write()` carried a
+single recreate-and-retry for exactly this, and it measurably could not close
+it: one removal between resolve and open is survived, while a second, landing
+between the recreate and the retried open, escaped as a bare
+`FileNotFoundError`.
+
+Widening the retry into a loop was rejected. It would have made the framework
+more tolerant of a hazard the framework alone produced, and no loop bound is
+correct against an adversary that deletes continuously. Removing the root
+removal eliminates the race at its source and needs no retry budget to reason
+about. The cost is one empty directory under the platform temporary directory,
+which is not residue — ADR §Spool ownership and cleanup scopes ownership to
+spool *files* — and which may persist until external
+temporary-directory maintenance removes it.
+
+The single recreate-and-retry is retained, now serving only its honest case:
+deletion by something outside task_core, such as a temporary-directory reaper
+or an operator. If it also fails, the native filesystem exception propagates;
+see §Filesystem failures keep their own type.
+
+`cleanup_default_spool_directory()` is removed rather than deprecated.
+
+Measured on the target host with the same instrumented eight-process harness
+in both configurations. With root removal, a peer deleted the root out from
+under a resolving task 7 times and the recreate-and-retry fired 6 times across
+48 cycles. Without it, three runs totalling 144 cycles recorded zero of each,
+with the root retained and no owned spool files left behind. The race is not
+merely survived more often; it no longer arises.
 
 The feature is not complete when COPY merely loads a table. It is complete when
 it loads large data materially faster without introducing a new way to publish

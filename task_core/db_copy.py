@@ -31,8 +31,6 @@ Selected module surface:
 - `write_spool_header` /
   `read_spool_header`            - the versioned internal header
 - `resolve_spool_directory`      - best-effort creation with 0o700
-- `cleanup_default_spool_directory` - best-effort removal of the empty
-                                      framework-owned default directory
 
 ADR 0011 §Spool ownership and cleanup requires *both* an exact filename
 grammar and an internal header for positive ownership before predecessor
@@ -543,64 +541,6 @@ def resolve_spool_directory(policy: CopyLoadPolicy | None) -> Path:
     target = target.resolve(strict=False)
     target.mkdir(mode=0o700, parents=True, exist_ok=True)
     return target
-
-
-def cleanup_default_spool_directory(
-    policy: CopyLoadPolicy | None,
-    *,
-    attempts: int = 3,
-    retry_delay_seconds: float = 0.05,
-) -> bool:
-    """Best-effort removal of the empty framework-owned spool root.
-
-    Only the implicit default directory is task_core-owned. A configured
-    ``spool_directory`` belongs to the operator and is never removed, even
-    when it is empty or resolves to the same path as the default root.
-
-    ``Path.rmdir()`` is the race-safe primitive: it removes only an empty
-    directory. A concurrent task or a preserved foreign file therefore makes
-    the call fail with ``ENOTEMPTY``/``EEXIST`` and the directory remains.
-    Missing directories count as success. Other transient failures receive
-    bounded retries and a final warning, but never replace the task result.
-    """
-    if policy is None:
-        policy = CopyLoadPolicy()
-    if not isinstance(policy, CopyLoadPolicy):
-        raise DbPublishError(
-            f'policy must be a CopyLoadPolicy or None, got {type(policy).__name__}'
-        )
-    if type(attempts) is not int or attempts < 1:
-        raise DbPublishError(f'attempts must be a positive integer, got {attempts!r}')
-    if type(retry_delay_seconds) not in (int, float) or retry_delay_seconds < 0:
-        raise DbPublishError(
-            f'retry_delay_seconds must be non-negative, got {retry_delay_seconds!r}'
-        )
-    if policy.spool_directory is not None:
-        return False
-
-    target = (Path(tempfile.gettempdir()) / DEFAULT_SPOOL_SUBDIR).resolve(
-        strict=False,
-    )
-    for attempt in range(1, attempts + 1):
-        try:
-            target.rmdir()
-        except FileNotFoundError:
-            return True
-        except OSError as exc:
-            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-                return False
-            if attempt == attempts:
-                log.warning(
-                    'could not remove empty default COPY spool directory %s '
-                    'after %s attempt(s): %s',
-                    target, attempts, exc,
-                )
-                return False
-            if retry_delay_seconds:
-                time.sleep(retry_delay_seconds)
-        else:
-            return True
-    return False
 
 
 # --- Type-neutral spool format ----------------------------------------
@@ -1931,12 +1871,14 @@ def open_spool_for_write(
     try:
         fd = os.open(path, flags, 0o600)
     except FileNotFoundError:
-        # Another task may remove the shared empty default root after this
-        # task resolved it but before file creation. Recreate the directory
-        # once and retry the exclusive open. The same behavior is safe for
-        # configured directories because resolve_spool_directory() already
-        # creates them when absent; this only closes the race between those
-        # two operations.
+        # The spool root is gone between resolution and creation. Something
+        # outside task_core removed it -- a tmp reaper, an operator, an
+        # unrelated cleanup script -- because task_core does not remove that
+        # root. One recreate is enough against that: a loop would only turn a
+        # fast failure into a slow one if something is deleting continuously.
+        #
+        # Nothing is caught around the retry. Filesystem failures keep their
+        # native type; see ADR 0011 §Filesystem failures keep their own type.
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(path, flags, 0o600)
     try:
@@ -2426,7 +2368,6 @@ def _prepare_declared_copy_source_one_pass(
     except BaseException:
         if copytext_path is not None:
             cleanup_spool_paths([copytext_path])
-        cleanup_default_spool_directory(policy)
         raise
 
 
@@ -2721,7 +2662,6 @@ def prepare_copy_source(
         to_cleanup = [p for p in (neutral_path, copytext_path) if p is not None]
         if to_cleanup:
             cleanup_spool_paths(to_cleanup)
-        cleanup_default_spool_directory(policy)
         raise
 
 
@@ -2744,7 +2684,6 @@ __all__ = [
     'write_spool_header',
     'read_spool_header',
     'resolve_spool_directory',
-    'cleanup_default_spool_directory',
     'write_neutral_preamble',
     'read_neutral_preamble',
     'write_neutral_row',

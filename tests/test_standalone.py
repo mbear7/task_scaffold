@@ -23,6 +23,7 @@ this test caught it before reverting.
 """
 
 import ast
+import builtins
 import os
 from pathlib import Path
 import sys
@@ -205,6 +206,200 @@ class TestShippedFilesDoNotNameExternalModules(unittest.TestCase):
         )
 
 
+class TestFilesystemFailuresKeepTheirOwnType(unittest.TestCase):
+    """ADR 0011 §Filesystem failures keep their own type, enforced.
+
+    A filesystem exception caught in `task_core/` may be re-raised as itself,
+    optionally with a better message, but must not be converted into a
+    task_core exception type. Those are reserved for framework validation,
+    ownership, serialization and spool-format failures.
+
+    The rule exists because one such conversion produced a per-errno contract
+    nobody could hold in their head: the same `EACCES` raised `PermissionError`
+    on a first attempt and `DbPublishError` on a retry.
+
+    The check is structural rather than a list of task_core exception classes,
+    which a first version tried and got wrong three ways: it matched only the
+    substring `DbPublish`, so `SpoolFormatError` -- itself a `DbPublishError`
+    subclass -- passed; it read only bare `ast.Name` nodes, so
+    `errors.DbPublishError` and `except builtins.OSError` both passed. Asking
+    "is the raised type a builtin OSError subclass?" needs no such list and
+    cannot drift as task_core gains exception classes.
+
+    ADR 0011 permits a deliberate higher-level policy to inspect a filesystem
+    failure and raise its own semantic error -- predecessor cleanup does
+    exactly that. Such policies act on a *returned* residual path rather than
+    inside an `except` block, so they do not appear here.
+    """
+
+    # Every builtin OSError subclass, taken from builtins rather than written
+    # out, so a future Python that adds one is covered automatically.
+    FILESYSTEM = frozenset(
+        name for name in dir(builtins)
+        if isinstance(getattr(builtins, name), type)
+        and issubclass(getattr(builtins, name), OSError)
+    )
+
+    @staticmethod
+    def _handler_names(handler):
+        """Names in an except clause, tolerating tuples and qualified forms."""
+        names = []
+        target = handler.type
+        elements = target.elts if isinstance(target, ast.Tuple) else [target]
+        for element in elements:
+            if isinstance(element, ast.Name):
+                names.append(element.id)
+            elif isinstance(element, ast.Attribute):
+                names.append(element.attr)
+        return names
+
+    @staticmethod
+    def _raised_name(node):
+        call = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+        if isinstance(call, ast.Name):
+            return call.id
+        if isinstance(call, ast.Attribute):
+            return call.attr
+        return None
+
+    @classmethod
+    def _conversions(cls, source, label='<source>'):
+        """Filesystem handlers that raise anything but the type they caught.
+
+        Allowed, because each provably preserves the exception type:
+
+        - bare `raise`;
+        - `raise exc`, where `exc` is the handler's own bound name -- the
+          identical object, so the type cannot change;
+        - constructing the caught class, but only when the handler caught
+          exactly one. `except (FileNotFoundError, PermissionError) as exc:`
+          followed by `raise FileNotFoundError(...)` converts a caught
+          `PermissionError`, so a tuple handler may only bare-raise or
+          re-raise its bound name.
+
+        An earlier version asked only whether the raised name was *some*
+        builtin OSError subclass, which allowed `FileNotFoundError` to become
+        `PermissionError` -- "filesystem exception to some filesystem
+        exception" rather than "to the same one" -- while flagging the
+        type-preserving `raise exc` as a violation.
+
+        Deliberately conservative about nesting: a raise inside a nested
+        handler within a filesystem handler is still reported. No such shape
+        exists in task_core, and for a tripwire an unnecessary review beats a
+        silent miss.
+        """
+        offenders = []
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.ExceptHandler) or node.type is None:
+                continue
+            caught = cls._handler_names(node)
+            if not set(caught) & cls.FILESYSTEM:
+                continue
+            bound = node.name
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Raise) or inner.exc is None:
+                    continue
+                # `raise exc` -- the caught object itself.
+                if (
+                    bound is not None
+                    and isinstance(inner.exc, ast.Name)
+                    and inner.exc.id == bound
+                ):
+                    continue
+                raised = cls._raised_name(inner)
+                # Reconstructing the one class this handler caught.
+                if len(caught) == 1 and raised == caught[0]:
+                    continue
+                offenders.append(
+                    f'{label}:{inner.lineno} catches '
+                    f'{"/".join(caught)} and raises {raised}'
+                )
+        return offenders
+
+    def test_the_scanner_detects_every_conversion_shape(self):
+        """Synthetic proof, because the tree contains no violation.
+
+        The repository scan below cannot protect this scanner -- with nothing
+        to find, weakening it leaves the suite green. That is the same gap the
+        main-guard tripwire had.
+        """
+        allowed = (
+            ('bare re-raise', 'try:\n    pass\nexcept OSError:\n    raise\n'),
+            (
+                'same class reconstructed with added context',
+                'try:\n    pass\nexcept FileNotFoundError as e:\n'
+                "    raise FileNotFoundError('better message') from e\n",
+            ),
+            (
+                're-raise of the bound name',
+                'try:\n    pass\nexcept FileNotFoundError as exc:\n'
+                '    raise exc\n',
+            ),
+            (
+                're-raise of the bound name from a tuple handler',
+                'try:\n    pass\nexcept (FileNotFoundError, PermissionError) as exc:\n'
+                '    raise exc\n',
+            ),
+        )
+        for label, source in allowed:
+            with self.subTest(allowed=label):
+                self.assertEqual(
+                    self._conversions(source), [],
+                    f'{label} must be allowed: re-raising the native type is '
+                    f'how context is added'
+                )
+
+        forbidden = (
+            ('task_core base type',
+             "try:\n    pass\nexcept OSError:\n    raise DbPublishError('x')\n"),
+            ('task_core subclass',
+             "try:\n    pass\nexcept OSError:\n    raise SpoolFormatError('x')\n"),
+            ('qualified raised name',
+             "try:\n    pass\nexcept OSError:\n    raise errors.DbPublishError('x')\n"),
+            ('qualified handler name',
+             "try:\n    pass\nexcept builtins.OSError:\n    raise DbPublishError('x')\n"),
+            ('tuple handler',
+             'try:\n    pass\nexcept (OSError, ValueError):\n'
+             "    raise DbPublishError('x')\n"),
+            ('nested inside the handler',
+             'try:\n    pass\nexcept OSError:\n    if True:\n'
+             "        raise DbPublishError('x')\n"),
+            # Native-to-native conversion is still a conversion: the caller
+            # is told a different thing went wrong than actually did.
+            ('one native type into another',
+             'try:\n    pass\nexcept FileNotFoundError as exc:\n'
+             "    raise PermissionError('x') from exc\n"),
+            # A tuple handler cannot prove which class it caught, so
+            # constructing one of them may convert the other.
+            ('reconstructed class from a tuple handler',
+             'try:\n    pass\nexcept (FileNotFoundError, PermissionError) as exc:\n'
+             "    raise FileNotFoundError('x') from exc\n"),
+        )
+        for label, source in forbidden:
+            with self.subTest(forbidden=label):
+                self.assertEqual(
+                    len(self._conversions(source)), 1,
+                    f'{label} was not detected; the scanner claims to reject '
+                    f'every conversion of a filesystem exception'
+                )
+
+    def test_no_filesystem_handler_converts_to_a_task_core_exception(self):
+        offenders = []
+        for path in _iter_py_files(_TASK_CORE_DIR):
+            offenders += self._conversions(
+                Path(path).read_text(encoding='utf-8'),
+                os.path.relpath(path, _PROJECT_ROOT),
+            )
+
+        self.assertEqual(
+            sorted(set(offenders)), [],
+            'filesystem exceptions must keep their native type; task_core '
+            'exception types are for validation, ownership, serialization '
+            'and spool-format failures (ADR 0011)'
+        )
+
+
+
 class TestNoTestModuleHidesCasesBehindItsMainBlock(unittest.TestCase):
     """`unittest.main()` must be the last statement in a test module.
 
@@ -243,6 +438,12 @@ class TestNoTestModuleHidesCasesBehindItsMainBlock(unittest.TestCase):
             isinstance(test, ast.Compare)
             and isinstance(test.left, ast.Name)
             and test.left.id == '__name__'
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            # The operator matters. Checking only the operands accepted
+            # `!=`, `is` and even `<` as main guards, so `if __name__ !=
+            # '__main__':` would have been treated as the guard and every
+            # statement after it reported.
             and len(test.comparators) == 1
             and isinstance(test.comparators[0], ast.Constant)
             and test.comparators[0].value == '__main__'
@@ -296,6 +497,34 @@ class TestNoTestModuleHidesCasesBehindItsMainBlock(unittest.TestCase):
             'a TestCase built by assignment after the main guard went '
             'unnoticed; discovery would run it and a direct run would not'
         )
+
+    def test_only_an_equality_test_counts_as_the_main_guard(self):
+        """`__name__` on the left is not enough -- the operator decides.
+
+        Checking operands alone accepted `!=`, `is` and `<`. A module opening
+        with `if __name__ != '__main__':` would then have had that treated as
+        its guard, and every statement below it reported as hidden.
+        """
+        trailing = "\n\nclass TestAfter(unittest.TestCase):\n    pass\n"
+        guard = "if __name__ {} '__main__':\n    unittest.main()\n"
+
+        with self.subTest(operator='=='):
+            self.assertEqual(
+                self._statements_after_main_guard(
+                    guard.format('==') + trailing
+                ),
+                ['TestAfter'],
+            )
+        for operator in ('!=', 'is', 'is not', '<'):
+            with self.subTest(operator=operator):
+                self.assertEqual(
+                    self._statements_after_main_guard(
+                        guard.format(operator) + trailing
+                    ),
+                    [],
+                    f'`__name__ {operator} "__main__"` was treated as the '
+                    f'main guard; only equality is one'
+                )
 
     def test_a_clean_module_reports_nothing_after_the_guard(self):
         source = (

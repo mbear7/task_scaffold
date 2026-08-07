@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.7.2. This describes the present system, not
+How `task_core` works as of 0.7.3. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -343,12 +343,22 @@ executions before preparing new output. This includes residue left when a
 process crash prevented current-run cleanup. Unknown, malformed and foreign
 files remain untouched. If a positively owned predecessor still cannot be
 removed after bounded retries, startup fails rather than knowingly accumulating
-another spool beside it. After owned files are gone, task_core best-effort
-removes the empty implicit default spool directory with atomic `rmdir()`. It
-never removes an operator-configured spool directory, and a nonempty default
-directory is preserved without deleting foreign or concurrent contents. If
-a peer removes the empty shared root between resolution and spool creation, the
-exclusive file-open path recreates it once and retries.
+another spool beside it.
+
+task_core removes owned spool *files* and leaves the shared root directory in
+place. It does not remove the root, and never removes an operator-configured
+spool directory. An empty directory under the platform temporary directory is
+not residue; it may persist until removed by external temporary-directory
+maintenance. 0.6.11 did remove the root, and that made one task able to delete
+a directory another had just resolved — the framework-controlled source of
+that race. See `decisions/0011`.
+
+The exclusive file-open path keeps one defensive recreate for deletion by
+something outside task_core, such as a temporary-directory reaper. A
+filesystem exception propagating from a spool operation keeps its native type
+rather than being normalized into `DbPublishError`; predecessor cleanup is the
+deliberate exception, refusing to continue when known residue survives. See
+`decisions/0011`.
 
 See [decisions/0001](decisions/0001-replace-tables-instead-of-truncating.md)
 for why inference is viable at all, and its limitations for tables with

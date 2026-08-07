@@ -10,6 +10,81 @@ chronologically rather than by release.
 
 
 
+## 0.7.3
+
+Removes the framework-created race between spool-directory resolution and
+spool creation, by removing its cause rather than widening the retry that
+could not close it.
+
+### Changed
+- **task_core no longer removes the shared COPY spool root.** It removes the
+  spool files it owns and leaves the directory in place. 0.6.11 added
+  best-effort `rmdir()` of the empty root; because `resolve_spool_directory()`
+  and the exclusive open are two operations, that made one task able to delete
+  a directory another had just resolved — and task_core was the only
+  framework-controlled source of that deletion. An empty directory under the
+  platform temporary directory is not residue; it may persist until external
+  temporary-directory maintenance removes it.
+- **The single recreate-and-retry in `open_spool_for_write()` is retained**,
+  now serving only its honest case: deletion by something outside task_core,
+  such as a temporary-directory reaper. It is deliberately not a loop — one
+  recreate suffices against external deletion unless something deletes
+  continuously, and then a loop only turns a fast failure into a slow one.
+- **Filesystem failures during spool operations keep their native type.**
+  ADR 0011 gains the rule as an explicit section, including the one
+  deliberate exception: predecessor cleanup raises `DbPublishError` when known
+  task-owned residue cannot be removed, which is a refusal to proceed rather
+  than a restatement of the underlying `errno`. The ADR also records the
+  constraint this makes enforceable — a task_core semantic error may not be
+  raised directly from inside a filesystem handler; interpretation happens
+  after the failure is reduced to ordinary data, which is the shape
+  predecessor cleanup already had. Earlier 0.7.3 commits
+  wrapped one case — a repeated `ENOENT` across the recreate-and-open retry —
+  as `DbPublishError`. That gave the retry a different exception type from the
+  first attempt for the same errno, which was accidental rather than designed,
+  and documenting the exception in four places did not make it a semantic
+  worth keeping. An `OSError` means the filesystem failure remains the
+  reported failure; a `DbPublishError` means task_core made a higher-level
+  semantic decision to stop.
+
+### Breaking
+- `db_copy.cleanup_default_spool_directory()` is removed, along with its
+  `__all__` entry. It is not deprecated and no shim is provided. It was never
+  re-exported from the `task_core` facade, so only direct
+  `task_core.db_copy` importers are affected. Callers should delete the call:
+  the root is now intended to persist.
+- Numbered as a patch by deliberate choice, not by the usual rule. Removing a
+  public name would ordinarily be a minor bump; the 0.7 line is being kept
+  contiguous, and nothing outside this repository imports the removed
+  function. Recorded here because the version number does not carry the
+  warning in this one case — this entry does.
+
+### Documentation
+- ADR 0011 records the reversal, why a retry loop was rejected, and that
+  0.6.11's hardening was the sole *framework-controlled* source of the race.
+  Deletion by something outside task_core remains possible, and is what the
+  retained retry exists for. `docs/architecture.md` and
+  `docs/task-authoring.md` state that an empty `task_core-copy-spool` between
+  runs is expected rather than residue.
+
+### Tests
+- Replaced the root-removal suite with the new contract: task_core does not
+  expose or perform root removal, a successful spool lifecycle leaves the root
+  in place and empty, one external deletion is survived, a second propagates
+  `FileNotFoundError`, and the `O_EXCL` collision keeps `FileExistsError`.
+- The two publisher integration tests that asserted root removal now assert
+  root retention with no owned files left behind.
+- Declared and inferred preparation-failure cleanup are asserted separately.
+  The previous declared-path test was deleted rather than inverted when root
+  removal came out, leaving both direct paths uncovered; each was re-proven by
+  injecting root removal into one failure block at a time and confirming only
+  its own test fails.
+- The main-guard scanner now requires `ast.Eq`. Checking only the operands
+  accepted `!=`, `is`, `is not` and `<`, so a module opening with
+  `if __name__ != '__main__':` would have had that treated as its guard and
+  everything below it reported.
+
+
 ## 0.7.2
 
 Closes a COPY test-coverage gap proven to let *injected* silent
