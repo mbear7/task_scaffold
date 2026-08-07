@@ -84,6 +84,35 @@ VALID_TABLE_ADAPTERS = frozenset({None, 'petl', 'pandas'})
 # previous [A-Za-z_] form broke nothing.
 PORTABLE_IDENTIFIER_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
 
+# Published column names follow a wider convention than relation names, and
+# deliberately do NOT claim portability in the sense defined above.
+#
+# Relation names are ours to choose. Column names usually are not: they come
+# from analytical vocabulary, where `lev.1` and `metric.plan_2026` are
+# ordinary rather than accidental. Rejecting them forced a rename of data the
+# scaffold did not own.
+#
+# The dot costs the property the name 'portable' stands for. This:
+#
+#     select lev.1 from hr_ssch
+#
+# does not select the column -- it parses as a qualified reference. Reading a
+# dotted column in hand-written SQL requires quoting it:
+#
+#     select "lev.1" from hr_ssch
+#
+# That is why the dot is added here instead of to PORTABLE_IDENTIFIER_RE:
+# schemas, table names and generated relation names keep the stronger
+# guarantee, and only columns take the weaker one. Every path where a column
+# name reaches SQL already quotes it -- SQLAlchemy for DDL and INSERT, the
+# dialect's identifier preparer for COPY, _quote_identifier() for refill's
+# INSERT ... SELECT. See decisions/0014.
+#
+# Written as a repeated dotted segment rather than [a-z0-9_.]* so that '.lev',
+# 'lev.' and 'lev..1' stay rejected: a dot separates parts, it is not just
+# another permitted character.
+PUBLISHED_COLUMN_RE = re.compile(r'^[a-z_][a-z0-9_]*(?:\.[a-z0-9_]+)*$')
+
 # How new data replaces old in a published table. Engine-neutral
 # vocabulary, like PORTABLE_IDENTIFIER_RE above; the mechanics live in
 # db/publish.py.

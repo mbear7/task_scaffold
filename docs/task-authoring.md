@@ -429,7 +429,18 @@ spec = PipelineSpec(
 Keys are the source column names as they exist in the table the pipeline
 returns; values are the target names in PostgreSQL. Columns not mentioned
 are dropped. This is where Cyrillic spreadsheet headers get renamed away —
-required, because published column names must be portable identifiers.
+required, because published column names must be lower-case ASCII.
+
+A column name may contain dots: `lev.1`, `metric.plan_2026`, `a.b.c`. A dot
+separates parts, so it may not lead, trail or repeat — `.lev`, `lev.` and
+`lev..1` are rejected, as are upper case, spaces and hyphens. Table and
+schema names are stricter and permit no dot at all.
+
+One consequence worth knowing before you query the published table by hand:
+a dotted column must be quoted, because `select lev.1 from hr_ssch` parses
+as a qualified reference rather than as the column. Write `select "lev.1"`.
+task_core itself always quotes, so publication is unaffected. See
+`decisions/0014`.
 
 
 ## Resources

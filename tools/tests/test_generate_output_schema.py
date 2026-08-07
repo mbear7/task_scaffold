@@ -376,13 +376,48 @@ class SelectionAndRenderingTests(unittest.TestCase):
         ):
             tool.convert_columns(inspection, exclude_columns=('missing',))
 
-    def test_nonportable_column_names_are_rejected_before_output(self):
-        inspection = _inspection(_column('Customer ID', 'bigint'))
-        with self.assertRaisesRegex(
-            tool.SchemaGenerationError,
-            'not a portable task_core identifier',
-        ):
-            tool.convert_columns(inspection)
+    def test_invalid_column_names_are_rejected_before_output(self):
+        """Columns take the wider rule; they are not exempt from a rule.
+
+        Since 0.7.5 a column may carry dots, so the message names the column
+        contract rather than the portable-identifier one. Upper case and
+        spaces stay rejected either way.
+        """
+        for name in ('Customer ID', 'lev..1', '.lev', 'lev-1'):
+            with self.subTest(column=name):
+                inspection = _inspection(_column(name, 'bigint'))
+                with self.assertRaisesRegex(
+                    tool.SchemaGenerationError,
+                    'not a valid task_core published column name',
+                ):
+                    tool.convert_columns(inspection)
+
+    def test_dotted_column_names_are_accepted(self):
+        """`lev.1` is ordinary analytical vocabulary, not garbage.
+
+        The generator reads a real catalog, so rejecting it here would make
+        the tool unable to describe tables task_core can now publish.
+        """
+        inspection = _inspection(
+            _column('lev.1', 'bigint', not_null=True),
+            _column('metric.plan_2026', 'text'),
+        )
+        columns, _ = tool.convert_columns(inspection)
+        self.assertEqual(
+            [c.name for c in columns], ['lev.1', 'metric.plan_2026'],
+        )
+
+    def test_the_generator_column_rule_matches_task_core(self):
+        """The tool is standalone and cannot import task_core, so the two
+        copies of the pattern are kept in step here rather than by sharing a
+        constant."""
+        from task_core.types import PORTABLE_IDENTIFIER_RE, PUBLISHED_COLUMN_RE
+        self.assertEqual(
+            tool._PUBLISHED_COLUMN_RE.pattern, PUBLISHED_COLUMN_RE.pattern,
+        )
+        self.assertEqual(
+            tool._PORTABLE_IDENTIFIER_RE.pattern, PORTABLE_IDENTIFIER_RE.pattern,
+        )
 
     def test_pipeline_argument_is_paste_ready_inside_pipeline_spec(self):
         inspection = _inspection(

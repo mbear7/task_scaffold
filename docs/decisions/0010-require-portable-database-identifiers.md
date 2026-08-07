@@ -31,6 +31,13 @@ All database schema, table and published column names must satisfy:
 ^[a-z_][a-z0-9_]*$
 ```
 
+> **Narrowed by [0014](0014-allow-dots-in-published-column-names.md) in
+> 0.7.5.** Published *column* names now follow
+> `^[a-z_][a-z0-9_]*(?:\.[a-z0-9_]+)*$`, permitting a dot between parts.
+> Schemas, table names and generated relation names are unchanged, as is
+> everything else in this decision. A dotted column is deliberately not
+> portable in 0004's sense and must be quoted in hand-written SQL.
+
 `db_identifier_mode` is removed from `PipelineSpec` and database payloads.
 There is no deprecation shim and invalid identifiers are not normalized.
 Cyrillic or otherwise non-portable source headers must be renamed before

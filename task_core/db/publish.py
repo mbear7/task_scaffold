@@ -49,6 +49,7 @@ from task_core.db.identifiers import (
     staging_target_token,
     validate_identifier,
     validate_portable_identifier,
+    validate_published_column_name,
 )
 from task_core.db.policies import (
     DEFAULT_IDENTIFIER_POLICY,
@@ -712,7 +713,7 @@ class DbPublisher:
 
             for column in cls._declared_column_targets(spec):
                 validate_identifier(column, max_identifier_bytes, kind='column name', context=context)
-                validate_portable_identifier(column, kind='column name', context=context)
+                validate_published_column_name(column, context=context)
 
             if spec.output_schema is not None:
                 for column in spec.output_schema:
@@ -776,7 +777,7 @@ class DbPublisher:
 
         for column in payload.columns:
             validate_identifier(column, limit, kind='column name', context=context)
-            validate_portable_identifier(column, kind='column name', context=context)
+            validate_published_column_name(column, context=context)
 
     def _prepare_copy_payload(self, payload: DbPayload):
         """Consume one COPY row source into the final encrypted spool.

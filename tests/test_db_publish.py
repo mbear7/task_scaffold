@@ -1518,6 +1518,66 @@ class Test13PortableIdentifierContract(unittest.TestCase):
         with self.assertRaises(DbPublishError):
             publisher.publish(payload)
 
+    def test_a_dotted_column_is_accepted_but_a_dotted_relation_is_not(self):
+        """0.7.5 split the contract; this is the split, not a relaxation.
+
+        Column names usually come from analytical vocabulary the scaffold
+        does not own -- `lev.1` is ordinary there. Relation names are ours
+        to choose, so they keep the stronger promise: a portable identifier
+        never needs quoting downstream, and a dotted one always does.
+        """
+        from task_core.db.identifiers import (
+            validate_portable_identifier,
+            validate_published_column_name,
+        )
+
+        for name in ('lev.1', 'lev.2', 'metric.actual', 'metric.plan_2026',
+                     'a.b.c', 'plain', '_x'):
+            with self.subTest(accepted=name):
+                self.assertEqual(validate_published_column_name(name), name)
+
+        # A dot separates parts; it is not just another permitted character.
+        for name in ('.lev', 'lev.', 'lev..1', 'Lev.1', 'lev-1', 'lev 1',
+                     '1lev', 'lev.1\n'):
+            with self.subTest(rejected=name):
+                with self.assertRaises(DbPublishError):
+                    validate_published_column_name(name)
+
+        # The relation contract is untouched.
+        for kind in ('schema', 'table name'):
+            with self.subTest(relation=kind):
+                with self.assertRaises(DbPublishError):
+                    validate_portable_identifier('lev.1', kind=kind)
+
+    def test_a_dotted_column_still_obeys_the_byte_limit(self):
+        """Widening the character set does not widen the length rule."""
+        publisher = self._publisher()
+        long_dotted = 'a' * 60 + '.bcde'
+        self.assertGreater(len(long_dotted.encode('utf-8')), 63)
+        payload = DbPayload(
+            table_name='t', schema=None, columns=[long_dotted],
+            rows=[{long_dotted: 1}],
+        )
+        with self.assertRaisesRegex(DbPublishError, 'exceeds limit'):
+            publisher.publish(payload)
+
+    def test_a_direct_payload_publishes_a_dotted_column_end_to_end(self):
+        """Not just accepted by validation -- actually loaded.
+
+        The dict the INSERT loader passes is keyed by the original name, and
+        SQLAlchemy rewrites the bind parameter to `lev_1` while quoting the
+        identifier as "lev.1". That mismatch is the thing most likely to
+        break quietly, so this goes through publish() rather than stopping
+        at the validator.
+        """
+        publisher = self._publisher()
+        payload = DbPayload(
+            table_name='t', schema=None, columns=['lev.1', 'plain'],
+            rows=[{'lev.1': 1, 'plain': 'a'}, {'lev.1': 2, 'plain': 'b'}],
+        )
+        result = publisher.publish(payload)
+        self.assertEqual(result.rows, 2)
+
     def test_identifier_mode_was_removed_without_a_compatibility_shim(self):
         with self.assertRaises(TypeError):
             tc.PipelineSpec(db_identifier_mode='quoted')

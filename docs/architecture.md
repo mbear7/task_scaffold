@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.7.4. This describes the present system, not
+How `task_core` works as of 0.7.5. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -444,9 +444,18 @@ source-state table as its own target.
 **Runtime**, when publishing *and* when source-change checking builds its
 store: reads the server's own `max_identifier_length` and uses the lower
 of that and the configured limit — configuration can only tighten. It
-validates the payload's schema, table and final column names under the one
-portable lower-case contract, after all renaming has happened. It
-asserts generated staging names and guards against collisions.
+validates the payload's schema, table and final column names after all
+renaming has happened. It asserts generated staging names and guards against
+collisions.
+
+Schemas, table names and generated relation names take the portable
+lower-case contract: `^[a-z_][a-z0-9_]*$`, chosen so an identifier behaves
+identically quoted or unquoted. **Published column names take a wider one**,
+`^[a-z_][a-z0-9_]*(?:\.[a-z0-9_]+)*$`, permitting a dot between parts so
+that analytical vocabulary such as `lev.1` need not be renamed. A dotted
+column is deliberately not portable in that sense and must be quoted in
+hand-written SQL. Both contracts are subject to the same 63-byte limit. See
+`decisions/0014`.
 
 The source-state table gets the same treatment before its own DDL runs,
 because it is a real table this run creates and writes. `SourceStateStore`

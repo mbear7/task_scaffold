@@ -26,7 +26,7 @@ resolves; this one behavior intentionally does not. See README
 message for the rationale.
 """
 
-__version__ = '0.7.4'
+__version__ = '0.7.5'
 
 from task_core.db.policies import (
     CopyLoadPolicy,

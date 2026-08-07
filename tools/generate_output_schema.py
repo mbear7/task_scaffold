@@ -69,6 +69,11 @@ DB_PASSWORD: str | None = None
 
 
 _PORTABLE_IDENTIFIER_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
+# Columns take the wider contract: a dot may separate parts. Relations do
+# not. Mirrors task_core.types -- this script is standalone by design and
+# must not import task_core, so the two patterns are kept in step by
+# tools/tests, not by sharing a constant. See decisions/0014.
+_PUBLISHED_COLUMN_RE = re.compile(r'^[a-z_][a-z0-9_]*(?:\.[a-z0-9_]+)*$')
 _PYTHON_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 _NUMERIC_RE = re.compile(r'^numeric(?:\(([-+]?\d+)(?:,([-+]?\d+))?\))?$')
 _VARCHAR_RE = re.compile(r'^character varying(?:\((\d+)\))?$')
@@ -363,10 +368,16 @@ def inspect_table(
     )
 
 
-def _identifier_problem(value: str, *, label: str) -> str | None:
+def _identifier_problem(value: str, *, label: str, column: bool = False) -> str | None:
     if len(value.encode('utf-8')) > 63:
         return f'{label} exceeds PostgreSQL/task_core 63-byte identifier limit'
-    if not _PORTABLE_IDENTIFIER_RE.fullmatch(value):
+    pattern = _PUBLISHED_COLUMN_RE if column else _PORTABLE_IDENTIFIER_RE
+    if not pattern.fullmatch(value):
+        if column:
+            return (
+                f'{label} is not a valid task_core published column name; '
+                f'expected {pattern.pattern}'
+            )
         return (
             f'{label} is not a portable task_core identifier; expected '
             "^[a-z_][a-z0-9_]*$"
@@ -487,6 +498,7 @@ def convert_columns(
         identifier_problem = _identifier_problem(
             column.name,
             label=f'column {column.name!r}',
+            column=True,
         )
         if identifier_problem is not None:
             problems.append(f'- {column.name}: {identifier_problem}')

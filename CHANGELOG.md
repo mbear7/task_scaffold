@@ -10,6 +10,48 @@ chronologically rather than by release.
 
 
 
+## 0.7.5
+
+Allows dots in published column names. Schemas, table names and generated
+relation names are unchanged.
+
+### Changed
+- **Published column names now follow
+  `^[a-z_][a-z0-9_]*(?:\.[a-z0-9_]+)*$`**, so `lev.1`, `lev.2` and
+  `metric.plan_2026` publish without renaming. A dot separates parts and may
+  not lead, trail or repeat: `.lev`, `lev.` and `lev..1` stay rejected, as do
+  upper case, spaces and hyphens. The 63-byte limit is unchanged — widening
+  the character set did not widen the length rule.
+- **`PORTABLE_IDENTIFIER_RE` is untouched** and still governs schemas, table
+  names, `db_table_id_pix`, generated staging names and the source-state
+  relation. The new `PUBLISHED_COLUMN_RE` sits beside it rather than
+  replacing it, because the two make different promises — see below.
+- `tools/generate_output_schema.py` gained the same split. It is standalone
+  by design and cannot import `task_core`, so a test asserts the two copies
+  of the patterns stay in step.
+
+### Why a second pattern instead of widening the first
+- A portable identifier never needs quoting downstream. **A dotted column
+  always does**: `select lev.1 from hr_ssch` parses as a qualified reference,
+  not as the column — you have to write `select "lev.1"`. Folding the dot
+  into `PORTABLE_IDENTIFIER_RE` would have left its comment, which explains
+  at length what 'portable' buys, describing a property the code no longer
+  had. Two contracts, not one weaker one. ADR 0014 records it; ADR 0010 is
+  annotated where it says the rule covers columns.
+
+### Verification
+- Live on the target localhost PostgreSQL 18.4, both loaders, 7/7: values
+  round-trip under `replace`; `information_schema` stores the dotted names
+  verbatim rather than mangled; refill preserves the target OID and refills
+  correctly — that path builds its column list with `_quote_identifier()`
+  rather than letting SQLAlchemy render it, so it is the one that could have
+  broken quietly; and a dotted *table* name is still rejected.
+- The INSERT path was the other quiet-failure candidate and is fine:
+  SQLAlchemy sanitises the bind parameter to `lev_1` while quoting the
+  identifier as `"lev.1"`, and maps a dict keyed by the original name, so
+  `load_rows_into_staging()` needed no change.
+
+
 ## 0.7.4
 
 Splits the database subsystem into a `task_core/db/` package of ten modules.

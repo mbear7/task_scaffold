@@ -21,7 +21,7 @@ from uuid import uuid4
 import sqlalchemy as sa
 
 from task_core.db.values import DbPublishError, DbPublishInvariantError
-from task_core.types import PORTABLE_IDENTIFIER_RE
+from task_core.types import PORTABLE_IDENTIFIER_RE, PUBLISHED_COLUMN_RE
 
 
 # PostgreSQL truncates any identifier past NAMEDATALEN-1 = 63 BYTES, and
@@ -83,6 +83,28 @@ def validate_portable_identifier(name, *, kind, context=''):
         raise DbPublishError(
             f'{context}{kind} is not a portable identifier '
             f'({PORTABLE_IDENTIFIER_RE.pattern}): {name!r}. Rename it.'
+        )
+    return name
+
+
+def validate_published_column_name(name, *, kind='column name', context=''):
+    """Columns may carry dots; schemas, tables and relations may not.
+
+    Separate from validate_portable_identifier() rather than a widened
+    version of it, because the two make different promises. A portable
+    identifier never needs quoting downstream. A dotted column always does:
+    `select lev.1` parses as a qualified reference, not as the column. See
+    decisions/0014.
+
+    fullmatch() for the same reason as above -- `$` also matches before a
+    trailing newline, so match() would accept 'lev.1\\n'.
+    """
+    if not PUBLISHED_COLUMN_RE.fullmatch(name):
+        raise DbPublishError(
+            f'{context}{kind} is not a valid published column name '
+            f'({PUBLISHED_COLUMN_RE.pattern}): {name!r}. Lower case, and a '
+            f'dot may separate parts but may not lead, trail or repeat. '
+            f'Rename it.'
         )
     return name
 
