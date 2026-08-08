@@ -10,6 +10,35 @@ chronologically rather than by release.
 
 
 
+## 0.7.8
+
+Two CSV defects found by review of 0.7.7. Both are cases where the code
+passed every test that existed and still did not meet
+[decisions/0015](docs/decisions/0015-add-first-class-csv-input-resources.md).
+
+### Fixed
+- **A quoting mode that converts values could leak a raw `ValueError`, with
+  the offending field value in its message.** `csv.reader` raises a plain
+  `ValueError` — not a `csv.Error` — when a converting mode fails, and
+  `QUOTE_NONNUMERIC` converts every unquoted field to float, so an unquoted
+  `abc` escaped the `CsvReadError` contract entirely. Its message is
+  `could not convert string to float: 'abc'`, so the escape also put source
+  data in front of whatever logged it. Now wrapped as `CsvReadError`
+  without interpolating the cause; the value stays reachable through
+  `__cause__` for local debugging.
+- **An all-unusable CSV file set did not name itself.** The failure belongs
+  to the set rather than to any member, and the message said only that a
+  schema could not be inferred. It now reports the selection root and
+  pattern (`source=C:\feed\*.csv`), read from the selection already made —
+  no rescan, no second filesystem observation.
+
+### Added
+- Tests for `QUOTE_NONNUMERIC` and `QUOTE_NONE`, which 0.7.7 listed as
+  verified and did not cover. Note that under `QUOTE_NONNUMERIC` values are
+  **not** strings — the standard library converts them, and task_core
+  neither adds inference nor suppresses the library's.
+
+
 ## 0.7.7
 
 First-class CSV input resources, and the generic exact-file selection they

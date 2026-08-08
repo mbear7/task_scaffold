@@ -1801,12 +1801,34 @@ The complete repository-mandated normal and `-O` verification remains required i
 
 ## Verification status
 
-As of 0.7.7, implemented and verified.
+As of 0.7.8, implemented and verified.
 
 Measured offline, in the suite: the parser contract, the header/width state
 machine, the construction-versus-iteration exception boundary, laziness and
 re-iterability, stream lifecycle, and the file-set semantics including
 cross-file header agreement and one-member-at-a-time traversal.
+
+Two gaps in the 0.7.7 implementation, found by review afterwards and fixed
+in 0.7.8. Both are recorded here rather than only in the changelog, because
+both were cases where the code satisfied every test that existed and still
+did not satisfy this decision:
+
+- Item 33 was only half met. `_iter_records()` wrapped `csv.Error` and
+  `UnicodeDecodeError` but not a plain `ValueError`, which is what a
+  value-converting quoting mode raises — `QUOTE_NONNUMERIC` converts every
+  unquoted field to float, so an unquoted `abc` escaped raw. It also
+  carried the offending field value in its message, so the leak defeated
+  item 37 at the same time. Now wrapped, without interpolating the cause.
+- Item 34 did not hold for the one failure that belongs to no member: an
+  all-unusable file set reported that a schema could not be inferred
+  without naming the set. It now reports the selection root and pattern,
+  read from the selection already made rather than from a rescan.
+
+Items 27 and 28 had no test at all in 0.7.7 despite being listed above.
+`QUOTE_NONNUMERIC` and `QUOTE_NONE` are both covered now, including the
+part that reads like a contradiction: under `QUOTE_NONNUMERIC` values are
+*not* strings, because the standard library converts them, and section 7
+means task_core neither adds inference nor suppresses the library's.
 
 Measured against a live PostgreSQL 18.4 instance — items 51 and 52, which
 no offline fake can settle, since the claim is about what the COPY path

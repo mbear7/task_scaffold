@@ -458,6 +458,63 @@ class Test4TheExceptionBoundaryHolds(unittest.TestCase):
                 _rows(malformed)
             self.assertIsInstance(parse.exception.__cause__, csv.Error)
 
+    def test_a_quoting_mode_conversion_failure_becomes_csvreaderror(self):
+        """The third runtime parser failure, and the easiest to miss.
+
+        It is neither csv.Error nor a decoding problem: QUOTE_NONNUMERIC
+        converts every unquoted field to float, so an unquoted 'abc' raises
+        a plain ValueError out of csv.reader. Before this was handled, that
+        ValueError escaped raw -- which both broke the CsvReadError
+        contract and, because its message is "could not convert string to
+        float: 'abc'", put a source field value in front of whatever logged
+        it.
+        """
+        with TempDir() as d:
+            path = _write(d / 'x.csv', '"a";"b"\n1;abc\n')
+            options = CsvReadOptions(quoting=csv.QUOTE_NONNUMERIC)
+
+            with self.assertRaises(CsvReadError) as raised:
+                _rows(path, options)
+
+            self.assertIsInstance(raised.exception.__cause__, ValueError)
+            self.assertNotIsInstance(raised.exception.__cause__, csv.Error)
+            self.assertNotIn(
+                'abc', str(raised.exception),
+                'the offending field value reached the diagnostic; section '
+                '30 forbids field values, and the cause chain already '
+                'carries it for local debugging',
+            )
+
+    def test_standard_library_quoting_modes_are_passed_through(self):
+        """Section 7: task_core preserves the parser's own semantics.
+
+        Including the part that looks like a contradiction -- under
+        QUOTE_NONNUMERIC values are *not* strings, because the standard
+        library converts them. task_core does not add type inference, and
+        it does not suppress the library's either.
+        """
+        with TempDir() as d:
+            numeric = _write(d / 'n.csv', '"a";"b"\n1;2.5\n')
+            self.assertEqual(
+                _rows(numeric, CsvReadOptions(quoting=csv.QUOTE_NONNUMERIC)),
+                [('a', 'b'), (1.0, 2.5)],
+            )
+
+            # QUOTE_NONE: quote characters are ordinary data, and no escape
+            # character is invented on the author's behalf.
+            raw = _write(d / 'r.csv', 'a;b\nx"y;2\n')
+            self.assertEqual(
+                _rows(raw, CsvReadOptions(quoting=csv.QUOTE_NONE)),
+                [('a', 'b'), ('x"y', '2')],
+            )
+
+            quoted = _write(d / 'q.csv', '"a";"b"\n1;abc\n')
+            self.assertEqual(
+                _rows(quoted, CsvReadOptions(quoting=csv.QUOTE_NONE)),
+                [('"a"', '"b"'), ('1', 'abc')],
+                'QUOTE_NONE must leave the quote characters in the values',
+            )
+
     def test_a_field_size_failure_reports_the_active_process_limit(self):
         with TempDir() as d:
             path = _write(d / 'big.csv', 'a;b\n' + 'x' * 200 + ';2\n')
@@ -1068,7 +1125,17 @@ class Test10ACsvFileSetIsOneLogicalTable(unittest.TestCase):
 
             with self.assertRaises(CsvReadError) as raised:
                 list(iter(self._set(d).get_table()))
-            self.assertIn('cannot be inferred', str(raised.exception))
+            message = str(raised.exception)
+            self.assertIn('cannot be inferred', message)
+
+            # Section 30: a failure belonging to the set as a whole has to
+            # name the logical source. No member owns this one, so without
+            # the root and pattern the message says only that something
+            # somewhere was unusable -- and the folder is exactly what the
+            # reader needs in order to go look. Built from the selection
+            # already made, so it costs no rescan.
+            self.assertIn(str(d), message)
+            self.assertIn('*.csv', message)
 
             self.assertEqual(
                 list(iter(self._set(
@@ -1077,6 +1144,19 @@ class Test10ACsvFileSetIsOneLogicalTable(unittest.TestCase):
                 'with a declared schema an unusable set is a zero-row table, '
                 'not an error',
             )
+
+    def test_a_directly_constructed_set_still_names_itself(self):
+        """The fallback says how many files, rather than inventing a path."""
+        with TempDir() as d:
+            _write(d / 'a.csv', '')
+            selected = tc.select_fixed_file_info(str(d / 'a.csv'))
+            resource = csv_file_set_resource(file_set_resource(
+                [selected], source_access=tc.LOCAL_FILE_ACCESS,
+            ))
+
+            with self.assertRaises(CsvReadError) as raised:
+                list(iter(resource.get_table()))
+            self.assertIn('1 selected files', str(raised.exception))
 
     def test_only_one_member_is_open_at_a_time(self):
         """Section 14, asserted on peak concurrency rather than on rows.

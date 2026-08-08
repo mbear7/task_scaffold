@@ -15,6 +15,7 @@ so `task_core.csv` does not become ambiguous either.
 import codecs
 import csv
 import io
+import os
 from dataclasses import dataclass
 
 import petl as etl
@@ -274,10 +275,30 @@ def _iter_records(stream, options, source_label):
             f'({_describe(source_label, reader=reader, field_size_limit=csv.field_size_limit())})'
         ) from exc
     except UnicodeDecodeError as exc:
+        # Before ValueError below, which it is a subclass of. Its own
+        # message names the encoding and the byte offset, never the field.
         raise CsvReadError(
             f'CSV source could not be decoded as {options.encoding!r}: '
             f'{exc.reason} '
             f'({_describe(source_label, reader=reader, encoding=options.encoding)})'
+        ) from exc
+    except ValueError as exc:
+        # The third runtime failure the parser can produce, and the one
+        # that is easy to miss because it is neither csv.Error nor a
+        # decoding problem: a quoting mode that converts values raises a
+        # plain ValueError. QUOTE_NONNUMERIC converts every unquoted field
+        # to float, so an unquoted 'abc' fails there -- measured.
+        #
+        # Deliberately does not interpolate exc. Its message is
+        # "could not convert string to float: 'abc'" -- it carries the
+        # offending field value, and decisions/0015 section 30 forbids
+        # field values in diagnostics. The cause is chained, so the value
+        # is still reachable when debugging locally; it just does not go
+        # into a log by default.
+        raise CsvReadError(
+            f'CSV value conversion failed -- the configured quoting mode '
+            f'converts field values, and one could not be converted '
+            f'({_describe(source_label, reader=reader, quoting=options.quoting)})'
         ) from exc
 
 
@@ -483,10 +504,28 @@ class csv_file_set_resource:
     fingerprint describe the same files.
     """
 
-    def __init__(self, file_set, options=None):
+    def __init__(self, file_set, options=None, *, source_label=None):
         self._file_set = file_set
         self._options = _coerce_options(options)
+        self._source_label = source_label
         self._table = None
+
+    def _set_label(self):
+        """A name for the set as a whole, for a failure no member owns.
+
+        decisions/0015 section 30 requires a failure that applies to the
+        selected set to identify the logical source, not just say that
+        something went wrong somewhere. The builder passes the root and
+        pattern it already used for selection, so this costs no rescan and
+        no second filesystem observation.
+
+        The fallback covers a wrapper constructed directly around a file
+        set, where there is no root to name. It says how many files were
+        selected rather than inventing a path.
+        """
+        if self._source_label is not None:
+            return self._source_label
+        return f'<csv file set of {len(self.files)} selected files>'
 
     @property
     def files(self):
@@ -582,8 +621,8 @@ class csv_file_set_resource:
             raise CsvReadError(
                 'no selected CSV file in this file set has a usable record, '
                 'so the columns cannot be inferred '
-                f'(files={len(self.files)}). Supply columns= to read an '
-                'empty set as a zero-row table.'
+                f'({_describe(self._set_label(), files=len(self.files))}). '
+                'Supply columns= to read an empty set as a zero-row table.'
             )
 
     def get_table(self):
@@ -636,6 +675,13 @@ def build_csv_file_set_resource(
     emptiness -- files that exist but hold no usable record -- is a
     separate concept decided during traversal.
     """
+    # The label is built from what selection already used, not from a
+    # second look at the filesystem. A glob spec is the honest name for a
+    # set: it says exactly which files were in scope.
+    label = os.path.join(str(folder_path), pattern)
+    if recursive:
+        label += ' (recursive)'
+
     return csv_file_set_resource(
         build_file_set_resource(
             folder_path,
@@ -649,6 +695,7 @@ def build_csv_file_set_resource(
             on_empty=on_empty,
         ),
         options,
+        source_label=label,
     )
 
 
