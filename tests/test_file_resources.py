@@ -7,6 +7,7 @@ would have to reimplement correctly to be worth testing at all.
 """
 
 import contextlib
+import errno
 import os
 import tempfile
 import time
@@ -1276,6 +1277,77 @@ class Test20SelectionInfoPrimitivesAreTheOneImplementation(unittest.TestCase):
             with self.assertRaises(FileNotFoundError) as not_a_file:
                 tc.select_fixed_file_info(str(d))
             self.assertIn('Path is not a file:', str(not_a_file.exception))
+
+
+class Test23RemoteMissingFilesRaiseTheDocumentedType(unittest.TestCase):
+    """A missing file is a FileNotFoundError on both branches, not one.
+
+    Found by running against a real DFS share, which no test here can do.
+    smbclient signals ENOENT with SMBOSError, which subclasses OSError
+    *directly* and is not a FileNotFoundError -- so the
+    `except FileNotFoundError` that used to wrap the remote stat could
+    never fire. The normalization it promised had never once run, and the
+    same function raised FileNotFoundError for a missing local file and
+    SMBOSError for a missing remote one.
+
+    The fake below reproduces that shape rather than guessing at it: an
+    OSError subclass that is deliberately *not* a FileNotFoundError, with
+    errno set to ENOENT, which is what was measured coming back from the
+    real share.
+    """
+
+    class _SmbLikeOSError(OSError):
+        """What smbclient.stat() raises. Not a FileNotFoundError."""
+
+    def _remote_access(self, error):
+        class RemoteAccess(FileAccessImpl):
+            def __init__(inner):
+                super().__init__(dfs_creds={'username': 'u', 'password': 'p'})
+
+            def _stat(inner, path):
+                raise error
+
+        return RemoteAccess()
+
+    def test_a_missing_remote_file_is_a_filenotfounderror(self):
+        missing = self._SmbLikeOSError(errno.ENOENT, 'No such file')
+        self.assertNotIsInstance(
+            missing, FileNotFoundError,
+            'the fake no longer reproduces the behaviour it exists to model',
+        )
+        access = self._remote_access(missing)
+
+        with self.assertRaises(FileNotFoundError) as raised:
+            access.select_fixed_file_info(r'\\server\share\nope.xlsx')
+        self.assertIn('File not found:', str(raised.exception))
+        self.assertIs(raised.exception.__cause__, missing)
+
+    def test_a_missing_remote_folder_is_a_filenotfounderror(self):
+        missing = self._SmbLikeOSError(errno.ENOENT, 'No such file')
+        access = self._remote_access(missing)
+
+        with self.assertRaises(FileNotFoundError) as raised:
+            access.select_file_infos(r'\\server\share\nope', pattern='*.xlsx')
+        self.assertIn('Path not found:', str(raised.exception))
+
+    def test_a_remote_permission_failure_keeps_its_own_type(self):
+        """The half that makes the normalization safe rather than lossy.
+
+        Only ENOENT is translated. Anything else -- a permission denial, a
+        transport failure -- has to arrive as itself, or task_core would be
+        reporting 'file not found' for a share the caller simply cannot
+        read, which is the single most misleading thing it could say.
+        """
+        denied = self._SmbLikeOSError(errno.EACCES, 'Access denied')
+        access = self._remote_access(denied)
+
+        with self.assertRaises(OSError) as raised:
+            access.select_fixed_file_info(r'\\server\share\secret.xlsx')
+        self.assertIs(
+            raised.exception, denied,
+            'a non-ENOENT failure was replaced instead of propagating',
+        )
+        self.assertNotIsInstance(raised.exception, FileNotFoundError)
 
 
 class Test21ExactXlsxIsTrackable(unittest.TestCase):

@@ -10,6 +10,34 @@ chronologically rather than by release.
 
 
 
+## 0.7.9
+
+A latent SMB defect, found by running against a real DFS share for the
+first time. Long-standing — it predates the CSV work and was not
+introduced by it.
+
+### Fixed
+- **A missing file on an SMB path did not raise `FileNotFoundError`.**
+  `select_fixed_file_info()` and the SMB folder scan both wrapped their
+  remote `stat` in `except FileNotFoundError`, but `smbclient` signals a
+  missing file with `SMBOSError`, which subclasses `OSError` *directly*.
+  The clause could never fire, so the normalization it promised had never
+  run: the same function raised `FileNotFoundError` for a missing local
+  file and `SMBOSError` for a missing remote one. Both sites now key on
+  `errno.ENOENT`.
+
+  A permission or transport failure still propagates with its own type —
+  only "not found" is translated. Reporting "file not found" for a share
+  the caller simply cannot read would be the most misleading thing the
+  scaffold could say.
+
+### Notes
+- The offline suite cannot reach SMB and still contains no SMB harness. The
+  regression test models `SMBOSError` with a fake built to match what was
+  *measured* coming back from the real share: an `OSError` subclass that is
+  deliberately not a `FileNotFoundError`, carrying `errno.ENOENT`.
+
+
 ## 0.7.8
 
 Two CSV defects found by review of 0.7.7. Both are cases where the code
