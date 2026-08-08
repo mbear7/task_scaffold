@@ -10,6 +10,63 @@ chronologically rather than by release.
 
 
 
+## 0.7.7
+
+First-class CSV input resources, and the generic exact-file selection they
+needed. See
+[decisions/0015](docs/decisions/0015-add-first-class-csv-input-resources.md).
+
+Additive: no existing name changes meaning, and `build_excel_resource()`'s
+signature already carried `selection=`. A caller can ignore all of it.
+
+### Added
+- **CSV resources: `csv_file()`, `latest_csv()`, `csv_file_set()`**, plus
+  `CsvReadOptions` and `CsvReadError` on the facade. One parser serves petl
+  and pandas consumers alike — resources return petl tables, as they always
+  have, and a pandas pipeline converts them itself.
+- **`xlsx_file()`** — one named workbook, tracked. This existed only as
+  `build_excel_resource(path)` before, which stores no selection metadata,
+  so `source_fingerprint()` refused for *every* fixed-path workbook. The
+  refusal was right; there was simply no builder that captured what it
+  needed.
+- **`select_fixed_file_info()` and `select_latest_file_info()`** — the
+  existing two selections returning the `SelectedFile` rather than the path
+  alone. The latest-file key `(st_mtime, path)` had been implemented
+  identically in two places; CSV would have been a third.
+- **`ROW_WIDTH_MODES` / `validate_row_width()`** in `types.py`, following
+  the `PUBLICATION_STRATEGIES` and `DB_LOADERS` pattern.
+
+### Changed
+- **`select_fixed_file()`'s local branch now stats the file.** It used
+  `exists()` / `is_file()` and returned without a `stat()`; it is now a
+  one-line delegation to `select_fixed_file_info()`, which needs one. Both
+  error messages (`File not found:`, `Path is not a file:`) are unchanged
+  and now have tests holding them there. Nothing else about the function
+  moved.
+- **`build_excel_resource()` no longer re-selects a path handed to it
+  together with selection metadata.** It called `select_fixed_file()`
+  unconditionally, which after this release would mean a second filesystem
+  observation of an already-chosen file — and a fingerprint describing an
+  observation other than the one it reports.
+- `single_file_fingerprint()` moved into `source_tracking.py`; the workbook
+  and CSV resources share it instead of each building the same fingerprint.
+
+### Notes for task authors
+- **The CSV delimiter default is `;`, not `,`** — a project convention, not
+  detection. task_core never sniffs a dialect, encoding or quote character.
+- **The CSV encoding default is `utf-8-sig`.** Under plain `utf-8` an Excel
+  BOM survives into the *first column name*: the header parses as `﻿name`,
+  nothing raises, and every later reference to `name` silently fails to
+  match.
+- **`list(table)` reads a CSV file twice.** This is petl's own behaviour on
+  every table, not something CSV adds — `IterContainer.__len__` counts by
+  iterating and `list()`/`tuple()` call it to pre-size before iterating
+  again. Harmless on a materialized table; a second file read here. Use
+  `table.list()` or a plain `for` loop. The runner is unaffected: it
+  stabilizes with `cache()`.
+- **`.todf()` is eager** and can use far more memory than the source files.
+
+
 ## 0.7.6
 
 Housekeeping. No behavior change: across 50 files the import bindings and the

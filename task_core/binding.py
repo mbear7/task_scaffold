@@ -17,15 +17,16 @@ This module implements the binding slice of a broader resource-model
 design -- required direct resources only, resolved through keyword-only
 run() parameters. It is not the complete design. Not yet implemented,
 deferred until a real pipeline needs one: required=False, missing-resource
-acceptance under keyword injection, zero-match file sets as a missing
-optional resource, and exact-file/CSV convenience factories.
+acceptance under keyword injection, and zero-match file sets as a missing
+optional resource.
 
 This deferral is about this module specifically -- the low-level
-resources/file_set.py and resources/excel.py builders still genuinely
-support on_empty='raise'|'empty', predating this module entirely. Neither
-latest_xlsx() nor xlsx_file_set() (resources/factories.py) exposes
-on_empty, and nothing here gives an injected resource's "empty" state any
-defined meaning -- that gap is deliberate, not an oversight.
+build_file_set_resource() still genuinely supports on_empty='raise'|'empty',
+predating this module entirely, and build_csv_file_set_resource() passes it
+through because zero matching files is a selection question. None of the
+factories in resources/factories.py exposes on_empty, and nothing here
+gives an injected resource's "empty" state any defined meaning -- that gap
+is deliberate, not an oversight.
 
 ResourceSpec.tracker is a bool, not a callable -- found, while building
 this for real, that the real task_core doesn't attach a tracker callable

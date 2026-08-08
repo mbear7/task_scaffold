@@ -25,7 +25,7 @@ resolves; this one behavior intentionally does not. See README
 message for the rationale.
 """
 
-__version__ = '0.7.6'
+__version__ = '0.7.7'
 
 from task_core.binding import (
     PipelineBinding,
@@ -57,17 +57,29 @@ from task_core.file_access import (
     select_file_infos,
     select_files,
     select_fixed_file,
+    select_fixed_file_info,
     select_latest_file,
+    select_latest_file_info,
     source_access,
 )
 from task_core.logging_setup import setup_logging
+from task_core.resources.csv import CsvReadError, CsvReadOptions
 from task_core.resources.db import build_db_resource, db_resource
 from task_core.resources.excel import (
     build_excel_resource,
     build_latest_xlsx_resource,
+    build_xlsx_file_resource,
     excel_resource,
 )
-from task_core.resources.factories import latest_xlsx, resource, xlsx_file_set
+from task_core.resources.factories import (
+    csv_file,
+    csv_file_set,
+    latest_csv,
+    latest_xlsx,
+    resource,
+    xlsx_file,
+    xlsx_file_set,
+)
 from task_core.resources.file_set import build_file_set_resource, file_set_resource
 from task_core.runner import (
     run_pipelines,

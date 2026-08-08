@@ -36,6 +36,7 @@ from task_core.db.identifiers import (
 )
 from task_core.db.payload import from_petl
 from task_core.db.publish import DbPublisher
+from task_core.resources.csv import build_csv_file_resource
 from task_core.table_adapters import _ADAPTERS, VALID_TABLE_ADAPTERS
 from task_core.types import PORTABLE_IDENTIFIER_RE
 
@@ -394,7 +395,7 @@ class Test2DocumentedLayeringHolds(unittest.TestCase):
         # architecture.md names these and says why each needs one.
         expected = {
             'table_adapters.py', 'db/values.py', 'db/payload.py',
-            'resources/excel.py', 'resources/db.py',
+            'resources/excel.py', 'resources/csv.py', 'resources/db.py',
         }
         actual = {
             name for name, path in self._modules()
@@ -440,8 +441,12 @@ class Test3DocumentedBehaviourOfDeclaredSpecFields(unittest.TestCase):
         self.assertEqual(payload.columns, ['block'])
 
     def test_resources_return_petl_tables_whatever_the_pipeline_uses(self):
-        # A pandas pipeline reading an Excel or DB resource converts them
-        # itself; task-authoring.md says so because it is not obvious.
+        # A pandas pipeline reading an Excel, CSV or DB resource converts
+        # them itself; task-authoring.md says so because it is not obvious.
+        # CSV is checked alongside Excel rather than trusted to follow the
+        # rule -- it is the resource most likely to grow a get_dataframe()
+        # shortcut, and decisions/0015 rules one out precisely so that petl
+        # and pandas consumers cannot see different CSV semantics.
         import tempfile
 
         from openpyxl import Workbook
@@ -456,6 +461,28 @@ class Test3DocumentedBehaviourOfDeclaredSpecFields(unittest.TestCase):
             with contextlib.closing(tc.build_excel_resource(path)) as resource:
                 rows = resource.get_sheet_rows(resource.sheets[0])
                 self.assertTrue(type(rows).__module__.startswith('petl'))
+
+            csv_path = os.path.join(tmp, 'x.csv')
+            with open(csv_path, 'w', encoding='utf-8', newline='') as handle:
+                handle.write('h;v\n1;2\n')
+
+            csv_resource = build_csv_file_resource(csv_path)
+            with contextlib.closing(csv_resource) as resource:
+                table = resource.get_table()
+                # isinstance, not __module__: the CSV view is a petl.Table
+                # subclass defined in task_core, so it lives in this
+                # package's namespace while being a petl table in every way
+                # a consumer can observe. Subclassing is what makes it
+                # re-iterable -- see decisions/0015 section 23.
+                self.assertIsInstance(table, etl.Table)
+                self.assertEqual(
+                    list(iter(table)), [('h', 'v'), ('1', '2')],
+                )
+                self.assertFalse(
+                    hasattr(resource, 'get_dataframe'),
+                    'a CSV-specific DataFrame accessor would give pandas '
+                    'consumers a second set of CSV semantics',
+                )
 
 
 class Test4DocumentationFilesExistWhereLinkedFrom(unittest.TestCase):

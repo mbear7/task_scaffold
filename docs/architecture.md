@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.7.6. This describes the present system, not
+How `task_core` works as of 0.7.7. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).
@@ -31,8 +31,9 @@ level 1   file_access.py              local and SMB file/workbook access
 
 level 2   context.py                  task_context: lazy resources, close-once
           binding.py                  ResourceSpec, bind(), wiring
-          resources/factories.py      latest_xlsx(), xlsx_file_set()
+          resources/factories.py      declarative xlsx_*/csv_* recipes
           resources/excel.py          one workbook
+          resources/csv.py            CSV parsing, lazy re-iterable tables
           resources/file_set.py       a folder of workbooks
           resources/db.py             petl tables from queries
           db/publish.py               DbPublisher, payload construction
@@ -94,12 +95,12 @@ Other modules do import an engine, for different reasons:
 `table_adapters.py` imports both because encapsulating their differences
 is its job; `db/payload.py` imports pandas to accept a DataFrame in
 `from_pandas()`; `db/values.py` imports pandas to normalize scalar values
-and identify missing markers; `resources/excel.py` and `resources/db.py`
-import petl because **resources return petl tables**. `db/publish.py`
-imports neither: it publishes a `DbPayload`, and building one from a
-DataFrame is `db/payload.py`'s job. That last one is visible to task
-authors: a pandas pipeline reading an Excel or DB resource receives petl
-tables and converts them itself.
+and identify missing markers; `resources/excel.py`, `resources/csv.py` and
+`resources/db.py` import petl because **resources return petl tables**.
+`db/publish.py` imports neither: it publishes a `DbPayload`, and building
+one from a DataFrame is `db/payload.py`'s job. That last one is visible to
+task authors: a pandas pipeline reading an Excel, CSV or DB resource
+receives petl tables and converts them itself.
 
 
 ## Run lifecycle
@@ -161,8 +162,9 @@ cleanup never replaces the original exception. See "Failure and cleanup".
 ## Resources
 
 A resource is anything a pipeline reads: a workbook, a folder of
-workbooks, a database connection. Resources are declared once at module
-level in the task file and referenced by pipelines through `bind()`.
+workbooks, a CSV file or folder, a database connection. Resources are
+declared once at module level in the task file and referenced by pipelines
+through `bind()`.
 
 ```python
 SSCH_FILES = xlsx_file_set('ssch', pattern='*.xlsx', tracker=True)
@@ -203,12 +205,30 @@ for why releasing a workbook involves `gc.collect()`.
 | builder | what it gives the pipeline |
 | --- | --- |
 | `build_excel_resource(path)` | one workbook: sheets, tables, named ranges, row metadata |
+| `build_xlsx_file_resource(path)` | the same workbook, plus the selection metadata a source-change check needs |
+| `build_latest_xlsx_resource(folder, pattern)` | the newest matching workbook, tracked |
 | `build_file_set_resource(folder, pattern)` | a folder of workbooks, plus selection (latest / fixed / all) |
+| `build_csv_file_resource(path)` | one CSV file as a lazy petl table |
+| `build_latest_csv_resource(folder, pattern)` | the newest matching CSV, tracked |
+| `build_csv_file_set_resource(folder, pattern)` | a folder of CSVs as one logical table |
 | `build_db_resource(creds=...)` | petl tables from queries or whole tables, optionally server-side cursors |
 
-`latest_xlsx()` and `xlsx_file_set()` are the declarative forms used in
-task files; they produce a `ResourceSpec` that the context turns into a
-resource when needed.
+`build_excel_resource()` takes a path and knows nothing about where it came
+from, so `source_fingerprint()` refuses. The two builders below it capture
+the `SelectedFile` that chose the workbook, and that is the whole difference
+— the parsing is the same code.
+
+The three CSV builders share one parser. `build_csv_file_set_resource()`
+*composes* `build_file_set_resource()` rather than extending it — selection,
+ordering, membership and the file-set fingerprint stay in the generic
+layer, which also holds workbooks and arbitrary binaries, while the CSV
+wrapper owns decoding, headers, widths and cross-file agreement. See
+[decisions/0015](decisions/0015-add-first-class-csv-input-resources.md).
+
+`latest_xlsx()`, `xlsx_file()`, `xlsx_file_set()`, `latest_csv()`,
+`csv_file()` and `csv_file_set()` are the declarative forms used in task
+files; they produce a `ResourceSpec` that the context turns into a resource
+when needed.
 
 
 ## Pipelines and specs

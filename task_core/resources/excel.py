@@ -5,7 +5,6 @@ openpyxl_compat.py (level 1) for warning suppression.
 """
 
 import warnings
-from datetime import datetime, timezone
 
 import petl as etl
 from openpyxl.utils.cell import range_boundaries
@@ -13,11 +12,7 @@ from openpyxl.utils.cell import range_boundaries
 from task_core.excel_metadata import read_excel_row_metadata as _read_excel_row_metadata
 from task_core.file_access import _resolve_source_access, _ResourceSelection
 from task_core.openpyxl_compat import suppress_openpyxl_data_validation_warning
-from task_core.source_tracking import (
-    SourceFileMeta,
-    SourceFingerprint,
-    make_source_signature,
-)
+from task_core.source_tracking import single_file_fingerprint
 from task_core.types import SourceCheckError
 
 
@@ -113,30 +108,17 @@ class excel_resource:
             raise SourceCheckError(
                 f'excel_resource for {self.file_path!r} was not built with source-selection '
                 'metadata; source_fingerprint() is only supported for resources built via '
-                'build_latest_xlsx_resource()'
+                'build_latest_xlsx_resource() or build_xlsx_file_resource()'
             )
 
         sel = self._selection
-        f = sel.selected_file
-        file_meta = SourceFileMeta(
-            relative_path=f.relative_path,
-            full_path=f.path,
-            size_bytes=f.stat_result.st_size,
-            modified_at_utc=datetime.fromtimestamp(f.stat_result.st_mtime, tz=timezone.utc),
-        )
-
-        return SourceFingerprint(
-            source_key=source_key,
+        return single_file_fingerprint(
+            source_key,
             source_kind=sel.source_kind,
             root_path=sel.root_path,
             include_mask=sel.include_mask,
             recursive=sel.recursive,
-            file_count=1,
-            total_size_bytes=file_meta.size_bytes,
-            max_modified_at_utc=file_meta.modified_at_utc,
-            source_signature=make_source_signature([file_meta.to_signature_dict()]),
-            source_snapshot=[file_meta.to_snapshot_dict()],
-            store_snapshot=True,  # file metadata, not query results -- fine to persist
+            selected_file=sel.selected_file,
         )
 
     def read_excel_row_metadata(self, sheet=0, mode='outline', column=None):
@@ -386,7 +368,16 @@ class excel_resource:
 
 def build_excel_resource(file_path, *, source_access=None, excel_buffered=False, selection=None):
     source_access = _resolve_source_access(source_access)
-    file_path = source_access.select_fixed_file(file_path)
+
+    # `selection is not None` means a builder above already selected this
+    # file and captured the SelectedFile that will fingerprint it. Selecting
+    # again here would be a second filesystem check of a path already chosen,
+    # and -- worse -- would make the fingerprinted metadata and the validated
+    # path two separate observations of the source. decisions/0015 names that
+    # explicitly. A bare path still gets validated, which is what a direct
+    # build_excel_resource('...xlsx') caller expects.
+    if selection is None:
+        file_path = source_access.select_fixed_file(file_path)
 
     return excel_resource(
         file_path=file_path,
@@ -395,6 +386,51 @@ def build_excel_resource(file_path, *, source_access=None, excel_buffered=False,
         selection=selection,
     )
 
+
+def build_xlsx_file_resource(file_path, *, source_access=None, excel_buffered=False):
+    """One named workbook, tracked.
+
+    build_excel_resource() takes a path and cannot fingerprint what it
+    opened -- excel_resource.source_fingerprint() raises SourceCheckError
+    without selection metadata. This captures that metadata, which is the
+    only difference between the two. Workbook parsing is identical; this
+    adds no second Excel implementation.
+    """
+    source_access = _resolve_source_access(source_access)
+    selected = source_access.select_fixed_file_info(file_path)
+
+    selection = _ResourceSelection(
+        source_kind='fixed_file',
+        # No folder was scanned and no pattern matched, so there is nothing
+        # honest to put here. The fingerprint still identifies the file
+        # through selected_file.
+        root_path=None,
+        include_mask=None,
+        recursive=False,
+        selected_file=selected,
+    )
+    # A consequence worth stating, because it is not obvious and it is
+    # deliberate: the signature is built from relative_path, size and mtime
+    # (SourceFileMeta.to_signature_dict), and select_fixed_file_info() sets
+    # relative_path to the bare filename. So repointing this builder at a
+    # different directory holding a same-named, same-size, same-mtime file
+    # produces the *same* signature and the run is skipped. Measured, not
+    # assumed.
+    #
+    # Kept that way because it is the same property to_signature_dict()
+    # already chose on purpose for file sets -- full_path is excluded so a
+    # DFS root or mount change does not read as a source change. A fixed
+    # file has no scanned root to be relative to, so the filename is as much
+    # location as there is to keep. Folding the parent directory in here
+    # would give exact files the mount-sensitivity the rest of the module
+    # goes out of its way to avoid.
+
+    return build_excel_resource(
+        selected.path,
+        source_access=source_access,
+        excel_buffered=excel_buffered,
+        selection=selection,
+    )
 
 
 def build_latest_xlsx_resource(
@@ -411,11 +447,13 @@ def build_latest_xlsx_resource(
 ):
     source_access = _resolve_source_access(source_access)
 
-    # Select via select_file_infos() (not select_latest_file()) so the
+    # select_latest_file_info() rather than select_latest_file() so the
     # SelectedFile/stat_result used for the source_fingerprint() below is the
     # same one that picks the file to open -- no second directory listing or
-    # re-stat.
-    file_infos = source_access.select_file_infos(
+    # re-stat. This module used to re-implement that max() inline for exactly
+    # that reason; the primitive now lives in file_access.py so CSV selects
+    # identically instead of growing a third copy.
+    latest = source_access.select_latest_file_info(
         folder_path,
         pattern=pattern,
         include_hidden=include_hidden,
@@ -424,7 +462,6 @@ def build_latest_xlsx_resource(
         min_age_seconds=min_age_seconds,
         recursive=recursive,
     )
-    latest = max(file_infos, key=lambda item: (item.stat_result.st_mtime, item.path))
 
     selection = _ResourceSelection(
         source_kind='latest_file',
