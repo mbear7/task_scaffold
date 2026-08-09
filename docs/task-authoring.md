@@ -449,12 +449,27 @@ task_core itself always quotes, so publication is unaffected. See
 
 ```python
 latest_xlsx('hr/staff', pattern='*.xlsx', tracker=True)
+xlsx_file('hr/reference/grades.xlsx', tracker=True)
 xlsx_file_set('hr/ssch', pattern='*.xlsx', tracker=True)
+
+latest_csv('vendor/daily', pattern='*.csv', tracker=True)
+csv_file('vendor/reference.csv', tracker=True)
+csv_file_set('vendor/archive', pattern='*.csv', tracker=True)
+
 resource(loader, tracker=False)
 ```
 
+The matrix is deliberately symmetric: exact file, latest matching file, and
+file set, for both formats.
+
 Paths are relative to `ResourceEnvironment.base_path`. `tracker=True`
 includes the resource in source-change fingerprinting.
+
+`xlsx_file()` names one workbook outright, for a source whose filename does
+not change. It is the tracked form: `build_excel_resource()` also takes a
+path, but it does not record what selected that path, so its
+`source_fingerprint()` refuses rather than reporting a fingerprint it cannot
+stand behind.
 
 Resources return **petl tables**, whatever adapter the pipeline uses. A
 pandas pipeline converts them itself.
@@ -468,15 +483,148 @@ pandas pipeline converts them itself.
 **File-set resource** — `selected_files`, plus the same sheet and table
 accessors applied to a selected file.
 
+**CSV resource** — `get_table()`, returning one lazy petl table.
+
+**CSV file-set resource** — `files`, `open_file(selected_file)`,
+`get_table()` for the whole set as one logical table, and
+`get_file_table(selected_file)` for a single member.
+
 **DB resource** — `get_table(table=...)` or `get_table(query=...)`
 returning petl tables, with optional server-side cursors for large
 results.
+
+### Reading CSV
+
+One immutable configuration object controls parsing:
+
+```python
+VENDOR = CsvReadOptions(
+    encoding='cp1251',
+    delimiter=',',
+    header=False,
+    columns=('id', 'name', 'amount'),
+    row_width='pad_or_truncate',
+)
+
+CURRENT = csv_file('vendor/current.csv', options=VENDOR)
+ARCHIVE = csv_file_set('vendor/archive', options=VENDOR)
+```
+
+`options=` is the only parser control. The factories deliberately do not
+also accept `delimiter=` or `encoding=` beside it, so there is no
+precedence rule to remember.
+
+**The default delimiter is `;`, not `,`.** That is a project convention,
+not detection — task_core never sniffs a dialect, an encoding or a quote
+character. A comma-separated source says so: `CsvReadOptions(delimiter=',')`.
+
+**The default encoding is `utf-8-sig`.** Excel writes a byte-order mark,
+and under plain `utf-8` that mark survives into the *first column name*:
+the header parses as `﻿name` rather than `name`, nothing raises, and
+every later reference to `name` simply fails to match. `utf-8-sig` reads
+BOM-less UTF-8 equally well.
+
+Values stay strings. `001` does not become `1`, and `2026-08-07` does not
+become a date. Type conversion is the pipeline's decision.
+
+Column names are **not** database identifiers. `Employee ID`, `lev.1` and
+`Metric/Plan` are all valid CSV table columns; publication applies its own
+narrower rule, so rename before publishing. See
+[decisions/0015](decisions/0015-add-first-class-csv-input-resources.md).
+
+**Headers.** With `header=True` and no `columns`, the first non-blank
+record becomes the output header. With `columns=` declared, the first
+record is still consumed as a physical header but is ignored — columns are
+positional. That is what lets a feed whose header spelling changes between
+deliveries keep loading:
+
+```text
+file A header: ID;Name;Value
+file B header: identifier;description;amount
+output columns: id;name;value
+```
+
+With `header=False` and no `columns`, the first record defines the width,
+stays a data row, and columns are named `Column1…ColumnN`.
+
+**Row width.** `row_width` decides what happens to a record that is not
+the expected width:
+
+| mode | short row | long row |
+| --- | --- | --- |
+| `strict` (default) | error | error |
+| `pad` | pad with `''` | error |
+| `truncate` | error | drop surplus |
+| `pad_or_truncate` | pad with `''` | drop surplus |
+
+`pad` and `truncate` are one-sided on purpose. A surplus field usually
+means an unescaped delimiter rather than a sloppy writer, so a task that
+tolerates ragged short rows still hears about long ones. With `columns=`
+declared, surplus fields are always projected away — they are outside the
+declared output schema — while short rows still obey the mode above.
+
+**File sets are one logical table.** Members are parsed in selection
+order, one open at a time, and no filename or provenance column is added.
+With an inferred header, every usable member must have an *exactly* equal
+header — same text, order, case and whitespace. There is no union by name,
+no reordering and no case-insensitive matching. A mismatch raises
+`CsvReadError` when iteration reaches that member; `get_file_table()` will
+still parse that member on its own so you can see what it contains.
+
+**Errors.** Bad configuration raises `TypeError` or `ValueError` when
+`CsvReadOptions` is constructed, before any source row is read. Bad source
+content raises `CsvReadError` lazily, when traversal reaches it.
+`CsvReadError` is a direct `Exception` subclass — not a `ValueError`, so a
+guard around configuration cannot swallow a data problem, and not a
+`PipelineError`, because a malformed vendor file is not a broken pipeline
+contract. Missing paths and permission failures keep their native
+filesystem types.
+
+#### CSV tables are lazy, and a traversal is a file read
+
+`get_table()` reads nothing. Every traversal re-opens and re-parses the
+source, which is what keeps memory bounded on the way into a `COPY`
+publication — and what makes repeated traversal cost real work:
+
+```python
+table = source.get_table()
+
+etl.nrows(table)   # first read of the file
+return table       # the runner reads it again
+```
+
+If the file changes between those two reads, the two consumers see
+different bytes at the same path. The runner protects its own multi-
+consumer path by stabilizing the returned table, but it cannot see
+traversals a pipeline performs internally before returning.
+
+Two specific costs worth knowing:
+
+- **`list(table)` traverses twice.** This is petl's own behaviour on every
+  table, not something CSV adds: `IterContainer.__len__` counts by
+  iterating, and `list()`/`tuple()` call it to pre-size before iterating
+  again. Use `table.list()` or a plain `for` loop, both of which traverse
+  once.
+- **`.todf()` is eager.** Converting to a pandas DataFrame materializes
+  the whole table, which for a large CSV or file set can consume
+  substantially more memory than the source files themselves.
 
 ### Selection
 
 A file set selects with `select_latest_file`, `select_fixed_file`, or all
 matching files. Hidden, system and Excel temporary files (`~$…`) are
 excluded by default.
+
+`select_latest_file_info()` and `select_fixed_file_info()` are the same two
+selections returning the `SelectedFile` — path, path relative to the scanned
+root, and the `stat_result` — rather than the path alone. Tracked resources
+use those, because the size and modification time that go into a fingerprint
+have to come from the selection itself; re-statting the path afterwards
+would describe a second observation of the file, not the one that was
+chosen.
+
+Latest selection breaks ties on the path, so two files sharing a
+modification time still resolve to the same one on every run.
 
 
 ## run_pipelines()

@@ -168,15 +168,39 @@ class source_access:
         pattern_norm = pattern.replace('\\', '/')
         return fnmatch(name, pattern) or fnmatch(rel_path_norm, pattern_norm)
 
-    def select_fixed_file(self, path):
+    def select_fixed_file_info(self, path):
+        """One named file, with the metadata needed to fingerprint it.
+
+        The counterpart to select_latest_file_info() for exact selection.
+        Returning the SelectedFile is what makes a fixed-file resource
+        trackable at all: a resource built from a bare path has no
+        stat_result to fingerprint, which is why excel_resource raises
+        SourceCheckError when it was built without selection metadata.
+
+        The local branch stats. select_fixed_file() historically did not --
+        exists()/is_file() answer the validity question without one -- so
+        this is one extra syscall on that path, accepted because the
+        stat_result is the whole point of the *_info variant. The two
+        existence checks stay in front of it so the error messages are
+        unchanged, including the Path-normalized separators in the local
+        branch's message.
+
+        relative_path is the bare filename. There is no scan root for an
+        exact selection, and the local scanner already falls back to
+        fn.name when a file is not under the root it was scanned from.
+        """
         path = str(path)  # same reasoning as _stat/open_binary/select_file_infos
         if not self._use_smb(path):
-            path = Path(path)
-            if not path.exists():
-                raise FileNotFoundError(f'File not found: {path}')
-            if not path.is_file():
-                raise FileNotFoundError(f'Path is not a file: {path}')
-            return str(path)
+            local = Path(path)
+            if not local.exists():
+                raise FileNotFoundError(f'File not found: {local}')
+            if not local.is_file():
+                raise FileNotFoundError(f'Path is not a file: {local}')
+            return SelectedFile(
+                path=str(local),
+                relative_path=local.name,
+                stat_result=local.stat(),
+            )
 
         try:
             st = self._stat(path)
@@ -186,7 +210,16 @@ class source_access:
         if not stat.S_ISREG(st.st_mode):
             raise FileNotFoundError(f'Path is not a file: {path}')
 
-        return str(path)
+        # Backslash-joined like the SMB scanner's relative paths, so a UNC
+        # path yields the same shape of name the file-set branch produces.
+        return SelectedFile(
+            path=str(path),
+            relative_path=str(path).replace('/', '\\').rsplit('\\', 1)[-1],
+            stat_result=st,
+        )
+
+    def select_fixed_file(self, path):
+        return self.select_fixed_file_info(path).path
 
     def select_file_infos(
         self,
@@ -384,6 +417,42 @@ class source_access:
             )
         ]
 
+    def select_latest_file_info(
+        self,
+        folder_path,
+        pattern='*',
+        *,
+        include_hidden=False,
+        include_system=False,
+        include_temp=False,
+        min_age_seconds=None,
+        recursive=False,
+    ):
+        """The newest matching file, with the metadata that chose it.
+
+        Returns the SelectedFile rather than a path, so a resource builder
+        can open that exact file *and* fingerprint it without a second
+        directory listing or re-stat. resources/excel.py used to re-implement
+        this max() for precisely that reason; that duplicate is now this
+        function.
+
+        The key is (st_mtime, path). The path tie-breaker is load-bearing:
+        two files written in the same clock tick would otherwise select
+        non-deterministically, and a source-change check that flips between
+        two files reports spurious changes. It compares the full path as a
+        case-sensitive string, which is what it has always done.
+        """
+        files = self.select_file_infos(
+            folder_path,
+            pattern=pattern,
+            include_hidden=include_hidden,
+            include_system=include_system,
+            include_temp=include_temp,
+            min_age_seconds=min_age_seconds,
+            recursive=recursive,
+        )
+        return max(files, key=lambda item: (item.stat_result.st_mtime, item.path))
+
     def select_latest_file(
         self,
         folder_path,
@@ -395,7 +464,7 @@ class source_access:
         min_age_seconds=None,
         recursive=False,
     ):
-        files = self.select_file_infos(
+        return self.select_latest_file_info(
             folder_path,
             pattern=pattern,
             include_hidden=include_hidden,
@@ -403,9 +472,7 @@ class source_access:
             include_temp=include_temp,
             min_age_seconds=min_age_seconds,
             recursive=recursive,
-        )
-        latest = max(files, key=lambda item: (item.stat_result.st_mtime, item.path))
-        return latest.path
+        ).path
 
     @contextmanager
     def open_binary(self, path, *, buffered=False):
@@ -540,6 +607,10 @@ def _resolve_source_access(source_access=None):
     return LOCAL_FILE_ACCESS if source_access is None else source_access
 
 
+def select_fixed_file_info(path, *, source_access=None):
+    return _resolve_source_access(source_access).select_fixed_file_info(path)
+
+
 def select_fixed_file(path, *, source_access=None):
     return _resolve_source_access(source_access).select_fixed_file(path)
 
@@ -609,6 +680,28 @@ def select_latest_file(
     source_access=None,
 ):
     return _resolve_source_access(source_access).select_latest_file(
+        folder_path,
+        pattern=pattern,
+        include_hidden=include_hidden,
+        include_system=include_system,
+        include_temp=include_temp,
+        min_age_seconds=min_age_seconds,
+        recursive=recursive,
+    )
+
+
+def select_latest_file_info(
+    folder_path,
+    pattern='*',
+    *,
+    include_hidden=False,
+    include_system=False,
+    include_temp=False,
+    min_age_seconds=None,
+    recursive=False,
+    source_access=None,
+):
+    return _resolve_source_access(source_access).select_latest_file_info(
         folder_path,
         pattern=pattern,
         include_hidden=include_hidden,

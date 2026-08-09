@@ -6,7 +6,7 @@ on task_core.types (for SourceCheckError).
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -57,6 +57,52 @@ class SourceFingerprint:
 
 # MD5 is acceptable here: this is a non-security change-detection digest
 # over file metadata, not a security hash.
+def file_meta_from_selected(selected_file):
+    """SourceFileMeta from a SelectedFile.
+
+    Duck-typed on the three attributes it reads rather than importing
+    file_access.SelectedFile: that module is the same level as this one,
+    and this module deliberately depends on nothing but types.py.
+    """
+    return SourceFileMeta(
+        relative_path=selected_file.relative_path,
+        full_path=selected_file.path,
+        size_bytes=selected_file.stat_result.st_size,
+        modified_at_utc=datetime.fromtimestamp(
+            selected_file.stat_result.st_mtime, tz=timezone.utc,
+        ),
+    )
+
+
+def single_file_fingerprint(
+    source_key, *, source_kind, root_path, include_mask, recursive,
+    selected_file,
+):
+    """The fingerprint of exactly one selected file.
+
+    Shared by every single-file resource -- workbooks and CSV alike -- so
+    that the three of them cannot drift into describing the same selection
+    differently. The expression was already duplicated once between
+    resources/excel.py and its latest-file builder before 0.7.7; a third
+    copy for CSV is what this exists to prevent.
+    """
+    meta = file_meta_from_selected(selected_file)
+    return SourceFingerprint(
+        source_key=source_key,
+        source_kind=source_kind,
+        root_path=root_path,
+        include_mask=include_mask,
+        recursive=recursive,
+        file_count=1,
+        total_size_bytes=meta.size_bytes,
+        max_modified_at_utc=meta.modified_at_utc,
+        source_signature=make_source_signature([meta.to_signature_dict()]),
+        source_snapshot=[meta.to_snapshot_dict()],
+        # File metadata, not query results -- fine to persist.
+        store_snapshot=True,
+    )
+
+
 def make_source_signature(payload):
     normalized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     return hashlib.md5(normalized.encode('utf-8')).hexdigest()

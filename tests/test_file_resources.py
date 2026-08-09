@@ -18,7 +18,11 @@ import petl as etl
 import task_core as tc
 from task_core.file_access import NoMatchingFilesError
 from task_core.file_access import source_access as FileAccessImpl
-from task_core.resources.excel import build_latest_xlsx_resource
+from task_core.resources.excel import (
+    build_excel_resource,
+    build_latest_xlsx_resource,
+    build_xlsx_file_resource,
+)
 from task_core.resources.file_set import build_file_set_resource
 
 
@@ -1197,6 +1201,267 @@ class Test19ExcelResourceCloseDropsTheWorkbookBeforeCollecting(unittest.TestCase
 
             self.assertEqual(len(exits), 1)
 
+
+
+class Test20SelectionInfoPrimitivesAreTheOneImplementation(unittest.TestCase):
+    """Exact and latest selection return the metadata that chose the file.
+
+    Before decisions/0015 the latest-file max() existed twice --
+    file_access.select_latest_file() computed it and threw the SelectedFile
+    away, so resources/excel.py re-implemented it byte-identically to keep
+    the stat_result it needed for fingerprinting. CSV would have been a
+    third copy. These tests pin the behaviour the single primitive must
+    keep.
+    """
+
+    def test_latest_info_and_latest_path_agree(self):
+        with TempDir() as d:
+            for name in ('a.xlsx', 'b.xlsx'):
+                _write(d / name)
+            os.utime(d / 'b.xlsx', (time.time() + 3600,) * 2)
+
+            info = tc.select_latest_file_info(str(d), '*.xlsx')
+            self.assertEqual(info.path, tc.select_latest_file(str(d), '*.xlsx'))
+            self.assertEqual(Path(info.path).name, 'b.xlsx')
+
+    def test_equal_mtimes_are_broken_by_path_deterministically(self):
+        """The tie-breaker is load-bearing, not decoration.
+
+        Two files written in the same clock tick would otherwise select by
+        whatever order the directory scan happened to return, and a
+        source-change check that flips between them reports a change on
+        every run. Asserted with the scan order reversed as well, so a
+        coincidence of glob order cannot make this pass.
+        """
+        with TempDir() as d:
+            for name in ('a.xlsx', 'b.xlsx', 'c.xlsx'):
+                _write(d / name)
+            stamp = 1_700_000_000
+            for name in ('a.xlsx', 'b.xlsx', 'c.xlsx'):
+                os.utime(d / name, (stamp, stamp))
+
+            picked = tc.select_latest_file_info(str(d), '*.xlsx')
+            self.assertEqual(Path(picked.path).name, 'c.xlsx')
+
+            class ReversedAccess(FileAccessImpl):
+                def select_file_infos(self, *a, **kw):
+                    return list(reversed(super().select_file_infos(*a, **kw)))
+
+            reversed_pick = ReversedAccess().select_latest_file_info(
+                str(d), '*.xlsx',
+            )
+            self.assertEqual(
+                Path(reversed_pick.path).name, 'c.xlsx',
+                'latest selection depended on directory scan order',
+            )
+
+    def test_fixed_info_carries_stat_and_agrees_with_the_path_form(self):
+        with TempDir() as d:
+            _write(d / 'one.xlsx', b'abcd')
+
+            info = tc.select_fixed_file_info(str(d / 'one.xlsx'))
+            self.assertEqual(info.path, tc.select_fixed_file(str(d / 'one.xlsx')))
+            self.assertEqual(info.relative_path, 'one.xlsx')
+            self.assertEqual(info.stat_result.st_size, 4)
+
+    def test_fixed_info_keeps_the_existing_error_messages(self):
+        """Delegating select_fixed_file() to the _info variant added a stat
+        to the local branch. The messages a task author sees must not move
+        with it."""
+        with TempDir() as d:
+            with self.assertRaises(FileNotFoundError) as missing:
+                tc.select_fixed_file_info(str(d / 'nope.xlsx'))
+            self.assertIn('File not found:', str(missing.exception))
+
+            with self.assertRaises(FileNotFoundError) as not_a_file:
+                tc.select_fixed_file_info(str(d))
+            self.assertIn('Path is not a file:', str(not_a_file.exception))
+
+
+class Test21ExactXlsxIsTrackable(unittest.TestCase):
+    """xlsx_file() exists because a bare path could not be fingerprinted.
+
+    build_excel_resource() takes a path and stores selection=None, so
+    excel_resource.source_fingerprint() raised SourceCheckError for every
+    fixed-file workbook. That was the real gap; the factory is the
+    convenience on top of closing it.
+    """
+
+    def test_a_fixed_file_resource_can_be_fingerprinted(self):
+        with TempDir() as d:
+            _write_xlsx(d / 'book.xlsx')
+            resource = build_xlsx_file_resource(
+                str(d / 'book.xlsx'), source_access=tc.LOCAL_FILE_ACCESS,
+            )
+            self.addCleanup(resource.close)
+
+            fingerprint = resource.source_fingerprint('book')
+            self.assertEqual(fingerprint.source_kind, 'fixed_file')
+            self.assertEqual(fingerprint.file_count, 1)
+
+    def test_a_bare_path_resource_still_refuses_to_fingerprint(self):
+        """The old builder keeps its old behaviour. xlsx_file() is the way
+        to get a tracked exact file, not a silent upgrade of every caller."""
+        with TempDir() as d:
+            _write_xlsx(d / 'book.xlsx')
+            resource = build_excel_resource(
+                str(d / 'book.xlsx'), source_access=tc.LOCAL_FILE_ACCESS,
+            )
+            self.addCleanup(resource.close)
+
+            with self.assertRaises(tc.SourceCheckError) as refused:
+                resource.source_fingerprint('book')
+
+            # The message tells the author which builder to reach for, so it
+            # has to keep naming all of them. It named only the latest-file
+            # builder until xlsx_file() became a second answer.
+            self.assertIn(
+                'build_xlsx_file_resource()', str(refused.exception),
+                'the fingerprint refusal does not mention the exact-file '
+                'builder that would satisfy it',
+            )
+
+    def test_construction_selects_exactly_once(self):
+        """decisions/0015 forbids re-selecting a captured SelectedFile.
+
+        build_latest_xlsx_resource() used to hand its already-selected path
+        to build_excel_resource(), which called select_fixed_file() on it --
+        a second filesystem check of a file already chosen, and a second
+        observation of a source the fingerprint claims to describe.
+        """
+        with TempDir() as d:
+            _write_xlsx(d / 'book.xlsx')
+            calls = {'fixed': 0, 'fixed_info': 0, 'latest_info': 0}
+
+            class CountingAccess(FileAccessImpl):
+                def select_fixed_file(self, *a, **kw):
+                    calls['fixed'] += 1
+                    return super().select_fixed_file(*a, **kw)
+
+                def select_fixed_file_info(self, *a, **kw):
+                    calls['fixed_info'] += 1
+                    return super().select_fixed_file_info(*a, **kw)
+
+                def select_latest_file_info(self, *a, **kw):
+                    calls['latest_info'] += 1
+                    return super().select_latest_file_info(*a, **kw)
+
+            exact = build_xlsx_file_resource(
+                str(d / 'book.xlsx'), source_access=CountingAccess(),
+            )
+            self.addCleanup(exact.close)
+            # calls['fixed'] is asserted first deliberately. select_fixed_file()
+            # now delegates to select_fixed_file_info() on self, so a
+            # re-selection bumps *both* counters -- and if the count assertion
+            # came first it would fire with a bare '2 != 1', hiding the named
+            # message behind an unreachable line. Checked by running the
+            # revert, not assumed.
+            self.assertEqual(
+                calls['fixed'], 0,
+                'the captured SelectedFile was re-selected by path',
+            )
+            self.assertEqual(
+                calls['fixed_info'], 1,
+                'construction did not select the file exactly once',
+            )
+
+            calls.update(fixed=0, fixed_info=0, latest_info=0)
+            latest = build_latest_xlsx_resource(
+                str(d), pattern='*.xlsx', source_access=CountingAccess(),
+            )
+            self.addCleanup(latest.close)
+            self.assertEqual(calls['latest_info'], 1)
+            self.assertEqual(
+                calls['fixed'], 0,
+                'build_latest_xlsx_resource re-selected its chosen file',
+            )
+
+
+class Test22ExactAndLatestFingerprintsDetectChange(unittest.TestCase):
+    """Change detection was only ever tested for build_file_set_resource.
+
+    The latest-file resource had tests that it does not re-list and does not
+    open the workbook, but nothing asserted its signature actually moves
+    when the selected file changes. The exact-file resource is new. Both
+    are written here rather than inherited as a hole.
+    """
+
+    def _exact(self, path):
+        resource = build_xlsx_file_resource(
+            str(path), source_access=tc.LOCAL_FILE_ACCESS,
+        )
+        self.addCleanup(resource.close)
+        return resource.source_fingerprint('book').source_signature
+
+    def _latest(self, folder):
+        resource = build_latest_xlsx_resource(
+            str(folder), pattern='*.xlsx', source_access=tc.LOCAL_FILE_ACCESS,
+        )
+        self.addCleanup(resource.close)
+        return resource.source_fingerprint('book').source_signature
+
+    def test_exact_file_size_change_moves_the_signature(self):
+        with TempDir() as d:
+            _write(d / 'book.xlsx', b'x')
+            before = self._exact(d / 'book.xlsx')
+            _write(d / 'book.xlsx', b'xxxxxx')
+            self.assertNotEqual(before, self._exact(d / 'book.xlsx'))
+
+    def test_exact_file_mtime_change_moves_the_signature(self):
+        with TempDir() as d:
+            _write(d / 'book.xlsx', b'x')
+            before = self._exact(d / 'book.xlsx')
+            os.utime(d / 'book.xlsx', (time.time() + 3600,) * 2)
+            self.assertNotEqual(before, self._exact(d / 'book.xlsx'))
+
+    def test_an_unchanged_exact_file_keeps_its_signature(self):
+        with TempDir() as d:
+            _write(d / 'book.xlsx', b'x')
+            self.assertEqual(
+                self._exact(d / 'book.xlsx'), self._exact(d / 'book.xlsx'),
+            )
+
+    def test_the_directory_is_not_part_of_an_exact_file_signature(self):
+        """Pins a deliberate insensitivity, so it cannot drift unnoticed.
+
+        SourceFileMeta.to_signature_dict() excludes full_path on purpose --
+        a DFS root or mount change must not read as a source change -- and
+        a fixed file's relative_path is the bare filename. The consequence
+        is that the same filename with the same size and mtime in a
+        different directory is the same signature. That is the intended
+        trade; this test is here so that changing it has to be a decision
+        rather than an accident.
+        """
+        with TempDir() as one, TempDir() as two:
+            for folder in (one, two):
+                _write(folder / 'book.xlsx', b'identical bytes')
+                os.utime(folder / 'book.xlsx', (1_700_000_000,) * 2)
+
+            self.assertEqual(
+                self._exact(one / 'book.xlsx'), self._exact(two / 'book.xlsx'),
+                'the parent directory leaked into an exact-file signature',
+            )
+
+            # The filename itself is still load-bearing -- the insensitivity
+            # is to location, not to identity.
+            _write(two / 'other.xlsx', b'identical bytes')
+            os.utime(two / 'other.xlsx', (1_700_000_000,) * 2)
+            self.assertNotEqual(
+                self._exact(one / 'book.xlsx'), self._exact(two / 'other.xlsx'),
+            )
+
+    def test_latest_selecting_a_different_file_moves_the_signature(self):
+        with TempDir() as d:
+            _write(d / 'a.xlsx', b'x')
+            before = self._latest(d)
+
+            _write(d / 'b.xlsx', b'yy')
+            os.utime(d / 'b.xlsx', (time.time() + 3600,) * 2)
+            self.assertNotEqual(
+                before, self._latest(d),
+                'a newer file became the selection without changing the '
+                'fingerprint',
+            )
 
 
 if __name__ == '__main__':

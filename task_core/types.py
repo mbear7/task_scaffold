@@ -194,6 +194,44 @@ def validate_db_loader(
     return value
 
 
+# What a CSV reader does with a record whose field count is not the
+# expected width. Same engine-neutral vocabulary rule as the two above.
+#
+#   strict            short -> error   long -> error
+#   pad               short -> ''      long -> error
+#   truncate          short -> error   long -> drop surplus
+#   pad_or_truncate   short -> ''      long -> drop surplus
+#
+# 'pad' and 'truncate' are one-sided on purpose, and the asymmetry is the
+# whole point of having four values rather than three: a task that expects
+# ragged short rows still wants to hear about a row that is too long,
+# because a surplus field usually means an unescaped delimiter rather than
+# a sloppy writer. Making 'truncate' also pad would leave it indistinguish-
+# able from 'pad_or_truncate'. See decisions/0015.
+ROW_WIDTH_MODES = ('strict', 'pad', 'truncate', 'pad_or_truncate')
+
+
+def validate_row_width(
+    value, *, field_name='row_width', error_type=ValueError,
+):
+    """Validate one row-width mode at any public boundary.
+
+    Lives here rather than in resources/csv.py for the same reason the two
+    validators above do: the vocabulary is the contract, and a second copy
+    of it inside the resource layer is how the spec path and the direct
+    path drift apart.
+    """
+    if not isinstance(value, str):
+        raise error_type(
+            f'{field_name} must be a str, got {type(value).__name__}'
+        )
+    if value not in ROW_WIDTH_MODES:
+        raise error_type(
+            f'{field_name} must be one of {ROW_WIDTH_MODES}, got {value!r}'
+        )
+    return value
+
+
 @runtime_checkable
 class DbRowSource(Protocol):
     """One-shot iterator over positional rows for a DbPayload.
