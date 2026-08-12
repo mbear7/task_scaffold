@@ -17,3 +17,10 @@ __pycache__/
 /psycopg2/
 /petl_util.py
 /.claude/
+
+# Live verification scripts: they need a real SMB share, real credentials
+# and a real PostgreSQL, so they cannot run in the offline suite and are
+# deliberately not part of it. Kept in the tree so they survive rather
+# than living in a temp directory, but never committed -- they encode
+# infrastructure paths and are run by hand.
+/local_tests/

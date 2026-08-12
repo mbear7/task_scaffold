@@ -390,6 +390,25 @@ class TestFilesystemFailuresKeepTheirOwnType(unittest.TestCase):
         handler within a filesystem handler is still reported. No such shape
         exists in task_core, and for a tripwire an unnecessary review beats a
         silent miss.
+
+        One further allowance, added in 0.7.8 for a case measured against a
+        real SMB share rather than imagined: `except OSError` may raise
+        `FileNotFoundError` when the handler also contains a bare `raise`.
+
+        smbclient signals a missing file with `SMBOSError`, which subclasses
+        `OSError` *directly* and is not a `FileNotFoundError` -- so
+        `except FileNotFoundError` around a remote stat can never fire, and
+        the whole point of catching is to give ENOENT the builtin type
+        Python itself uses for it everywhere else. Without this, task_core
+        would raise `FileNotFoundError` for a missing local file and
+        something else entirely for a missing remote one, from the same
+        function.
+
+        The bare `raise` is what makes it safe and is why it is required
+        here: it is the escape hatch that sends every non-ENOENT failure --
+        permission, transport -- onward with its own type untouched, which
+        is the property this whole class exists to protect. A handler that
+        converts unconditionally has no such raise and is still reported.
         """
         offenders = []
         for node in ast.walk(ast.parse(source)):
@@ -399,6 +418,16 @@ class TestFilesystemFailuresKeepTheirOwnType(unittest.TestCase):
             if not set(caught) & cls.FILESYSTEM:
                 continue
             bound = node.name
+            # See the docstring: an errno-guarded ENOENT normalization is
+            # allowed, and the bare raise is the evidence that everything
+            # else keeps its own type.
+            errno_guarded = (
+                caught == ['OSError']
+                and any(
+                    isinstance(inner, ast.Raise) and inner.exc is None
+                    for inner in ast.walk(node)
+                )
+            )
             for inner in ast.walk(node):
                 if not isinstance(inner, ast.Raise) or inner.exc is None:
                     continue
@@ -412,6 +441,8 @@ class TestFilesystemFailuresKeepTheirOwnType(unittest.TestCase):
                 raised = cls._raised_name(inner)
                 # Reconstructing the one class this handler caught.
                 if len(caught) == 1 and raised == caught[0]:
+                    continue
+                if errno_guarded and raised == 'FileNotFoundError':
                     continue
                 offenders.append(
                     f'{label}:{inner.lineno} catches '
@@ -442,6 +473,12 @@ class TestFilesystemFailuresKeepTheirOwnType(unittest.TestCase):
                 're-raise of the bound name from a tuple handler',
                 'try:\n    pass\nexcept (FileNotFoundError, PermissionError) as exc:\n'
                 '    raise exc\n',
+            ),
+            (
+                'errno-guarded ENOENT normalization',
+                'try:\n    pass\nexcept OSError as e:\n'
+                '    if e.errno != errno.ENOENT:\n        raise\n'
+                "    raise FileNotFoundError('File not found') from e\n",
             ),
         )
         for label, source in allowed:
@@ -477,6 +514,24 @@ class TestFilesystemFailuresKeepTheirOwnType(unittest.TestCase):
             ('reconstructed class from a tuple handler',
              'try:\n    pass\nexcept (FileNotFoundError, PermissionError) as exc:\n'
              "    raise FileNotFoundError('x') from exc\n"),
+            # The ENOENT allowance must stay narrow. Each of these is
+            # one property short of it, and each must still be caught --
+            # otherwise the allowance is a hole rather than an exception.
+            ('OSError to FileNotFoundError with no bare-raise escape',
+             'try:\n    pass\nexcept OSError as e:\n'
+             "    raise FileNotFoundError('x') from e\n"),
+            ('the allowance does not extend to other native types',
+             'try:\n    pass\nexcept OSError as e:\n'
+             '    if e.errno != errno.ENOENT:\n        raise\n'
+             "    raise PermissionError('x') from e\n"),
+            ('the allowance does not extend to task_core types',
+             'try:\n    pass\nexcept OSError as e:\n'
+             '    if e.errno != errno.ENOENT:\n        raise\n'
+             "    raise DbPublishError('x') from e\n"),
+            ('the allowance does not extend to a tuple handler',
+             'try:\n    pass\nexcept (OSError, ValueError) as e:\n'
+             '    if True:\n        raise\n'
+             "    raise FileNotFoundError('x') from e\n"),
         )
         for label, source in forbidden:
             with self.subTest(forbidden=label):

@@ -1027,14 +1027,32 @@ characters.
 
 ### pandas missing values
 
-pandas 3 defaults object columns to `StringDtype`, which converts `None`
-to `nan`. When building a DataFrame that must preserve `None`, be explicit
-about dtype, and prefer `fromdataframe_preserve_none()` over
-`etl.fromdataframe()` when converting back.
+pandas 3 infers a plain string column as its own `str`/`StringDtype`
+rather than `object`, and that dtype's missing marker is `nan`, not
+`None` — so a `None` you pass in at construction is gone by the time the
+DataFrame exists, converted before any code of yours runs. Confirmed
+directly: this happens even when data reaches the constructor through an
+intermediate call like `pd.array(..., dtype=object)`, which pandas 3 does
+not honour for string data.
+
+What does work, confirmed directly: passing `dtype=object` straight to
+`pd.Series(...)` or `pd.DataFrame(...)` at construction preserves `None`
+exactly. What does not: calling `.astype(object)` afterwards on a
+DataFrame pandas already built with its own inference — by then the
+`None` has already become `nan`, and `.astype(object)` only relabels the
+container; the original value is gone. The dtype has to be explicit at
+construction, not fixed up after.
+
+If you're handed a DataFrame you didn't build (already inferred, `nan`
+standing in for `None`), recover it before conversion the way
+`from_pandas()` (`task_core/db/payload.py`) already does internally:
+`df.astype(object).where(df.notna(), None)`. `petl.fromdataframe()` takes
+the DataFrame as given and has no missing-value handling of its own, so
+this has to happen before that call, not instead of it.
 
 `normalize_for_excel()` and the DB payload path both convert every flavour
-of missing value to `None`, but one-element containers are values, not
-scalars, and are left alone.
+of missing value to `None` on the way out of the scaffold, but one-element
+containers are values, not scalars, and are left alone.
 
 ### `types` shadowing
 

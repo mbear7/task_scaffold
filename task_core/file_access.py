@@ -10,6 +10,7 @@ resources/excel.py (level 2) would make this module (level 1) import
 upward, which the package's own layering rule forbids.
 """
 
+import errno
 import gc
 import io
 import stat
@@ -185,6 +186,9 @@ class source_access:
         unchanged, including the Path-normalized separators in the local
         branch's message.
 
+        The SMB branch reports the same 'File not found:' message, which
+        before 0.7.8 it only appeared to: see the errno comment below.
+
         relative_path is the bare filename. There is no scan root for an
         exact selection, and the local scanner already falls back to
         fn.name when a file is not under the root it was scanned from.
@@ -204,7 +208,20 @@ class source_access:
 
         try:
             st = self._stat(path)
-        except FileNotFoundError as e:
+        except OSError as e:
+            # OSError, not FileNotFoundError. Measured against a real
+            # share: smbclient raises SMBOSError, which subclasses OSError
+            # *directly* and is not a FileNotFoundError, so the narrower
+            # clause this replaces could never fire and the normalized
+            # message it promised never appeared on the SMB path. It read
+            # as working code for as long as nobody tested against SMB.
+            #
+            # errno is checked rather than the type, so a permission or
+            # transport failure keeps its own type and message -- ADR 0015
+            # section 29 requires native filesystem errors to stay native,
+            # and only "not found" is being translated here.
+            if e.errno != errno.ENOENT:
+                raise
             raise FileNotFoundError(f'File not found: {path}') from e
 
         if not stat.S_ISREG(st.st_mode):
@@ -337,7 +354,12 @@ class source_access:
     ):
         try:
             root_st = self._stat(folder_path)
-        except FileNotFoundError as e:
+        except OSError as e:
+            # Same dead-clause problem as select_fixed_file_info above, for
+            # the same measured reason: SMBOSError is not a
+            # FileNotFoundError. Non-ENOENT failures propagate untouched.
+            if e.errno != errno.ENOENT:
+                raise
             raise FileNotFoundError(f'Path not found: {folder_path}') from e
 
         if stat.S_ISREG(root_st.st_mode):

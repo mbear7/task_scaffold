@@ -237,8 +237,24 @@ class _PandasAdapter:
         # at all, so this is the only path that can ever catch it), or a
         # genuinely mixed column. Same per-value duck-typed check the
         # petl adapter uses via etl.convertall(tbl, normalize_for_excel).
-        for col in df.select_dtypes(include=['object']).columns:
-            df[col] = df[col].map(normalize_for_excel)
+        #
+        # A direct dtype check, not select_dtypes(include=['object']):
+        # pandas 3's default string dtype triggers Pandas4Warning there
+        # ("'str' dtypes are included ... for backward compatibility ...
+        # deprecated"), and the fix is not to add 'str' to include --
+        # confirmed directly that raises TypeError under pandas 2's
+        # select_dtypes ("numpy string dtypes are not allowed"), so a
+        # single include list cannot serve both majors at once. A
+        # genuine string-dtype column needs neither correction this loop
+        # makes: it cannot hold a tz-aware value (pandas enforces the
+        # dtype), and a missing value in it is already caught by the
+        # unconditional per-column scan below regardless of dtype.
+        # Confirmed directly, including with the compat inclusion
+        # switched off: the round trip through this method is identical
+        # either way.
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].map(normalize_for_excel)
 
         # Numeric/datetime-dtype columns with a missing value: confirmed
         # directly that pandas's own df.to_excel() already treats an

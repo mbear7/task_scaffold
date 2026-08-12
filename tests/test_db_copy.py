@@ -3120,5 +3120,112 @@ class Test25DeclaredFastPathMatchesTheGenericSerializerByte(unittest.TestCase):
                     )
 
 
+class Test26FrameworkColumnPinsSurviveInferenceInCopyMode(unittest.TestCase):
+    """`framework_columns` overrides inference for the technical timestamp
+    that `db_updated_at` appends.
+
+    The nullability half was already covered end to end, at the export
+    level: test_db_publish Test17e
+    test_db_updated_at_framework_column_is_appended_and_constant asserts
+    nullable=False through _prepare_copy_source_for_pipeline. What was
+    not covered is the TYPE half -- and it could not have been, from the
+    values apply_db_updated_at actually emits. Those are timezone-aware,
+    and inference reads an aware datetime as timezone=True on its own, so
+    a pin that silently stopped applying its type would leave every
+    existing assertion passing. Feeding naive datetimes is what separates
+    the two, which is why this class exists rather than an extra
+    assertion on Test17e.
+
+    The copy suite itself passed `framework_columns` exactly zero times
+    across about twenty prepare_copy_source calls before this, so the
+    unit-level contract -- pin applies to its own column, and to no other
+    -- was unpinned as well.
+
+    Declared mode is not tested here on purpose: per the
+    prepare_copy_source docstring the override is a no-op there, because
+    declared columns already carry their pinned type. Inferred mode is
+    the only mode where the mechanism does work.
+    """
+
+    def _framework_ts(self):
+        return ResolvedColumn(
+            'etl_updated_at', sa.DateTime(timezone=True), nullable=False,
+        )
+
+    def test_pin_overrides_inference_on_both_type_and_nullability(self):
+        # Deliberately naive datetimes. apply_db_updated_at emits aware
+        # ones, so this is not a claim about what the framework produces
+        # -- it is the only input that makes the pin observable on BOTH
+        # axes at once. Inference reads naive data as timezone=False and
+        # every column as nullable=True, so if the pin stops being
+        # applied both assertions flip. Measured directly: with the pin
+        # removed inference gives (timezone=False, nullable=True).
+        naive = datetime(2026, 8, 12, 9, 30)
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=iter([('000042', naive), ('000043', naive)]),
+                columns=['emp_id', 'etl_updated_at'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+                framework_columns=(self._framework_ts(),),
+            )
+            stamp = prepared.columns[1]
+            self.assertTrue(
+                stamp.type.timezone,
+                'framework pin lost: etl_updated_at resolved timezone-naive, '
+                'so inference overrode the pinned TIMESTAMPTZ contract'
+            )
+            self.assertFalse(
+                stamp.nullable,
+                'framework pin lost: etl_updated_at resolved nullable, but '
+                'the framework timestamp is NOT NULL by contract'
+            )
+
+    def test_pinned_stamp_leaves_inferred_text_columns_alone(self):
+        # The shape a CSV task actually publishes: every user column
+        # arrives as text (leading zeros and Cyrillic intact, empty field
+        # preserved), with one pinned timestamp beside them. The pin must
+        # apply to its own column and to no other.
+        ts = datetime(2026, 8, 12, 9, 30, tzinfo=timezone.utc)
+        ident = _make_identity()
+        with tempfile.TemporaryDirectory() as tmp:
+            prepared = prepare_copy_source(
+                row_source=iter([
+                    ('000042', 'Иванов И.И.', 'ops', ts),
+                    ('000043', 'Петров П.П.', '', ts),
+                ]),
+                columns=['emp_id', 'full_name', 'dept', 'etl_updated_at'],
+                declared_schema=None,
+                identity=ident,
+                directory=Path(tmp),
+                framework_columns=(self._framework_ts(),),
+            )
+            user_columns = prepared.columns[:3]
+            self.assertTrue(
+                all(c.nullable for c in user_columns),
+                f'the pin leaked onto inferred user columns: '
+                f'{[(c.name, c.nullable) for c in user_columns]}'
+            )
+            self.assertEqual(
+                [type(c.type).__name__ for c in user_columns],
+                ['Text', 'Text', 'Text'],
+                'CSV user columns no longer infer as text'
+            )
+            self.assertFalse(prepared.columns[3].nullable)
+
+            body = _read_copytext_body(prepared)
+            self.assertEqual(
+                body.decode('utf-8').splitlines(),
+                [
+                    '000042\tИванов И.И.\tops\t2026-08-12 09:30:00+00:00',
+                    '000043\tПетров П.П.\t\t2026-08-12 09:30:00+00:00',
+                ],
+                'pinned timestamp did not serialize with its UTC offset, or '
+                'a user field was altered by the pin'
+            )
+
+
 if __name__ == '__main__':
     unittest.main()

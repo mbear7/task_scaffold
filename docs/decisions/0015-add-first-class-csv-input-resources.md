@@ -1801,7 +1801,7 @@ The complete repository-mandated normal and `-O` verification remains required i
 
 ## Verification status
 
-As of 0.7.7, implemented and verified.
+As of 0.7.8, implemented and verified.
 
 Measured offline, in the suite: the parser contract, the header/width state
 machine, the construction-versus-iteration exception boundary, laziness and
@@ -1810,8 +1810,9 @@ cross-file header agreement and one-member-at-a-time traversal.
 
 Two gaps in the first implementation, found by review before release and
 fixed in it. Both are recorded here rather than only in the changelog,
-because both were cases where the code satisfied every test that existed
-and still did not satisfy this decision:
+because
+both were cases where the code satisfied every test that existed and still
+did not satisfy this decision:
 
 - Item 33 was only half met. `_iter_records()` wrapped `csv.Error` and
   `UnicodeDecodeError` but not a plain `ValueError`, which is what a
@@ -1848,5 +1849,26 @@ traversals of the same view register two opens, and three consumers of a
 stabilized view register one. A count that could not move would have made
 `opens == 1` a constant rather than an assertion.
 
-Not measured: SMB/DFS transport. No SMB test harness exists in this
-repository and CSV inherits that limit, exactly as the XLSX resources do.
+Measured against a real DFS share in 0.7.8, read-only, from a host where
+the referral resolves only intermittently. The suite still contains no SMB
+harness — it must run offline — so this was a scratchpad run, and the
+results are recorded here because they are not otherwise reproducible.
+
+Passing: the SMB branch of `select_file_infos`, `select_latest_file_info`
+and `select_fixed_file_info`; fingerprints for the exact, latest and
+file-set resources; opening and reading a workbook; and the CSV reader's
+transport seam end to end.
+
+That run found a defect no offline test could: `select_fixed_file_info` and
+the SMB folder scan both wrapped their remote stat in
+`except FileNotFoundError`, and `smbclient` signals a missing file with
+`SMBOSError`, which subclasses `OSError` directly. The clause could never
+fire. A missing file therefore raised `FileNotFoundError` locally and
+`SMBOSError` remotely from the same function, and had done since long
+before this decision. Both sites now key on `errno.ENOENT` and re-raise
+anything else untouched.
+
+Still not measured over SMB: CSV parsing of a real CSV file. The share
+holds only workbooks and access is read-only, so the seam was exercised by
+reading a workbook *as* CSV — which proves transport, decoding and the
+failure path, but not the parser against genuine CSV bytes over the wire.

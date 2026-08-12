@@ -10,6 +10,84 @@ chronologically rather than by release.
 
 
 
+## 0.7.8
+
+A latent SMB defect, found by running against a real DFS share for the
+first time, and the offline coverage that would have caught it. Both
+predate the CSV work; neither was introduced by it.
+
+### Fixed
+- **A missing file on an SMB path did not raise `FileNotFoundError`.**
+  `select_fixed_file_info()` and the SMB folder scan both wrapped their
+  remote `stat` in `except FileNotFoundError`, but `smbclient` signals a
+  missing file with `SMBOSError`, which subclasses `OSError` *directly*.
+  The clause could never fire, so the normalization it promised had never
+  run: the same function raised `FileNotFoundError` for a missing local
+  file and `SMBOSError` for a missing remote one. Both sites now key on
+  `errno.ENOENT`.
+
+  A permission or transport failure still propagates with its own type —
+  only "not found" is translated. Reporting "file not found" for a share
+  the caller simply cannot read would be the most misleading thing the
+  scaffold could say.
+
+- **`to_excel()`'s missing-value/tz-aware detection warned under pandas 3**
+  (`Pandas4Warning`, on the loop reading
+  `df.select_dtypes(include=['object'])`). The suggested fix — add `'str'`
+  to `include` — was checked before applying: it raises `TypeError` under
+  pandas 2 (`numpy string dtypes are not allowed`), and `requirements.txt`
+  is unpinned across both majors, so one `include` list cannot serve both.
+  Replaced with the same direct dtype check the very next loop already
+  uses. Confirmed a genuine string-dtype column needs neither correction
+  this loop makes — it cannot hold a tz-aware value, since pandas enforces
+  the dtype, and a missing value in it is already caught by that next,
+  unconditional loop regardless of dtype — including with the compat
+  inclusion switched off to check the round trip stays identical either
+  way.
+
+  Found on the way: `docs/task-authoring.md` recommended a
+  `fromdataframe_preserve_none()` that does not exist, anywhere. Replaced
+  with what's actually verified — `dtype=object` holds when given directly
+  to `pd.Series()`/`pd.DataFrame()` at construction, but not through
+  `pd.array(..., dtype=object)` (pandas 3 overrides it for string data
+  regardless) and not through `.astype(object)` applied after the fact,
+  by which point the `None` is already `nan`.
+
+### Added
+- **Offline coverage of the whole SMB branch** (`tests/test_smb_branch.py`,
+  28 tests). Everything gated by `_use_smb()` was previously invisible to
+  the suite, which runs without a network: the mode switch, credential and
+  port forwarding, the DFS `str()` path coercion, both halves of the errno
+  translation, the scanner with every filter, latest selection and its
+  tie-break, and `open_binary` in both modes.
+
+  The fake is modelled on behaviour measured against a real server rather
+  than on what seemed reasonable — a populated `st_file_attributes`, an
+  `SMBOSError` that is not a `FileNotFoundError`, `os.walk` semantics in
+  `walk()`. It raises explicitly instead of using `assert`, because
+  `python -O` strips assertions and an assert-based fake silently stops
+  checking anything in exactly the mode this project requires.
+- **Copy-loader coverage of `db_updated_at`'s pinned *type*, not only its
+  nullability** (`tests/test_db_copy.py`). The nullability half was
+  already covered end to end at the export level; the type half was not,
+  and could not have been from the values the framework actually emits —
+  `apply_db_updated_at` produces timezone-aware datetimes, and inference
+  reads those as `timezone=True` on its own, so a pin that silently
+  stopped applying its type left every existing assertion passing.
+  Confirmed by removing only the type half of the pin: 935 of 936 tests
+  still passed.
+
+### Notes
+- Pins what `open_binary(buffered=True)` actually does, which is narrower
+  than the name suggests: the bytes are copied up front, but the remote
+  handle is held for the caller's whole body either way.
+- **`local_tests/`**, gitignored: SMB/database verification scripts that
+  need a real share and real credentials, so they cannot run in the
+  offline suite. Previously lived in a temp directory deleted with the
+  job that created it — a campaign that was run, not a suite that could
+  be re-run. Kept in the tree now; still never committed.
+
+
 ## 0.7.7
 
 First-class CSV input resources, and the generic exact-file selection they
