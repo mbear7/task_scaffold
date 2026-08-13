@@ -854,20 +854,34 @@ retaining the generic normalizer only for pandas, NumPy and other scalar
 wrappers. Inferred COPY must retain a type-neutral first spool, resolve
 the schema at EOF and replay the normalized values into the final spool.
 
-Declaring also removes the schema resolution itself, which costs more than
-its description suggests on a wide output. Inference scans the sample once
-per column, so that part of the cost tracks column count rather than row
-count: a 200-column output spends roughly a second of CPU before a single
-row is inserted, and spends it whether the output holds ten thousand rows
-or a hundred thousand. Columns whose sampled type could still widen are
-then verified against the remaining rows, and that part does grow with
-height — the same 200-column output with 100 integer columns measured
-939ms at 10,000 rows and 4.1s at 100,000. A declared schema skips both,
-leaving only the row validation every payload performs anyway.
+**The two loaders disagree about which schema source costs less**, and the
+difference is large in both directions. `publish()` branches on `db_loader`
+before any schema work, so INSERT and COPY do not share a path here.
+
+On **COPY**, declaring is much cheaper, for the reason above — one pass
+instead of a neutral spool and a replay. Measured on 200 columns × 20,000
+rows: 3.1s declared against 16.9s inferred.
+
+On **INSERT**, declaring is much more expensive, because the declared
+branch validates every value against its declared type, cell by cell,
+while inference samples 5000 rows and then verifies only the columns whose
+answer could still widen. The same shape measured 7.4s declared against
+0.68s inferred. That is not waste — it is validation the inferred path has
+no reason to perform, and it fails before the database is touched rather
+than during the load — but it is not a throughput saving, and it is worth
+knowing before declaring a wide INSERT output for speed.
+
+Inference's own cost tracks column count rather than row count: the sample
+is scanned once per column, so a 200-column output spends roughly a second
+of CPU whether it holds ten thousand rows or a hundred thousand. Columns
+whose sampled type could still widen are then verified against the
+remaining rows, and that part does grow with height — the same width with
+100 integer columns measured 939ms at 10,000 rows and 4.1s at 100,000.
 
 Use inference for exploratory or genuinely variable outputs. Use
-`output_schema` when the output contract is stable, especially for large COPY
-loads, wide outputs, or any `refill` target.
+`output_schema` when the output contract is stable, and for throughput
+specifically when the loader is COPY — or for any `refill` target, which
+requires it regardless.
 
 ### Account for memory and scratch disk
 

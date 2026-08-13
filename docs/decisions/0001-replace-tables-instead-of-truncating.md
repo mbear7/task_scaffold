@@ -87,17 +87,38 @@ to catalog operations.
   a 20-column measurement; at 200 columns the same sampling is
   ~700-900ms.
 
-  This is the argument for `output_schema` that has nothing to do with
-  stability: a declared schema skips both terms outright, leaving only
-  the row validation every payload performs anyway. On a narrow table
-  that is a small saving. At 200 columns it is seconds of CPU spent
-  before the first row reaches the database.
+  A first version of this note claimed declaring skipped both terms and
+  was therefore the throughput answer. That is wrong on the INSERT path
+  and is corrected in the bullet below; it is kept here because the
+  reasoning was plausible and will recur.
 
   Since 0.7.9 the scan is inverted above 30 columns — one walk per phase
   instead of one per column — which is 2.2x at 200 columns × 100,000
   rows and nothing at 20. The threshold is measured, not chosen: the
   row-major order is genuinely slower on a narrow table, 0.64x at three
   columns.
+
+- **Declared and inferred cost the opposite of each other on the two
+  loaders**, so "declare it for speed" is only half true. `publish()`
+  branches on `db_loader` before any schema work: COPY goes to
+  `prepare_copy_source` and never calls `_resolve_payload_schema` at all.
+  On COPY, declaring means one pass into the final spool rather than a
+  neutral spool plus a replay — 3.1s against 16.9s on 200 columns ×
+  20,000 rows. On INSERT it is the reverse, 7.4s declared against 0.68s
+  inferred on the same shape, because the declared branch validates every
+  value against its declared type cell by cell while inference samples
+  5000 rows and verifies only what could still widen.
+
+  The INSERT cost is not waste — it is validation the inferred path has
+  no reason to do, and it fails before the database is touched. It is
+  simply not a throughput saving, which is what the earlier version of
+  the bullet above asserted.
+
+  Neither is the dominant term for INSERT anyway. Building the payload
+  itself — one dict per row, every cell normalized — measured 3.3s for
+  the same 4M cells, against 0.68s for inference: 83% of the CPU spent
+  before the network. COPY avoids it by streaming tuples through
+  `to_row_source` rather than materializing row mappings.
 
 - **Loop structure is exhausted as a lever; the floor is the per-cell
   classification.** One further step looks obvious and does not work:
