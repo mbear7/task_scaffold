@@ -1010,5 +1010,99 @@ class Test12PayloadsCarryWhetherTheirRowsAreNormalized(unittest.TestCase):
         )
 
 
+class Test13FastPathsAgreeWithTheGeneralPaths(unittest.TestCase):
+    """`_normalize_value()` and `_value_family()` both short-circuit on
+    exact type before their general logic runs. Both are on the hottest
+    path in a publish -- normalization runs once per cell while the
+    payload is built, family classification once per non-null cell
+    scanned -- and both shortcuts are only safe because the general path
+    provably returns the same answer for the listed types.
+
+    "Provably" is the risk. The list is exact types, not isinstance, and
+    the reason is subtle enough to be worth pinning: pd.Timestamp and
+    pd.NaT are datetime instances, np.str_ and np.bool_ are str and bool
+    instances, and every one of them needs work the shortcut skips. A
+    later edit adding `float` (nan is missing) or switching to isinstance
+    would pass every other test in this suite.
+    """
+
+    CORPUS = None  # built in setUpClass, needs numpy
+
+    @classmethod
+    def setUpClass(cls):
+        import numpy as np
+
+        cls.CORPUS = [
+            None, 0, 1, -5, 10 ** 20, 1.5, -0.0, float('inf'), float('nan'),
+            Decimal('1.25'), Decimal('NaN'), 'text', '', 'многобайт',
+            True, False, b'bytes', bytearray(b'x'), memoryview(b'x'),
+            datetime(2020, 1, 1).date(), datetime(2020, 1, 1),
+            datetime(2020, 1, 1, tzinfo=timezone.utc),
+            np.int64(7), np.float64(2.5), np.bool_(True), np.str_('s'),
+            np.datetime64('2020-01-01'), np.array(5), np.array([1, 2]),
+            pd.Timestamp('2020-01-01'), pd.Timestamp('2020-01-01', tz='UTC'),
+            pd.NA, pd.NaT, np.nan, pd.Index([1, 2]),
+            [1, 2], [None], (1, 2), {'k': 'v'}, {1}, object(),
+        ]
+
+    def _normalize_without_shortcut(self, value):
+        """_normalize_value() with the exact-type shortcut disabled."""
+        from task_core.db import values
+
+        with mock.patch.object(values, '_NORMALIZATION_NOOP_TYPES', frozenset()):
+            return values._normalize_value(value)
+
+    def _family_without_shortcut(self, value):
+        from task_core.db import values
+
+        with mock.patch.object(values, '_EXACT_VALUE_FAMILIES', {}):
+            return values._value_family(value)
+
+    def test_normalization_shortcut_matches_the_general_path(self):
+        from task_core.db.values import _normalize_value
+
+        for value in self.CORPUS:
+            with self.subTest(value=repr(value)):
+                fast = _normalize_value(value)
+                general = self._normalize_without_shortcut(value)
+                self.assertIs(
+                    type(fast), type(general),
+                    f'{value!r}: shortcut produced {type(fast).__name__}, '
+                    f'general path {type(general).__name__}'
+                )
+                self.assertEqual(repr(fast), repr(general), repr(value))
+
+    def test_family_shortcut_matches_the_general_path(self):
+        from task_core.db.values import _normalize_value, _value_family
+
+        for raw in self.CORPUS:
+            value = _normalize_value(raw)
+            with self.subTest(value=repr(value)):
+                self.assertEqual(
+                    _value_family(value), self._family_without_shortcut(value),
+                    f'{value!r}: family shortcut disagrees with the match '
+                    f'statement'
+                )
+
+    def test_float_is_not_shortcut_because_nan_is_missing(self):
+        # The specific mistake the comment warns about. nan is a float;
+        # adding float to the no-op set would stop it becoming None.
+        from task_core.db.values import _NORMALIZATION_NOOP_TYPES, _normalize_value
+
+        self.assertNotIn(float, _NORMALIZATION_NOOP_TYPES)
+        self.assertIsNone(_normalize_value(float('nan')))
+
+    def test_pandas_and_numpy_scalars_do_not_take_the_shortcut(self):
+        # They are instances of the listed types but not exactly them,
+        # and they genuinely need unwrapping.
+        import numpy as np
+        from task_core.db.values import _normalize_value
+
+        self.assertIs(type(_normalize_value(np.int64(7))), int)
+        self.assertIs(type(_normalize_value(np.bool_(True))), bool)
+        self.assertIs(type(_normalize_value(pd.Timestamp('2020-01-01'))), datetime)
+        self.assertIsNone(_normalize_value(pd.NaT))
+
+
 if __name__ == '__main__':
     unittest.main()

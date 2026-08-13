@@ -10,6 +10,44 @@ chronologically rather than by release.
 
 
 
+## 0.7.11
+
+Two exact-type fast paths on the hottest values in a publish. Nothing a
+caller can observe changes.
+
+### Changed
+- **`_normalize_value()` returns immediately for the exact types that
+  need nothing done to them** — `str`, `int`, `bool`, `bytes`,
+  `datetime`, `date`. Each is provably unchanged by the general path, so
+  reaching it only cost a `pd.isna()` call per value. Payload
+  construction, which normalizes every cell and is ~83% of the CPU an
+  INSERT spends before the network, drops roughly 2x: 3,264ms → 1,588ms
+  on 200 columns × 20,000 rows, and `from_pandas` 3,910ms → 2,559ms.
+
+  `float` and `Decimal` are deliberately excluded: `nan` is a `float` and
+  *is* missing, and `Decimal` has its own NaN. The check is `type(x) in`,
+  never `isinstance` — `pd.Timestamp` and `pd.NaT` are `datetime`
+  instances, `np.str_` and `np.bool_` are `str`/`bool` instances, and all
+  four need work the shortcut skips.
+
+- **`_value_family()` resolves common exact types by dict lookup** before
+  its `match` statement, which is the floor of inference cost — one call
+  per non-null cell scanned. `datetime` is absent on purpose: its family
+  depends on `tzinfo`, not on its type, and putting it in the table
+  silently loses the aware/naive distinction. Eleven tests across three
+  files fail if it is added.
+
+### Notes
+- The larger change this pair replaced was measured and rejected.
+  Replacing the INSERT payload's `list[dict]` with positional tuples and
+  a column-index map — the shape COPY already streams — is 1.01x on its
+  own, and 1.11x on top of the normalization fast path, against a change
+  reaching schema resolution, inference, the not-null loop,
+  `RowProjection`, the INSERT loader and any external caller building a
+  `DbPayload` directly. The dict per row was never the cost;
+  `_normalize_value` was.
+
+
 ## 0.7.10
 
 Schema resolution stops redoing work the payload builders already did.

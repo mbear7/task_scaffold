@@ -217,9 +217,28 @@ def is_missing(value):
         return False
 
 
+# Exact types that need nothing done to them, checked before the general
+# path below. Each one: cannot be a missing marker, is already scalar,
+# and exposes neither to_pydatetime() nor item(). So the general path is
+# guaranteed to return them unchanged, and reaching it costs a pd.isna()
+# call per value -- measured at roughly half of payload construction,
+# which is itself ~83% of the CPU an INSERT spends before the network.
+#
+# `type(x) is`, never isinstance: pd.Timestamp and pd.NaT are both
+# datetime instances and must NOT take this path, and np.str_/np.bool_
+# are str/bool instances that genuinely need .item() unwrapping.
+#
+# float and Decimal are deliberately absent. nan is a float and IS
+# missing; Decimal has its own NaN. Both must reach is_missing().
+_NORMALIZATION_NOOP_TYPES = frozenset({str, int, bool, bytes, datetime, date})
+
+
 def _normalize_value(value):
     if value is None:
         return None
+
+    if type(value) in _NORMALIZATION_NOOP_TYPES:
+        return value
 
     if is_missing(value):
         return None
@@ -1140,7 +1159,33 @@ def _infer_column_types(rows, col_names, *, sample_size):
     return _infer_column_types_row_major(rows, names, sample_size=sample_size)
 
 
+# Exact-type shortcut for the match statement below, which is now the
+# floor of inference cost: one call per non-null cell scanned, and the
+# loop structure around it has already been optimised as far as it goes
+# (see decisions/0001). A dict lookup on type() resolves the common
+# cases without walking the isinstance ladder.
+#
+# datetime is absent on purpose -- its family depends on tzinfo, not on
+# its type. Anything not listed falls through to the match, which stays
+# authoritative: subclasses (np.str_, np.bool_) and memoryview resolve
+# there exactly as before.
+_EXACT_VALUE_FAMILIES = {
+    str: 'text',
+    bool: 'bool',
+    int: 'int',
+    float: 'numeric',
+    Decimal: 'numeric',
+    bytes: 'bytes',
+    bytearray: 'bytes',
+    date: 'date',
+}
+
+
 def _value_family(value):
+    family = _EXACT_VALUE_FAMILIES.get(type(value))
+    if family is not None:
+        return family
+
     match value:
         case bool():
             return 'bool'
