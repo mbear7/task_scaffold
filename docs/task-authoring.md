@@ -854,9 +854,20 @@ retaining the generic normalizer only for pandas, NumPy and other scalar
 wrappers. Inferred COPY must retain a type-neutral first spool, resolve
 the schema at EOF and replay the normalized values into the final spool.
 
+Declaring also removes the schema resolution itself, which costs more than
+its description suggests on a wide output. Inference scans the sample once
+per column, so that part of the cost tracks column count rather than row
+count: a 200-column output spends roughly a second of CPU before a single
+row is inserted, and spends it whether the output holds ten thousand rows
+or a hundred thousand. Columns whose sampled type could still widen are
+then verified against the remaining rows, and that part does grow with
+height — the same 200-column output with 100 integer columns measured
+939ms at 10,000 rows and 4.1s at 100,000. A declared schema skips both,
+leaving only the row validation every payload performs anyway.
+
 Use inference for exploratory or genuinely variable outputs. Use
 `output_schema` when the output contract is stable, especially for large COPY
-loads or any `refill` target.
+loads, wide outputs, or any `refill` target.
 
 ### Account for memory and scratch disk
 

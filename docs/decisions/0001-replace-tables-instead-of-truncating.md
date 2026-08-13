@@ -57,6 +57,42 @@ to catalog operations.
   awareness changes. Aware datetimes infer `TIMESTAMPTZ`; ambiguous
   aware/naive or aware/date columns fail before database work.
 
+- **The sample size is not an accuracy dial**, and this is easy to get
+  backwards. Once verification exists, the sampled answer and a full scan
+  agree for every case verification covers — whatever the size is. What
+  the size actually varies is how often the cheap path suffices versus
+  how often the expensive full re-infer fires. Cost is therefore
+  non-monotonic and data-dependent: a *smaller* sample is cheaper to take
+  but likelier to meet a contradicting value and pay the ~200x rescan,
+  and where the first such value sits is a property of the data, not of
+  the setting. Cases verification does not cover — a column sampled as
+  `numeric` that meets a string much later — do still depend on the size,
+  but they fail loudly at insert rather than corrupting silently, which
+  is why they are deliberately left unverified.
+
+  This is why the size stays a publisher constructor argument rather than
+  task-facing configuration. The intuition it invites — raise it to be
+  safer, lower it to be faster — is wrong in both halves, so exposing it
+  would mostly offer a way to tune the wrong direction confidently.
+
+- **Inference cost scales with column count, not row count** — which the
+  code's shape does not suggest, since the sample size is the number
+  written down. The scan runs once per column, so the sampled term is
+  `columns × sample_size` cell visits and does not grow with the table's
+  height at all. The verification term is `narrowable columns ×
+  remaining rows`, and does. Measured on a 200-column table: all-text
+  costs ~1s whether it holds 10,000 rows or 100,000, while the same width
+  with 100 integer columns runs 939ms → 2.3s → 4.1s across those same
+  heights. The ~35ms sampling figure recorded in `_infer_column_type` is
+  a 20-column measurement; at 200 columns the same sampling is
+  ~700-900ms.
+
+  This is the argument for `output_schema` that has nothing to do with
+  stability: a declared schema skips both terms outright, leaving only
+  the row validation every payload performs anyway. On a narrow table
+  that is a small saving. At 200 columns it is seconds of CPU spent
+  before the first row reaches the database.
+
 ## Rejected
 
 **`TRUNCATE` + `INSERT` as the default** — requires schema compatibility and

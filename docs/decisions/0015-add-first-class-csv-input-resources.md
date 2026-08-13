@@ -1872,3 +1872,14 @@ Still not measured over SMB: CSV parsing of a real CSV file. The share
 holds only workbooks and access is read-only, so the seam was exercised by
 reading a workbook *as* CSV — which proves transport, decoding and the
 failure path, but not the parser against genuine CSV bytes over the wire.
+
+That gap has since closed: `csv_test/` was provisioned on the share
+(`smb_make_fixtures.py`), and both live harnesses now run the CSV parser
+against it directly. `dfs_live.py` passed 13 of 13 against genuine CSV
+bytes over SMB — BOM stripping, file-set combination, latest selection
+proven by parsed content (not just mtime), a cross-file header mismatch
+naming the failing member, non-default encoding (`cp1251`, Cyrillic
+names), and fingerprint stability across two reads. `smb_db_smoke.py`
+carried the same fixtures through the full route into PostgreSQL: leading
+zeros, dotted columns and empty-field handling all survived `csv_file()`
+over SMB, through COPY, into the database.
