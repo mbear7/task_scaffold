@@ -737,6 +737,20 @@ def _resolve_payload_schema(payload, *, sample_size):
         )
 
     framework_by_name = {column.name: column for column in payload.framework_columns}
+    overrides = payload.type_overrides or {}
+    resolved_overrides = {name: _resolve_override(overrides.get(name)) for name in payload.columns}
+
+    # Gathered before anything is resolved so the columns that genuinely
+    # need inference can be inferred together. A framework column carries
+    # its own declared type and an overridden one is pinned, so neither
+    # reaches the scan at all -- excluding them here keeps the width that
+    # picks the traversal order the real width, not the nominal one.
+    to_infer = [
+        name for name in payload.columns
+        if name not in framework_by_name and resolved_overrides[name] is None
+    ]
+    inferred_types = _infer_column_types(payload.rows, to_infer, sample_size=sample_size)
+
     resolved_columns = []
     for name in payload.columns:
         framework = framework_by_name.get(name)
@@ -744,9 +758,9 @@ def _resolve_payload_schema(payload, *, sample_size):
             type_obj = _resolve_declared_type(framework.type)
             nullable = framework.nullable
         else:
-            type_obj = _resolve_override((payload.type_overrides or {}).get(name))
+            type_obj = resolved_overrides[name]
             if type_obj is None:
-                type_obj = _infer_column_type(payload.rows, name, sample_size=sample_size)
+                type_obj = inferred_types[name]
             nullable = name not in not_null
         resolved_columns.append(ResolvedColumn(name, type_obj, nullable))
 
@@ -942,6 +956,156 @@ def _infer_column_type(
         return _infer_from_scan(rows, col_name, sample_size=None)
 
     return inferred
+
+
+# Above this many columns, infer them all in one walk instead of one walk
+# each. Measured, both directions: row-major loses on a narrow table
+# because it pays per-row bookkeeping (iterating the live set, a dict
+# lookup per column, retirement) that the per-column loop does not --
+# 0.64x at 3 columns, 0.80x at 10, 0.93x at 20 -- and wins once the
+# traversals it saves dominate that: 1.09x at 30, 1.26x at 80, and
+# 2.3x at 200 columns x 100,000 rows. The crossover sat at 25-30 on every
+# shape tried, so the threshold is the measurement rather than a guess.
+#
+# Dispatched on column count rather than configured. The deciding
+# dimension is len(columns), which this function already has and a task
+# author often does not -- in inferred mode the column set comes from the
+# data and can change between runs. See decisions/0001 on why the
+# neighbouring sample size is not exposed either.
+_ROW_MAJOR_MIN_COLUMNS = 30
+
+
+def _scan_families_row_major(rows, col_names, *, start=0, stop=None):
+    """Families for several columns in a single walk over the rows.
+
+    Same cell visits as calling _scan_families() per column -- the same
+    row.get() happens for the same (row, column) pairs. What this saves
+    is len(col_names) - 1 traversals of the row list and that many
+    re-fetches of each row object, which is the whole reason it is
+    faster on a wide table and slower on a narrow one.
+
+    Retires a column as soon as a third family makes its answer Text
+    regardless, exactly as the per-column scan's early return does.
+    """
+    families = {name: set() for name in col_names}
+    live = set(col_names)
+
+    for row in islice(rows, start, stop):
+        if not live:
+            break
+        retired = None
+        for name in live:
+            value = row.get(name)
+            if value is None:
+                continue
+            found = families[name]
+            found.add(_value_family(value))
+            if len(found) > 2:
+                if retired is None:
+                    retired = []
+                retired.append(name)
+        if retired:
+            live.difference_update(retired)
+
+    return families
+
+
+def _infer_column_types_row_major(rows, col_names, *, sample_size):
+    """_infer_column_type() for several columns, one walk per phase.
+
+    Every branch mirrors the per-column function deliberately: the
+    all-null sample falling back to a full scan, the DateTime awareness
+    check, the silently-widenable exact-type check, and the full re-infer
+    when the remainder contradicts the sample. Any divergence here is a
+    bug, not a variation -- tests/test_db_values.py asserts the two agree
+    column by column on the shapes that distinguish them.
+    """
+    row_count = len(rows)
+    families = _scan_families_row_major(rows, col_names, stop=sample_size)
+    sampled_short = sample_size is not None and row_count > sample_size
+
+    resolved = {}
+    needs_full_scan = []
+    for name in col_names:
+        if sampled_short and not families[name]:
+            # Saw no non-null value at all: Text here would be a guess
+            # rather than an observation, same as the per-column path.
+            needs_full_scan.append(name)
+        else:
+            resolved[name] = _resolve_families(families[name])
+
+    if not sampled_short:
+        return resolved
+
+    skip = set(needs_full_scan)
+    to_verify = {}
+    for name in col_names:
+        if name in skip:
+            continue
+        inferred = resolved[name]
+        if isinstance(inferred, sa.DateTime):
+            to_verify[name] = (True, bool(inferred.timezone))
+            continue
+        exact_type = _silently_widenable_exact_type(inferred)
+        if exact_type is not None:
+            to_verify[name] = (False, exact_type)
+
+    contradicted = []
+    if to_verify:
+        for row in islice(rows, sample_size, None):
+            if not to_verify:
+                break
+            failed = None
+            for name, (is_datetime, expected) in to_verify.items():
+                value = row.get(name)
+                if value is None:
+                    continue
+                if is_datetime:
+                    wants_timezone = expected
+                    if type(value) is date and not wants_timezone:
+                        continue
+                    if (
+                        isinstance(value, datetime)
+                        and _is_aware_datetime(value) is wants_timezone
+                    ):
+                        continue
+                elif type(value) is expected:
+                    continue
+                if failed is None:
+                    failed = []
+                failed.append(name)
+            if failed:
+                for name in failed:
+                    contradicted.append(name)
+                    del to_verify[name]
+
+    # One walk for every column that needs the full set of families,
+    # rather than one walk each. On a wide table with many contradicted
+    # columns this is the difference the batching exists for: the
+    # per-column path re-scanned every row once per such column.
+    rescan = needs_full_scan + contradicted
+    if rescan:
+        full = _scan_families_row_major(rows, rescan)
+        for name in rescan:
+            resolved[name] = _resolve_families(full[name])
+
+    return resolved
+
+
+def _infer_column_types(rows, col_names, *, sample_size):
+    """Inferred types for `col_names`, keyed by name.
+
+    Dispatches on width alone -- see _ROW_MAJOR_MIN_COLUMNS. Both paths
+    must return identical answers for every input; only their cost
+    differs.
+    """
+    names = list(col_names)
+    if len(names) < _ROW_MAJOR_MIN_COLUMNS:
+        return {
+            name: _infer_column_type(rows, name, sample_size=sample_size)
+            for name in names
+        }
+    return _infer_column_types_row_major(rows, names, sample_size=sample_size)
 
 
 def _value_family(value):

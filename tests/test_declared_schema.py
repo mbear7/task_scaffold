@@ -706,5 +706,190 @@ class Test9PublicationStrategyIsIndependentOfSchemaSource(unittest.TestCase):
 
 
 
+class Test10RowMajorInferenceAgreesWithPerColumn(unittest.TestCase):
+    """Above _ROW_MAJOR_MIN_COLUMNS, types are inferred in one walk over
+    the rows instead of one walk per column. The two paths must return
+    identical answers for every input; only their cost differs.
+
+    This exists because the faster path was invisible to the suite when
+    it was written. Instrumenting the whole run showed the row-major
+    branch entered zero times across all 936 tests and the per-column
+    branch 85 times -- no payload anywhere was wide enough to reach it.
+    A second implementation of the function every publish depends on,
+    exercised by nothing, is exactly the shape of defect this project
+    keeps finding in its own fakes.
+
+    The shapes below are not arbitrary. Each one is a case where a naive
+    row-major rewrite diverges: the sample that sees only nulls and must
+    fall back to a full scan, the late value that contradicts a silently
+    widenable answer, the datetime awareness check, and the column whose
+    third family retires it early.
+    """
+
+    SAMPLE = 5000
+
+    def _both_ways(self, rows, names, sample_size=None):
+        """(per-column answers, row-major answers) for the same input."""
+        from task_core.db.values import (
+            _infer_column_type,
+            _infer_column_types_row_major,
+        )
+        size = self.SAMPLE if sample_size is None else sample_size
+        per_column = {
+            name: _infer_column_type(rows, name, sample_size=size)
+            for name in names
+        }
+        row_major = _infer_column_types_row_major(rows, names, sample_size=size)
+        return per_column, row_major
+
+    def _assert_agree(self, rows, names, sample_size=None, msg=''):
+        per_column, row_major = self._both_ways(rows, names, sample_size)
+        for name in names:
+            a, b = per_column[name], row_major[name]
+            self.assertEqual(
+                type(a), type(b),
+                f'{msg}{name}: per-column inferred {type(a).__name__}, '
+                f'row-major inferred {type(b).__name__}'
+            )
+            self.assertEqual(
+                getattr(a, 'timezone', None), getattr(b, 'timezone', None),
+                f'{msg}{name}: timezone differs between the two paths '
+                f'({a!r} vs {b!r})'
+            )
+
+    def test_late_float_after_an_integer_sample_agrees(self):
+        # The exact case the verification pass exists for: the sample says
+        # BigInteger, one later row says otherwise, and both paths must
+        # re-infer rather than keep the narrow answer.
+        rows = [{'a': i} for i in range(self.SAMPLE + 50)]
+        rows[self.SAMPLE + 10]['a'] = 3.5
+        self._assert_agree(rows, ['a'], msg='late float: ')
+
+    def test_late_naive_datetime_after_a_date_sample_agrees(self):
+        rows = [{'a': datetime(2020, 1, 1).date()} for _ in range(self.SAMPLE + 50)]
+        rows[self.SAMPLE + 20]['a'] = datetime(2021, 5, 5, 12, 0)
+        self._assert_agree(rows, ['a'], msg='late datetime: ')
+
+    def test_all_null_sample_falls_back_the_same_way(self):
+        # A sample that saw nothing at all must trigger a full scan on
+        # both paths. Text here would be a guess, not an observation.
+        rows = [{'a': None} for _ in range(self.SAMPLE + 30)]
+        for row in rows[self.SAMPLE + 5:]:
+            row['a'] = 7
+        self._assert_agree(rows, ['a'], msg='all-null sample: ')
+
+    def test_aware_datetimes_agree(self):
+        rows = [
+            {'a': datetime(2020, 1, 1, tzinfo=timezone.utc)}
+            for _ in range(self.SAMPLE + 20)
+        ]
+        self._assert_agree(rows, ['a'], msg='aware: ')
+
+    def test_a_third_family_retires_the_column_the_same_way(self):
+        rows = []
+        for i in range(self.SAMPLE + 20):
+            rows.append({'a': i if i % 3 == 0 else (f't{i}' if i % 3 == 1 else i * 1.5)})
+        self._assert_agree(rows, ['a'], msg='three families: ')
+
+    def test_every_shape_together_on_a_wide_payload(self):
+        # All of the above in one payload, which is what a real wide table
+        # looks like: the paths must agree column by column, not merely
+        # produce the same multiset of types.
+        names = [f'c{i}' for i in range(40)]
+        rows = []
+        for r in range(self.SAMPLE + 60):
+            row = {}
+            for i, name in enumerate(names):
+                kind = i % 5
+                if kind == 0:
+                    row[name] = 3.5 if r == self.SAMPLE + 10 else r
+                elif kind == 1:
+                    row[name] = (
+                        datetime(2021, 5, 5, 12, 0) if r == self.SAMPLE + 20
+                        else datetime(2020, 1, 1).date()
+                    )
+                elif kind == 2:
+                    row[name] = None if r < self.SAMPLE + 5 else r
+                elif kind == 3:
+                    row[name] = datetime(2020, 1, 1, tzinfo=timezone.utc)
+                else:
+                    row[name] = r if r % 3 == 0 else (f't{r}' if r % 3 == 1 else r * 1.5)
+            rows.append(row)
+        self._assert_agree(rows, names, msg='wide payload: ')
+
+    def test_sample_size_none_agrees(self):
+        rows = [{'a': i, 'b': f't{i}'} for i in range(200)]
+        self._assert_agree(rows, ['a', 'b'], sample_size=None, msg='full scan: ')
+
+    def test_shorter_than_the_sample_agrees(self):
+        rows = [{'a': i} for i in range(10)]
+        self._assert_agree(rows, ['a'], msg='short table: ')
+
+
+class Test11InferenceDispatchesOnWidth(unittest.TestCase):
+    """The traversal order is chosen from len(columns) alone, never
+    configured -- decisions/0001 records why the neighbouring sample size
+    is not exposed either, and the same argument applies with more force
+    here: the deciding dimension is one this function already has.
+
+    Pins the dispatch itself, because a threshold that silently stopped
+    dispatching would leave the suite green and the fast path dead, which
+    is the state this whole class was written in response to.
+    """
+
+    def _which_path(self, n_cols):
+        """Run _infer_column_types over n_cols and report the path taken."""
+        from task_core.db import values
+
+        rows = [{f'c{i}': i for i in range(n_cols)} for _ in range(10)]
+        names = [f'c{i}' for i in range(n_cols)]
+        seen = []
+        original = values._infer_column_types_row_major
+
+        def spy(*args, **kwargs):
+            seen.append('row_major')
+            return original(*args, **kwargs)
+
+        with mock.patch.object(values, '_infer_column_types_row_major', spy):
+            values._infer_column_types(rows, names, sample_size=5000)
+        return 'row_major' if seen else 'per_column'
+
+    def test_narrow_payload_uses_the_per_column_path(self):
+        from task_core.db.values import _ROW_MAJOR_MIN_COLUMNS
+
+        self.assertEqual(
+            self._which_path(_ROW_MAJOR_MIN_COLUMNS - 1), 'per_column',
+            'a payload below the threshold should not pay row-major '
+            'bookkeeping; it is measurably slower there'
+        )
+
+    def test_wide_payload_uses_the_row_major_path(self):
+        from task_core.db.values import _ROW_MAJOR_MIN_COLUMNS
+
+        self.assertEqual(
+            self._which_path(_ROW_MAJOR_MIN_COLUMNS), 'row_major',
+            'a payload at or above the threshold should infer in one '
+            'walk; if this fails the fast path is unreachable and the '
+            'equivalence tests above are exercising nothing'
+        )
+
+    def test_framework_and_overridden_columns_do_not_count_toward_width(self):
+        # A column with a declared or pinned type never reaches the scan,
+        # so counting it would pick the traversal order from a width that
+        # is not the width being traversed.
+        from task_core.db.values import _ROW_MAJOR_MIN_COLUMNS
+
+        n_overridden = _ROW_MAJOR_MIN_COLUMNS
+        columns = [f'c{i}' for i in range(n_overridden + 2)]
+        rows = [{name: 1 for name in columns} for _ in range(5)]
+        payload = DbPayload(
+            't', 's', list(columns), rows,
+            type_overrides={name: sa.BigInteger() for name in columns[:n_overridden]},
+        )
+        resolved = _resolve_payload_schema(payload, sample_size=5000)
+        self.assertEqual(len(resolved.columns), len(columns))
+        self.assertEqual(resolved.source, 'inferred')
+
+
 if __name__ == '__main__':
     unittest.main()

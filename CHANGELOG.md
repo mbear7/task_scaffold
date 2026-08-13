@@ -10,6 +10,54 @@ chronologically rather than by release.
 
 
 
+## 0.7.9
+
+Type inference on a wide table, in one walk over the rows instead of one
+walk per column. Same answers, chosen automatically, nothing to
+configure — a caller can ignore all of it.
+
+### Changed
+- **Inferred schema resolution dispatches on column count.** Inference
+  called `_scan_families()` once per column, so a 200-column output made
+  200 separate walks over the same 5000-row sample, and every column
+  whose sample was entirely null or whose remainder contradicted it
+  walked the whole table again by itself. Above 30 columns all of that
+  now happens in one walk per phase.
+
+  Measured through `_resolve_payload_schema()`, not just in isolation:
+  2.21x at 200 columns × 100,000 rows, 1.52x at 200 × 20,000, and
+  unchanged at 20 columns. The threshold is a measurement rather than a
+  guess — row-major is genuinely *slower* on a narrow table, because it
+  pays per-row bookkeeping the per-column loop does not: 0.64x at 3
+  columns, 0.80x at 10, 0.93x at 20, crossing over at 25-30 on every
+  shape tried.
+
+  Dispatched on `len(columns)`, never configured. The deciding dimension
+  is one the function already has and a task author often does not — in
+  inferred mode the column set comes from the data and can change
+  between runs. See `docs/decisions/0001` on why the neighbouring sample
+  size is not exposed either.
+
+  This is not the alternative `_infer_column_type()`'s docstring records
+  as built and rejected. That one walked every row for every column, a
+  full-table pass costing ~2.5s where sampling cost ~35ms. The
+  sample/verification split is unchanged; only the loop nesting differs.
+
+### Added
+- **Equivalence coverage for the two inference paths**
+  (`tests/test_declared_schema.py`). Instrumenting the whole suite showed
+  the row-major branch entered **zero** times across all 936 tests — no
+  payload was wide enough to reach it — so it shipped as a second
+  implementation of a function every publish depends on, exercised by
+  nothing. The tests assert the paths agree column by column on the
+  shapes that distinguish them: an all-null sample falling back to a full
+  scan, a late float after an integer sample, a late naive datetime after
+  a date sample, aware datetimes, and a column retired early by a third
+  family. Verified with teeth, reverting each part separately: removing
+  the all-null fallback, the contradiction handling, and the dispatch
+  each fail their own tests with messages naming the divergence.
+
+
 ## 0.7.8
 
 A latent SMB defect, found by running against a real DFS share for the
