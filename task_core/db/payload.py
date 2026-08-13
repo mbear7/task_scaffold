@@ -77,6 +77,22 @@ class DbPayload:
     # every existing payload field so older positional construction keeps
     # its meaning. None inherits the publisher policy.
     copy_spool_encryption: bool | None = None
+    # True when every value in `rows` has already been through
+    # _normalize_value(). from_petl() and from_pandas() set it, because
+    # they normalize each cell as they build the mappings -- inference
+    # requires that, since _value_family() classifies np.int64 and
+    # pd.Timestamp as 'text' rather than as their real families.
+    # Schema resolution then normalized every cell a SECOND time,
+    # measured at 41% of declared resolution on 200 columns x 20,000
+    # rows. _normalize_value() is idempotent (checked directly over the
+    # scalar, missing-value, numpy and pandas cases, plus containers), so
+    # the second pass was pure duplication for these two builders.
+    #
+    # Defaults False: a caller constructing DbPayload directly may hold
+    # raw values, and must keep being normalized exactly as before.
+    # Appended after every existing field, per the positional-stability
+    # rule above.
+    rows_normalized: bool = False
 
     def __post_init__(self):
         validate_publication_strategy(
@@ -356,6 +372,7 @@ def from_petl(
         publication_strategy=publication_strategy,
         db_loader=db_loader,
         db_table_id_pix=db_table_id_pix,
+        rows_normalized=True,
     )
 
 
@@ -396,4 +413,5 @@ def from_pandas(
         publication_strategy=publication_strategy,
         db_loader=db_loader,
         db_table_id_pix=db_table_id_pix,
+        rows_normalized=True,
     )

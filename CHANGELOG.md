@@ -10,6 +10,46 @@ chronologically rather than by release.
 
 
 
+## 0.7.10
+
+Schema resolution stops redoing work the payload builders already did.
+Nothing a caller can observe changes.
+
+### Changed
+- **Declared INSERT resolution no longer normalizes every cell twice.**
+  `from_petl()`/`from_pandas()` normalize each value as they build the
+  row mappings — inference requires it, since `_value_family()` reads
+  `np.int64` and `pd.Timestamp` as `'text'` otherwise. Schema resolution
+  then normalized every cell again. `DbPayload.rows_normalized`, set by
+  those two builders, lets resolution skip the repeat: 7.4s → 4.0s on
+  200 columns × 20,000 rows.
+
+  `_normalize_value()` is idempotent — checked directly across scalars,
+  missing-value markers, numpy and pandas types, and containers — so the
+  second pass could not have changed a value. The flag defaults `False`,
+  so a caller assembling a `DbPayload` by hand is normalized exactly as
+  before; four existing tests already covered that direction and fail
+  if the default is flipped.
+
+  `apply_db_updated_at()` now normalizes its timestamp once before
+  writing it into rows the builders marked normalized. The runner only
+  ever passes `datetime.now(timezone.utc)`, which needs nothing done to
+  it, but the flag is a claim about every value in `rows` and should
+  hold by construction rather than by the caller being well behaved.
+
+- **The declared branch compares row keys without building a set per
+  row.** `row.keys() != expected_set` rather than `set(row) != ...`,
+  which allocated and discarded one set for every row in the payload.
+
+### Notes
+- Profiling the publish path found the documentation error corrected in
+  the previous commit, and put the remaining cost in proportion:
+  building the INSERT payload — one dict per row, every cell normalized
+  — is ~83% of pre-network CPU on a wide output, against ~17% for
+  inference. COPY does not build it at all; it streams tuples through
+  `to_row_source()`.
+
+
 ## 0.7.9
 
 Type inference on a wide table, in one walk over the rows instead of one

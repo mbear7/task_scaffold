@@ -1,6 +1,6 @@
 # Architecture
 
-How `task_core` works as of 0.7.9. This describes the present system, not
+How `task_core` works as of 0.7.10. This describes the present system, not
 how it came to be that way; durable rationale lives in
 [decisions/](decisions/), and the history is in git and
 [CHANGELOG.md](../CHANGELOG.md).

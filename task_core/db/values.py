@@ -707,13 +707,23 @@ def _resolve_payload_schema(payload, *, sample_size):
         resolved = ResolvedSchema(tuple(resolved_columns), 'declared')
         expected_set = set(expected_names)
 
+        # from_petl()/from_pandas() normalized every cell while building
+        # the mappings, because inference needs Python-native values to
+        # classify at all. Repeating it here was 41% of this function's
+        # cost on a wide declared payload, for values that cannot change
+        # -- _normalize_value() is idempotent. A payload built by hand
+        # still gets normalized: the flag defaults False.
+        needs_normalize = not payload.rows_normalized
+
         for row_number, row in enumerate(payload.rows, start=1):
             if not isinstance(row, Mapping):
                 raise DbPublishError(
                     f'{payload.table_name!r}: output row {row_number} is not a mapping'
                 )
-            row_keys = set(row)
-            if row_keys != expected_set:
+            # A keys view compares against a set without building one per
+            # row, which the previous set(row) did for every row in the
+            # payload purely to throw it away.
+            if row.keys() != expected_set:
                 missing_row = [name for name in expected_names if name not in row]
                 unexpected_row = [name for name in row if name not in expected_set]
                 raise DbPublishError(
@@ -721,9 +731,11 @@ def _resolve_payload_schema(payload, *, sample_size):
                     f'output_schema; missing={missing_row!r}, unexpected={unexpected_row!r}'
                 )
             for column in resolved.columns:
-                normalized = _normalize_value(row[column.name])
-                row[column.name] = normalized
-                _validate_declared_value(payload.table_name, column, row_number, normalized)
+                value = row[column.name]
+                if needs_normalize:
+                    value = _normalize_value(value)
+                    row[column.name] = value
+                _validate_declared_value(payload.table_name, column, row_number, value)
 
         payload.columns = expected_names
         return resolved
@@ -767,10 +779,13 @@ def _resolve_payload_schema(payload, *, sample_size):
     resolved = ResolvedSchema(tuple(resolved_columns), 'inferred')
     constrained = {column.name: column for column in resolved.columns if not column.nullable}
     if constrained:
+        needs_normalize = not payload.rows_normalized
         for row_number, row in enumerate(payload.rows, start=1):
             for name, column in constrained.items():
-                normalized = _normalize_value(row.get(name))
-                row[name] = normalized
+                normalized = row.get(name)
+                if needs_normalize:
+                    normalized = _normalize_value(normalized)
+                    row[name] = normalized
                 if normalized is None:
                     raise DbPublishError(
                         f'{payload.table_name!r}: output row {row_number} contains NULL in '

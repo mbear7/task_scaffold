@@ -891,5 +891,124 @@ class Test11InferenceDispatchesOnWidth(unittest.TestCase):
         self.assertEqual(resolved.source, 'inferred')
 
 
+class Test12PayloadsCarryWhetherTheirRowsAreNormalized(unittest.TestCase):
+    """`from_petl()`/`from_pandas()` normalize every cell as they build
+    the mappings, because inference cannot classify np.int64 or
+    pd.Timestamp without it. Schema resolution then normalized every cell
+    a second time -- 41% of declared resolution on a wide payload, for
+    values that cannot change, since _normalize_value() is idempotent.
+
+    `DbPayload.rows_normalized` lets resolution skip that second pass.
+    The risk it introduces is the interesting part: a payload whose rows
+    are NOT normalized must still be normalized, or raw numpy and pandas
+    values reach the driver. So the flag defaults False, and the tests
+    below pin both directions rather than only the fast one.
+    """
+
+    def test_from_petl_marks_its_rows_normalized(self):
+        import petl as etl
+        from task_core.db.payload import from_petl
+
+        payload = from_petl(
+            etl.wrap([('a',), (1,)]), table_name='t', schema='s',
+        )
+        self.assertTrue(
+            payload.rows_normalized,
+            'from_petl normalizes every cell it writes; if this is False '
+            'resolution pays to normalize them a second time'
+        )
+
+    def test_from_pandas_marks_its_rows_normalized(self):
+        from task_core.db.payload import from_pandas
+
+        payload = from_pandas(
+            pd.DataFrame({'a': [1, 2]}), table_name='t', schema='s',
+        )
+        self.assertTrue(payload.rows_normalized)
+
+    def test_a_hand_built_payload_is_not_marked_and_is_still_normalized(self):
+        # The case the default protects. A caller assembling DbPayload
+        # directly may hold raw numpy/pandas values, and resolution is
+        # the only thing that will normalize them.
+        import numpy as np
+
+        payload = DbPayload(
+            't', 's', ['a', 'b'],
+            [{'a': np.int64(7), 'b': pd.Timestamp('2020-01-01')}],
+            output_schema=(
+                tc.OutputColumn('a', sa.BigInteger()),
+                tc.OutputColumn('b', sa.DateTime()),
+            ),
+        )
+        self.assertFalse(
+            payload.rows_normalized,
+            'a directly constructed payload must not claim normalized rows'
+        )
+        _resolve_payload_schema(payload, sample_size=5000)
+        self.assertIs(
+            type(payload.rows[0]['a']), int,
+            'np.int64 reached the driver unconverted; the default must '
+            'keep normalizing hand-built payloads'
+        )
+        self.assertIs(type(payload.rows[0]['b']), datetime)
+
+    def test_declared_resolution_agrees_whether_or_not_the_flag_is_set(self):
+        # Skipping the second normalization must not change any value,
+        # which is the whole premise: _normalize_value is idempotent over
+        # what the builders already produced.
+        import petl as etl
+        from task_core.db.payload import from_petl
+
+        schema = (
+            tc.OutputColumn('a', sa.BigInteger()),
+            tc.OutputColumn('b', sa.Text()),
+        )
+        rows = [('a', 'b'), (1, 'x'), (2, 'y'), (3, None)]
+
+        skipped = from_petl(etl.wrap(rows), table_name='t', schema='s',
+                            output_schema=schema)
+        _resolve_payload_schema(skipped, sample_size=5000)
+
+        repeated = from_petl(etl.wrap(rows), table_name='t', schema='s',
+                             output_schema=schema)
+        repeated.rows_normalized = False
+        _resolve_payload_schema(repeated, sample_size=5000)
+
+        self.assertEqual(
+            skipped.rows, repeated.rows,
+            'skipping the redundant normalization changed a value, so it '
+            'was not redundant'
+        )
+
+    def test_not_null_checking_still_normalizes_a_hand_built_payload(self):
+        # The inferred path's not-null loop normalizes too, and has the
+        # same default. pd.NA must still become None and be reported.
+        payload = DbPayload(
+            't', 's', ['a'], [{'a': pd.NA}], not_null_columns=('a',),
+        )
+        with self.assertRaises(DbPublishError) as caught:
+            _resolve_payload_schema(payload, sample_size=5000)
+        self.assertIn('non-nullable', str(caught.exception))
+
+    def test_the_framework_timestamp_is_normalized_before_it_is_written(self):
+        # apply_db_updated_at writes into rows the builders already marked
+        # normalized, so it must not put a raw value there -- otherwise
+        # the flag becomes a claim the payload does not honour.
+        import petl as etl
+        from task_core.db.payload import from_petl
+        from task_core.export import apply_db_updated_at
+
+        payload = from_petl(etl.wrap([('a',), (1,)]), table_name='t', schema='s')
+        spec = tc.PipelineSpec(db_table='t', db_updated_at=True)
+        apply_db_updated_at(payload, spec, pd.Timestamp('2020-01-01', tz='UTC'))
+
+        written = payload.rows[0]['etl_updated_at']
+        self.assertIs(
+            type(written), datetime,
+            f'a raw {type(written).__name__} was written into rows already '
+            f'marked normalized'
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

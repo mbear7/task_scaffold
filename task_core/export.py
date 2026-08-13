@@ -25,6 +25,7 @@ import os
 from dataclasses import replace
 from datetime import datetime, timezone
 
+from task_core.db.values import _normalize_value
 from task_core.table_adapters import get_table_adapter
 from task_core.types import OutputColumn, PipelineContractError, get_pipeline_spec
 
@@ -77,6 +78,15 @@ def apply_db_updated_at(payload, spec, run_started_at=None):
 
     if run_started_at is None:
         run_started_at = datetime.now(timezone.utc)
+
+    # Normalized once, not once per row. This writes into rows that
+    # from_petl/from_pandas have already marked normalized, and
+    # DbPayload.rows_normalized promises that every value in them has
+    # been through _normalize_value(). The runner only ever passes
+    # datetime.now(timezone.utc), which needs nothing done to it -- but
+    # the promise should hold by construction rather than because the one
+    # caller happens to be well behaved.
+    run_started_at = _normalize_value(run_started_at)
 
     payload.columns.append(column_name)
     for row in payload.rows:
