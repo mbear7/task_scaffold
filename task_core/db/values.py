@@ -1017,8 +1017,25 @@ def _infer_column_types_row_major(rows, col_names, *, sample_size):
     all-null sample falling back to a full scan, the DateTime awareness
     check, the silently-widenable exact-type check, and the full re-infer
     when the remainder contradicts the sample. Any divergence here is a
-    bug, not a variation -- tests/test_db_values.py asserts the two agree
-    column by column on the shapes that distinguish them.
+    bug, not a variation -- tests/test_declared_schema.py asserts the two
+    agree column by column on the shapes that distinguish them.
+
+    Rejected, after building and measuring it: accumulating families
+    during the verification walk so a contradicted column never needs the
+    fallback rescan at all. It looks like the obvious next step and it is
+    correct -- 300 randomised differential trials against the per-column
+    path found no disagreement, including the columns that raise on an
+    aware/naive mix. It is simply not faster: 1.02x on the 200-column x
+    100,000-row shape built to favour it, and 0.88x on a shape with no
+    contradictions, where its bookkeeping is pure overhead.
+
+    The reason is worth keeping, because the idea will occur again. The
+    dominant cost is _value_family() per non-null cell, and both shapes
+    call it the same number of times -- fusing the rescan into the
+    verification walk moves that work rather than removing it, and the
+    remainder is ~95% of a tall table, so the "extra" pass was never the
+    expensive part. Loop structure is exhausted as a lever here; the
+    floor is now the per-cell classification itself.
     """
     row_count = len(rows)
     families = _scan_families_row_major(rows, col_names, stop=sample_size)

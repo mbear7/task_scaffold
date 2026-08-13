@@ -93,6 +93,30 @@ to catalog operations.
   that is a small saving. At 200 columns it is seconds of CPU spent
   before the first row reaches the database.
 
+  Since 0.7.9 the scan is inverted above 30 columns — one walk per phase
+  instead of one per column — which is 2.2x at 200 columns × 100,000
+  rows and nothing at 20. The threshold is measured, not chosen: the
+  row-major order is genuinely slower on a narrow table, 0.64x at three
+  columns.
+
+- **Loop structure is exhausted as a lever; the floor is the per-cell
+  classification.** One further step looks obvious and does not work:
+  accumulating families during the verification walk, so a column whose
+  remainder contradicts its sample never needs the fallback rescan. It
+  was built and it is correct — 300 randomised differential trials
+  against the per-column path found no disagreement, including columns
+  that raise on an aware/naive mix — but it measured 1.02x on the
+  200-column × 100,000-row shape constructed to favour it, and 0.88x
+  where nothing is contradicted and its bookkeeping is pure overhead.
+
+  The reason it fails is the useful part. `_value_family()` runs once per
+  non-null cell either way, and that is the dominant cost; fusing the
+  rescan into the verification walk relocates that work without removing
+  any of it. The remainder is ~95% of a tall table, so the "second pass"
+  it eliminates was never the expensive half. Anything that moves these
+  numbers further has to make the per-cell classification cheaper, or
+  skip it — which is what declaring a schema does.
+
 ## Rejected
 
 **`TRUNCATE` + `INSERT` as the default** — requires schema compatibility and
