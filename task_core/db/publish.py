@@ -1658,12 +1658,14 @@ class DbPublisher:
 
         self._drop_open_transaction()
 
+        dropped = []
         for schema, staging_name in sorted(self._generated_names):
             try:
                 self._conn.execute(
                     sa.text(f'drop table if exists {_quoted_name(schema, staging_name)}')
                 )
                 self._conn.commit()
+                dropped.append(staging_name)
             except Exception:
                 # break, not continue. A failed DROP leaves the PostgreSQL
                 # transaction in an aborted state, so every subsequent
@@ -1681,7 +1683,25 @@ class DbPublisher:
                 break
 
         self._generated_names = set()
-        self.log.info('run aborted; staging artifacts dropped best-effort')
+        # Reports what this actually did, not why it was called. The old
+        # message was 'run aborted; staging artifacts dropped
+        # best-effort', logged unconditionally -- but rollback() serves
+        # two callers, and only one of them is an abort. The other is the
+        # source-change skip, which calls it to release the open read
+        # transaction after finding the sources unchanged. That is a
+        # normal, successful outcome, and it ended every such run with a
+        # line saying the run had been aborted.
+        #
+        # Nothing was wrong underneath: _generated_names is empty on that
+        # path, so no table was dropped and nothing was rolled back but a
+        # SELECT. The message was the whole defect, and the abort path
+        # loses nothing -- its caller logs 'task %s failed' immediately
+        # afterwards.
+        if dropped:
+            self.log.info(
+                'dropped %s staging table(s) prepared by this run: %s',
+                len(dropped), ', '.join(dropped),
+            )
 
     def _drop_open_transaction(self):
         if self._tx is not None:

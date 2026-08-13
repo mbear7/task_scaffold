@@ -10,6 +10,38 @@ chronologically rather than by release.
 
 
 
+## 0.7.12
+
+A skipped run no longer reports itself as an aborted one.
+
+### Fixed
+- **A run that skipped because its sources were unchanged ended by
+  logging `run aborted; staging artifacts dropped best-effort`.**
+  Reported from production, on a task correctly skipping unchanged DFS
+  sources, where it read as an unexpected termination.
+
+  Nothing underneath was wrong. `rollback()` serves two callers with
+  opposite meanings — the failure path in `run_pipelines()`, and the
+  source-change skip, which calls it to release the open read
+  transaction after comparing fingerprints — and it ended with that
+  message unconditionally. On the skip path no pipeline had run, so
+  `_generated_names` was empty, nothing was dropped, and nothing was
+  rolled back but a `SELECT`.
+
+  It now reports what it did rather than why it was called: the staging
+  tables it dropped, named, or nothing at all. The abort path loses
+  nothing, since its caller logs `task %s failed` immediately after.
+
+  The suite could not have caught this. The runner's source-change tests
+  drive a fake publisher whose `rollback()` logs nothing, so the real
+  method's output on that path had never been observed. The new tests
+  use the real `DbPublisher` with only its connection faked — and
+  writing that fake surfaced two more gaps of the same kind, since a
+  connection without `invalidated` or `in_transaction()` makes
+  `rollback()` fail inside an `except Exception` and report a
+  transaction-rollback failure that never happened.
+
+
 ## 0.7.11
 
 Two exact-type fast paths on the hottest values in a publish. Nothing a

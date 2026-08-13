@@ -30,6 +30,7 @@ tell a correct commit() from a broken one, the same way the original
 FakeDbPublisher couldn't.
 """
 
+import logging
 import sys
 import tempfile
 import time
@@ -5113,6 +5114,123 @@ class Test25SqliteFixtureOwnership(unittest.TestCase):
     def test_staged_model_fixture_disposes_its_owned_engine(self):
         self._assert_owned_engine_is_disposed(
             Test20GapsFoundReviewingTheStagedModel._Conn()
+        )
+
+
+class Test30RollbackReportsWhatItDidNotWhyItWasCalled(unittest.TestCase):
+    """`rollback()` serves two callers with opposite meanings: the
+    genuine failure path in run_pipelines, and the source-change skip,
+    which calls it to release the open read transaction after finding the
+    sources unchanged.
+
+    It used to end with an unconditional
+    'run aborted; staging artifacts dropped best-effort', so every
+    successful skipped run finished by announcing an abort. Reported from
+    production, where a task that correctly skipped unchanged DFS sources
+    read as having terminated unexpectedly. Nothing underneath was wrong.
+
+    The suite could not have caught it: the runner tests drive a fake
+    publisher whose rollback() logs nothing, so the real method's output
+    on that path was never observed. These tests use the real
+    DbPublisher, with only its connection faked.
+    """
+
+    def _publisher(self, log):
+        return DbPublisher(
+            creds={'user': 'x', 'host': 'x', 'dbname': 'x'},
+            schema='bsr', task_name='t', logger=log,
+        )
+
+    class _Conn:
+        """A SQLAlchemy Connection, only as far as rollback() uses one.
+
+        Both extras here were found by writing this test, not by
+        inspection, and each had made rollback fail before it did
+        anything: `invalidated` is read through _note_connection_loss()
+        at the top, and `in_transaction()` through
+        _drop_open_transaction() just after. A fake missing either raises
+        AttributeError inside an `except Exception` and reports
+        'rolling back the open transaction failed' -- a fake testing its
+        own omission, which is the failure mode this project keeps
+        hitting.
+
+        Starts in a transaction, because the caller that matters here --
+        the source-change skip -- has just run a SELECT to compare
+        fingerprints, and releasing that is the actual reason it calls
+        rollback at all.
+        """
+
+        def __init__(self):
+            self.statements = []
+            self.invalidated = False
+            self._in_transaction = True
+            self.rollbacks = 0
+
+        def in_transaction(self):
+            return self._in_transaction
+
+        def rollback(self):
+            self.rollbacks += 1
+            self._in_transaction = False
+
+        def execute(self, statement):
+            self.statements.append(str(statement))
+
+        def commit(self):
+            self._in_transaction = False
+
+    def test_a_rollback_with_nothing_staged_says_nothing(self):
+        # The skip path: no pipeline ran, so no staging table exists.
+        log = logging.getLogger('test.rollback.quiet')
+        publisher = self._publisher(log)
+        conn = self._Conn()
+        publisher._conn = conn
+
+        with self.assertLogs(log, level='INFO') as captured:
+            log.info('sentinel so assertLogs has at least one record')
+            publisher.rollback()
+
+        messages = [r.getMessage() for r in captured.records]
+        self.assertEqual(
+            len(messages), 1,
+            f'rollback with nothing staged logged {messages[1:]}; a run that '
+            f'skipped because its sources were unchanged must not report an '
+            f'abort'
+        )
+        self.assertNotIn('aborted', ' '.join(messages).lower())
+        self.assertEqual(
+            conn.rollbacks, 1,
+            'the open read transaction was not released, which is the only '
+            'reason the skip path calls rollback at all'
+        )
+
+    def test_a_rollback_that_drops_staging_tables_names_them(self):
+        log = logging.getLogger('test.rollback.dropped')
+        publisher = self._publisher(log)
+        conn = self._Conn()
+        publisher._conn = conn
+        publisher._generated_names = {('bsr', 't__stg_aaaaaaaa_bbbbbbbb')}
+
+        with self.assertLogs(log, level='INFO') as captured:
+            publisher.rollback()
+
+        joined = ' '.join(r.getMessage() for r in captured.records)
+        self.assertIn('t__stg_aaaaaaaa_bbbbbbbb', joined)
+        self.assertIn('1 staging table', joined)
+        self.assertTrue(
+            any('drop table if exists' in s.lower() for s in conn.statements),
+            'the staging table was reported dropped but no DDL was issued'
+        )
+
+    def test_rollback_still_clears_the_generated_names(self):
+        publisher = self._publisher(logging.getLogger('test.rollback.clear'))
+        publisher._conn = self._Conn()
+        publisher._generated_names = {('bsr', 't__stg_aaaaaaaa_bbbbbbbb')}
+
+        publisher.rollback()
+        self.assertEqual(
+            publisher._generated_names, set(),
+            'a second rollback would otherwise try to drop them again'
         )
 
 
