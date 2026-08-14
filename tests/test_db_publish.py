@@ -5267,5 +5267,200 @@ class Test30RollbackReportsWhatItDidNotWhyItWasCalled(unittest.TestCase):
         )
 
 
+class Test31LockTimeoutRelationshipIsReported(unittest.TestCase):
+    """begin_run() states the two timeouts, and warns when they invert.
+
+    decisions/0016 decided lock_timeout_ms stays below the server's
+    deadlock_timeout, because PostgreSQL's autovacuum cancellation is
+    driven by the deadlock detector. Nothing enforced it and neither
+    number was logged: establishing the relationship the first time took
+    a pg_locks sampler and a grep of the server log.
+
+    The defaults hold it by luck, 500 against 1000. These tests exist for
+    the server where a DBA has tuned deadlock_timeout down, which inverts
+    the relationship silently and reproduces the exact failure 0016 is
+    about.
+
+    The fake here answers the settings query and carries
+    server_version_info, unlike the other publisher fakes in this file.
+    That is the point: the diagnostic swallows its own failures so a
+    restricted role can still publish, and swallowing is the permissive
+    direction, so a fake that did not answer would let a broken
+    diagnostic pass silently.
+    """
+
+    class _Conn:
+        invalidated = False
+
+        def __init__(self, deadlock_ms=1000, unit='ms',
+                     version=(18, 4), settings_error=None):
+            self.statements = []
+            self._deadlock_ms = deadlock_ms
+            self._unit = unit
+            self._version = version
+            self._settings_error = settings_error
+
+        @property
+        def dialect(self):
+            return type('D', (), {
+                'name': 'postgresql',
+                'server_version_info': self._version,
+            })()
+
+        def execute(self, statement, params=None):
+            text = str(statement)
+            self.statements.append(text)
+            lowered = text.lower()
+
+            if 'max_identifier_length' in lowered:
+                return _Scalar(63)
+            if 'advisory' in lowered:
+                return _Scalar(True)
+            if 'deadlock_timeout' in lowered:
+                if self._settings_error is not None:
+                    raise self._settings_error
+                # one_or_none() semantics, matching the publisher's other
+                # single-row lookup: the row itself, or None.
+                return _Scalar((str(self._deadlock_ms), self._unit))
+            if 'relname like' in lowered:
+                return _Rows([])
+            return None
+
+        def in_transaction(self): return False
+        def begin(self): return _NoopTx(self)
+        def commit(self): pass
+        def rollback(self): pass
+        def close(self): pass
+
+    def _publisher(self, conn, lock_timeout_ms=500, logger=None):
+        from task_core.db.publish import PublicationLockPolicy
+        publisher = DbPublisher(
+            creds=_CREDS, schema='bsr', task_name='demo_task',
+            logger=logger,
+            publication_lock_policy=PublicationLockPolicy(
+                lock_timeout_ms=lock_timeout_ms,
+                acquisition_timeout_ms=lock_timeout_ms * 10 + 50,
+            ),
+        )
+        publisher._conn = conn
+        publisher._engine = type('E', (), {'dispose': lambda self: None})()
+        return publisher
+
+    def test_the_two_timeouts_and_the_version_are_reported(self):
+        log = logging.getLogger('test.locktimeout.report')
+        publisher = self._publisher(self._Conn(), logger=log)
+
+        with self.assertLogs(log, level='INFO') as captured:
+            self.assertTrue(publisher.begin_run())
+
+        line = [m for m in captured.output if 'deadlock_timeout' in m]
+        self.assertEqual(len(line), 1, f'expected one line, got {captured.output}')
+        self.assertIn('PostgreSQL 18.4', line[0])
+        self.assertIn('deadlock_timeout = 1000 ms', line[0])
+        self.assertIn('lock_timeout = 500 ms', line[0])
+
+    def test_a_lock_timeout_at_or_above_deadlock_timeout_warns(self):
+        # The case 0016 exists for: a server tuned to 200ms turns the
+        # shipped default into a violation without anything saying so.
+        log = logging.getLogger('test.locktimeout.warn')
+        publisher = self._publisher(self._Conn(deadlock_ms=200), logger=log)
+
+        with self.assertLogs(log, level='WARNING') as captured:
+            publisher.begin_run()
+
+        joined = '\n'.join(captured.output)
+        self.assertIn('at or above', joined)
+        self.assertIn('500 ms', joined)
+        self.assertIn('200 ms', joined)
+        self.assertIn('0016', joined)
+
+    def test_the_healthy_relationship_warns_about_nothing(self):
+        log = logging.getLogger('test.locktimeout.quiet')
+        publisher = self._publisher(self._Conn(deadlock_ms=1000), logger=log)
+
+        with self.assertLogs(log, level='INFO') as captured:
+            publisher.begin_run()
+
+        warnings = [r for r in captured.records if r.levelno >= logging.WARNING]
+        self.assertEqual(
+            warnings, [],
+            f'500 sits below 1000 and needs no warning, got {warnings}'
+        )
+
+    def test_equal_timeouts_warn(self):
+        """The boundary is >=, not >.
+
+        At lock_timeout == deadlock_timeout the publisher still aborts
+        before the autovacuum cancellation can fire -- the two race and
+        the timeout is armed first. A > comparison would call that case
+        healthy, which is the whole defect 0016 describes.
+        """
+        log = logging.getLogger('test.locktimeout.boundary')
+        publisher = self._publisher(
+            self._Conn(deadlock_ms=500), lock_timeout_ms=500, logger=log)
+
+        with self.assertLogs(log, level='WARNING') as captured:
+            publisher.begin_run()
+        self.assertIn('at or above', '\n'.join(captured.output))
+
+    def test_an_unreadable_setting_does_not_fail_the_run(self):
+        # A restricted role that cannot read pg_settings must still be
+        # able to publish. The diagnostic is the only thing that is lost.
+        log = logging.getLogger('test.locktimeout.denied')
+        conn = self._Conn(settings_error=RuntimeError('permission denied'))
+        publisher = self._publisher(conn, logger=log)
+
+        with self.assertLogs(log, level='DEBUG') as captured:
+            self.assertTrue(
+                publisher.begin_run(),
+                'a failed diagnostic must not stop the run'
+            )
+        self.assertFalse(
+            [r for r in captured.records if r.levelno >= logging.WARNING],
+            'an unreadable setting is not a warning-level event'
+        )
+
+    def test_an_unexpected_unit_is_not_reported_as_milliseconds(self):
+        # pg_settings reports deadlock_timeout in ms today. If a server
+        # ever reports another unit, saying nothing beats saying '1 ms'.
+        log = logging.getLogger('test.locktimeout.unit')
+        publisher = self._publisher(
+            self._Conn(deadlock_ms=1, unit='s'), logger=log)
+
+        with self.assertLogs(log, level='DEBUG') as captured:
+            publisher.begin_run()
+        self.assertFalse(
+            [m for m in captured.output if 'deadlock_timeout =' in m],
+            'a non-ms unit was reported as if it were milliseconds'
+        )
+
+    def test_a_skipped_run_reports_nothing(self):
+        """A run that loses the lock race stays quiet.
+
+        0.7.12 fixed a skipped run emitting a line that read as an
+        aborted one. Putting this diagnostic above the lock attempt
+        would have reintroduced exactly that.
+        """
+        log = logging.getLogger('test.locktimeout.skipped')
+        conn = self._Conn()
+
+        class _Busy(type(conn)):
+            def execute(self, statement, params=None):
+                if 'advisory' in str(statement).lower():
+                    self.statements.append(str(statement))
+                    return _Scalar(False)
+                return super().execute(statement, params)
+
+        publisher = self._publisher(_Busy(), logger=log)
+        with self.assertLogs(log, level='DEBUG') as captured:
+            log.debug('anchor')          # assertLogs needs at least one record
+            self.assertFalse(publisher.begin_run())
+
+        self.assertFalse(
+            [m for m in captured.output if 'deadlock_timeout' in m],
+            'a skipped run logged the publication diagnostic'
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

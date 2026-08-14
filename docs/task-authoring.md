@@ -700,6 +700,20 @@ on back-to-back publications. The retry loop is the intended resolution; do
 not raise `lock_timeout_ms` to outwait it, for the reasons in
 [decisions/0016](decisions/0016-keep-lock-timeout-below-deadlock-timeout.md).
 
+Every publishing run states the relationship once, so you do not have to go
+looking for it:
+
+```
+publication: PostgreSQL 18.4, deadlock_timeout = 1000 ms, lock_timeout = 500 ms
+```
+
+`lock_timeout_ms` must stay **below** the server's `deadlock_timeout`, and the
+run warns if it does not. The two defaults satisfy that (500 against 1000), so
+on a stock server there is nothing to do. If your DBAs have tuned
+`deadlock_timeout` down, lower `lock_timeout_ms` to match — and remember that
+`acquisition_timeout_ms >= n * lock_timeout_ms + 50` must still hold, so
+lowering it is safe while raising it is not.
+
 
 ## Publication strategy
 

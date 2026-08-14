@@ -549,6 +549,11 @@ class DbPublisher:
         if not self.try_acquire_task_lock():
             return False
 
+        # After the lock, not before: a run that loses the race and skips
+        # should stay quiet. 0.7.12 was precisely about a skipped run
+        # emitting a line that read as something else.
+        self._log_lock_timeout_relationship()
+
         self._cleanup_predecessor_spools()
         self.cleanup_predecessor_artifacts()
         return True
@@ -753,6 +758,81 @@ class DbPublisher:
                 self.ensure_connection(), self.max_identifier_bytes,
             )
         return min(self.max_identifier_bytes, self._server_identifier_bytes)
+
+    def _log_lock_timeout_relationship(self):
+        """State the server version and the two timeouts that interact.
+
+        decisions/0016 decided that lock_timeout_ms stays below the
+        server's deadlock_timeout, because PostgreSQL's autovacuum
+        cancellation is driven by the deadlock detector: a publisher
+        whose lock_timeout expires first can never benefit from it and
+        retries instead. Nothing enforced that, and neither number
+        appeared in any log -- establishing the relationship in the first
+        place took a pg_locks sampler and a server-log grep.
+
+        The defaults hold the relationship by luck (500 against 1000). A
+        server tuned down -- 200ms is an ordinary OLTP choice -- silently
+        inverts it, which is why this warns rather than only reporting.
+
+        Comparing the CONFIGURED lock_timeout_ms is sound even though
+        attempt_budgets_ms() may derive a smaller effective value: the
+        derivation is min(configured, ...), so it only ever lowers the
+        number. A configured ceiling below deadlock_timeout guarantees
+        every derived value is too.
+
+        Diagnostic only, so any failure is swallowed. That is the
+        opposite of server_identifier_limit(), which raises -- deliberately.
+        The identifier limit governs correctness and a wrong one corrupts
+        generated names; this is a log line, and a restricted role that
+        cannot read pg_settings should still be able to publish.
+        """
+        conn = self.ensure_connection()
+        if conn.dialect.name != 'postgresql':
+            return
+
+        configured_ms = self.publication_lock_policy.lock_timeout_ms
+        try:
+            # pg_settings, not current_setting: the latter returns the
+            # unit-formatted '1s', which int() rejects. pg_settings
+            # reports the raw number with its unit alongside.
+            row = conn.execute(sa.text(
+                "select setting, unit from pg_settings "
+                "where name = 'deadlock_timeout'"
+            )).one_or_none()
+            version = conn.dialect.server_version_info
+            if row is None or version is None:
+                return
+            setting, unit = row[0], row[1]
+            if unit != 'ms':
+                # Never observed -- pg_settings reports this one in ms on
+                # every server checked. Saying nothing beats reporting a
+                # value of 1 as though it were a millisecond.
+                self.log.debug(
+                    'deadlock_timeout reported in %r, not ms; skipping the '
+                    'publication diagnostic', unit,
+                )
+                return
+            deadlock_ms = int(setting)
+            release = '.'.join(str(part) for part in version[:2])
+        except Exception as exc:
+            self.log.debug(
+                'could not read deadlock_timeout for the publication '
+                'diagnostic: %s: %s', type(exc).__name__, exc,
+            )
+            return
+
+        self.log.info(
+            'publication: PostgreSQL %s, deadlock_timeout = %s ms, '
+            'lock_timeout = %s ms', release, deadlock_ms, configured_ms,
+        )
+        if configured_ms >= deadlock_ms:
+            self.log.warning(
+                'lock_timeout (%s ms) is at or above this server\'s '
+                'deadlock_timeout (%s ms). Autovacuum contention will abort '
+                'the lock attempt before PostgreSQL can cancel the autovacuum '
+                'worker, so publication will retry instead of proceeding. '
+                'See decisions/0016.', configured_ms, deadlock_ms,
+            )
 
 
     def _validate_payload_identifiers(self, payload, limit):

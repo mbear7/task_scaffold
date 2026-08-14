@@ -10,6 +10,63 @@ chronologically rather than by release.
 
 
 
+## 0.7.14
+
+Every publishing run now states the two timeouts that interact, and warns
+when they invert.
+
+### Added
+- **A once-per-run publication diagnostic**, logged by `begin_run()` after
+  the task lock is acquired:
+
+  ```
+  publication: PostgreSQL 18.4, deadlock_timeout = 1000 ms, lock_timeout = 500 ms
+  ```
+
+  `decisions/0016` decided that `lock_timeout_ms` stays below the server's
+  `deadlock_timeout`. That held **by luck** — 500 against a default 1000 —
+  with nothing checking it and neither number in any log. Establishing the
+  relationship the first time took a `pg_locks` sampler, `log_lock_waits`,
+  and a grep of the server log; an operator reporting `publication lock
+  unavailable` could not supply the one fact that makes the warning
+  interpretable.
+
+  A WARNING follows when `lock_timeout_ms >= deadlock_timeout`, which is the
+  case 0016 exists for: on a server tuned to 200 ms — an ordinary OLTP choice
+  — the shipped default silently inverts the decision.
+
+  Three details worth knowing. The comparison uses the **configured**
+  `lock_timeout_ms` even though `attempt_budgets_ms()` may derive a smaller
+  effective value; the derivation is `min(configured, ...)`, so a ceiling
+  below `deadlock_timeout` guarantees every derived value is too. The
+  boundary is `>=`, not `>`, because at equality the timeout is armed before
+  the deadlock detector fires. And the whole thing is diagnostic only and
+  swallows its own failures — unlike `server_identifier_limit()`, which
+  raises — so a restricted role that cannot read `pg_settings` still
+  publishes normally, losing only the log line.
+
+  The server version costs no round trip: SQLAlchemy already carries
+  `dialect.server_version_info` from the connection handshake. Only
+  `deadlock_timeout` needs a query, and it reads `pg_settings` rather than
+  `current_setting`, which returns the unit-formatted `'1s'` that `int()`
+  rejects.
+
+  It sits **after** `try_acquire_task_lock()`, so a run that loses the race
+  and skips stays silent — the mistake 0.7.12 already paid for once.
+
+### Not changed
+- **`PublicationLockPolicy` is untouched** — no new field, no changed
+  default, `__post_init__` exactly as it was. An `auto` value for
+  `lock_timeout_ms`, derived from the server's `deadlock_timeout`, was
+  considered and rejected: 500 ms is chosen for reader latency while
+  `deadlock_timeout` is a deadlock-detection setting, and the two interact
+  only by an accident of which mechanism fires first. Deriving one from the
+  other would let a DBA retuning `deadlock_timeout` silently change
+  publication behaviour, put a string sentinel in an int field, and split
+  policy validation across construction and connection time, since
+  `A >= n*L + M` cannot be checked in `__post_init__` when `L` is unknown
+  until a connection exists.
+
 ## 0.7.13
 
 The lock-contention diagnostic no longer blames a reader.

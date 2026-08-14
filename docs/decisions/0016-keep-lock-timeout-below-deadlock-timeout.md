@@ -84,9 +84,49 @@ pointless on one set to 5 s, and silently harmful on one set to 50 ms. The
 scaffold cannot read it at policy-construction time and has no business
 depending on it.
 
+*Depending on it* and *checking against it* are different, and 0.7.14 added
+the second. `begin_run()` reads `deadlock_timeout` once per run and logs both
+numbers, warning when `lock_timeout_ms >= deadlock_timeout`. The policy is
+unchanged and still constructed without a connection; the server value is
+never fed back into it. See "Enforcement" below.
+
 **The observed cost is seconds, and it is bounded.** In the measured runs the
 retry loop succeeded — three attempts, roughly fifteen seconds, publication
 completed. That is a slow publication, not a failure.
+
+## Enforcement (0.7.14)
+
+The decision above held **by luck** as originally shipped: 500 against a
+default 1000. Nothing checked the relationship, and neither number appeared in
+any log — establishing it the first time took a `pg_locks` sampler,
+`log_lock_waits`, and a grep of the server log. On a server where a DBA has
+tuned `deadlock_timeout` down, 200 ms being an ordinary OLTP choice, the
+shipped default silently *inverts* this decision and produces exactly the
+failure it exists to prevent.
+
+So `begin_run()` now logs, once per run, after the task lock is acquired:
+
+```
+publication: PostgreSQL 18.4, deadlock_timeout = 1000 ms, lock_timeout = 500 ms
+```
+
+and warns when `lock_timeout_ms >= deadlock_timeout`, naming this record.
+
+Three properties worth keeping:
+
+- **It compares the configured ceiling, not the effective value.**
+  `attempt_budgets_ms()` may derive a smaller per-attempt `lock_timeout` —
+  `min(configured, available // n)` — so the effective value can be below the
+  configured one but never above it. A configured ceiling under
+  `deadlock_timeout` therefore guarantees every derived value is too, which is
+  what makes the cheap check sound.
+- **The boundary is `>=`, not `>`.** At equality the timeout and the deadlock
+  detector race, and the timeout is armed first. Treating that as healthy
+  would miss the case.
+- **It is diagnostic only and swallows its own failures**, unlike
+  `server_identifier_limit()`, which raises. The identifier limit governs
+  correctness; this is a log line, and a restricted role that cannot read
+  `pg_settings` must still be able to publish.
 
 ## Consequences
 
@@ -182,3 +222,27 @@ for staging tables, which live for one run.
 
 **Reasoned, not measured:** the horizon-exhaustion risk above, and the claim
 that escalating `L` would resolve it.
+
+### 0.7.14 enforcement
+
+Both log lines confirmed against the live PostgreSQL 18.4 through a real
+publication, not only through fakes:
+
+```
+INFO  publication: PostgreSQL 18.4, deadlock_timeout = 1000 ms, lock_timeout = 500 ms
+```
+
+then with the server's `deadlock_timeout` lowered to 200 ms for the duration:
+
+```
+INFO  publication: PostgreSQL 18.4, deadlock_timeout = 200 ms, lock_timeout = 500 ms
+WARN  lock_timeout (500 ms) is at or above this server's deadlock_timeout
+      (200 ms). Autovacuum contention will abort the lock attempt before
+      PostgreSQL can cancel the autovacuum worker, so publication will retry
+      instead of proceeding. See decisions/0016.
+```
+
+The unit tests were reverted three ways to confirm they bite: relaxing the
+boundary to `>` fails the equality test alone; removing the call fails six of
+seven; and moving the call above `try_acquire_task_lock()` fails only the
+skipped-run test, which is the placement mistake 0.7.12 already paid for once.
