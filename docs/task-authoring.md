@@ -692,6 +692,14 @@ delay.
 Widen the horizon for tables under constant BI load; leave it alone
 otherwise. Nothing about a normal task changes.
 
+A `publication lock unavailable` warning does not necessarily mean a slow
+query. Autovacuum takes `SHARE UPDATE EXCLUSIVE`, which conflicts with the
+publication's `ACCESS EXCLUSIVE` exactly as a reader does, and a table this
+scaffold has just filled is a prime candidate for it — measured as the cause
+on back-to-back publications. The retry loop is the intended resolution; do
+not raise `lock_timeout_ms` to outwait it, for the reasons in
+[decisions/0016](decisions/0016-keep-lock-timeout-below-deadlock-timeout.md).
+
 
 ## Publication strategy
 

@@ -28,3 +28,4 @@ them is usually still relevant to whatever replaced them.
 | [0013](0013-name-configuration-choices.md) | Name configuration choices |
 | [0014](0014-allow-dots-in-published-column-names.md) | Allow dots in published column names |
 | [0015](0015-add-first-class-csv-input-resources.md) | Add first-class CSV input resources |
+| [0016](0016-keep-lock-timeout-below-deadlock-timeout.md) | Keep `lock_timeout_ms` below `deadlock_timeout` |

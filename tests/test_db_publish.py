@@ -4626,6 +4626,39 @@ class Test27PublicationLockIsBounded(unittest.TestCase):
         self.assertIn('elapsed', message)
         self.assertGreater(conn.lock_attempts, 1)
 
+    def test_exhaustion_does_not_blame_a_reader(self):
+        """The diagnostic must not name a reader as the holder.
+
+        Until 0.7.13 it read 'A long-running reader is holding one of
+        them.' That was measured false against PostgreSQL 18.4: the
+        holder was an autovacuum worker on the live target, taking SHARE
+        UPDATE EXCLUSIVE after the previous publication filled it. An
+        operator who trusted the message would look for a slow query and
+        find none. See decisions/0016.
+        """
+        from task_core.db.publish import PublicationLockPolicy
+        conn = self._Conn(lock_failures=99)
+        publisher = self._publisher(conn, PublicationLockPolicy(
+            lock_timeout_ms=10, acquisition_timeout_ms=100,
+            retry_horizon_seconds=1.0,
+            retry_delay_min_seconds=0.05, retry_delay_max_seconds=0.05,
+        ))
+        with self.assertRaises(DbPublishError) as caught:
+            publisher.commit()
+        message = str(caught.exception)
+
+        self.assertIn('autovacuum', message,
+                      'the measured cause of contention is not mentioned')
+        self.assertIn('reader', message,
+                      'a long-running reader is still a real cause')
+        # Asserts on what the sentence CLAIMS, not merely that both words
+        # occur: the defect was a message naming one cause as the cause.
+        self.assertNotIn(
+            'A long-running reader is holding', message,
+            'the diagnostic asserts a reader is the holder, which is the '
+            'exact misdirection 0016 records',
+        )
+
     def test_max_attempts_is_a_defensive_ceiling(self):
         from task_core.db.publish import PublicationLockPolicy
         conn = self._Conn(lock_failures=99)

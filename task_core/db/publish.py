@@ -1140,8 +1140,16 @@ class DbPublisher:
     # 55P03 lock_not_available is unambiguous here: this code never issues
     # NOWAIT, and the connection is exclusively ours -- dedicated, NullPool,
     # never returned to a pool -- so nothing else can be requesting locks on
-    # it. It means precisely "a reader still held it when my budget
-    # expired", which is the retryable condition.
+    # it. It means precisely "some conflicting holder still held a target
+    # when my budget expired", which is the retryable condition.
+    #
+    # It does NOT mean the holder was a reader, which this comment claimed
+    # until 0.7.13. Measured against PostgreSQL 18.4: the holder was an
+    # autovacuum worker on the live target, taking SHARE UPDATE EXCLUSIVE
+    # after the previous publication filled it. That conflicts with ACCESS
+    # EXCLUSIVE exactly as a reader would, and it is arguably the more
+    # common cause on a table this scaffold has just written. See
+    # decisions/0016 for why lock_timeout_ms is not raised to outlast it.
     #
     # 57014 query_canceled is NOT uniquely statement_timeout. An operator's
     # pg_cancel_backend(), a client-side cancel, or a role- or
@@ -1522,8 +1530,10 @@ class DbPublisher:
                     raise DbPublishError(
                         f'publication could not acquire its target locks within '
                         f'{policy.retry_horizon_seconds}s ({attempt} attempts, '
-                        f'{elapsed:.1f}s elapsed). A long-running reader is holding '
-                        f'one of them.'
+                        f'{elapsed:.1f}s elapsed). Something holds a conflicting '
+                        f'lock on a target: a long-running reader, or an autovacuum '
+                        f'worker on a table this run has just filled. Join pg_locks '
+                        f'to pg_stat_activity to name it.'
                     ) from exc
 
                 delay = random.uniform(

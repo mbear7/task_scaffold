@@ -338,6 +338,12 @@ net:
 Scheduling the task for a quieter period may reduce observed contention, but
 it does not make an invalid timeout policy executable.
 
+`L` also has a **floor** that this section does not derive, because it comes
+from a PostgreSQL server setting rather than from the arithmetic here: raising
+`L` past `deadlock_timeout` changes which mechanism resolves autovacuum
+contention. See [0016](0016-keep-lock-timeout-below-deadlock-timeout.md).
+Lowering `L`, as recommended above, is unaffected.
+
 ### What enforcement does
 
 `_lock_publication_targets()` knows the actual number of existing targets after

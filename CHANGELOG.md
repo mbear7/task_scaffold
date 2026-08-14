@@ -10,6 +10,49 @@ chronologically rather than by release.
 
 
 
+## 0.7.13
+
+The lock-contention diagnostic no longer blames a reader.
+
+### Fixed
+- **`publication could not acquire its target locks` told the operator
+  `A long-running reader is holding one of them.`** Measured false
+  against PostgreSQL 18.4: the holder was an autovacuum worker on the
+  live target, taking `SHARE UPDATE EXCLUSIVE` after the previous
+  publication filled it. That conflicts with `ACCESS EXCLUSIVE` exactly
+  as a reader does, and on back-to-back publications it is arguably the
+  likelier cause — a table this scaffold has just written a million rows
+  into is a prime autovacuum candidate.
+
+  The message named one cause as *the* cause, so an operator following
+  it would look for a slow query and find none. It now names both and
+  says where to look: `Join pg_locks to pg_stat_activity to name it.`
+
+  A comment in `publish.py` carried the same wrong claim, that `55P03`
+  means precisely "a reader still held it when my budget expired". The
+  narrower claim beside it — that `55P03` is unambiguous *as to its
+  source*, because this code never issues `NOWAIT` on a private
+  connection — was and remains true.
+
+  Behaviour is unchanged; only the diagnostic is.
+
+### Documented
+- **`docs/decisions/0016`**, on why `lock_timeout_ms` stays below
+  `deadlock_timeout`. The measurement that prompted the fix above also
+  showed the publisher's 500 ms `lock_timeout` expiring before
+  PostgreSQL's autovacuum cancellation — which is driven by the deadlock
+  detector, and so keyed to `deadlock_timeout`, 1000 ms by default —
+  could ever fire. The staging `DROP`, running with `lock_timeout = 0`,
+  waited 1009.929 ms and was rescued.
+
+  The path with no timeout beat the path with one, which invites raising
+  `lock_timeout_ms`. The record refuses that: retries hold no locks
+  while they sleep, so the retry loop costs the publisher and not
+  readers, whereas a larger per-conflict timeout lengthens the
+  worst-case reader delay that 0008 exists to bound. It also records the
+  escalating-`L` design as the change to make *if* an autovacuum is ever
+  seen outlasting the horizon, which has not happened.
+
 ## 0.7.12
 
 A skipped run no longer reports itself as an aborted one.
